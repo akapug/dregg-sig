@@ -152,15 +152,18 @@
 //! missing for every lock and key source). The subprotocols, their sources and what each
 //! opens are in the module documentation of [`witgen`]; malicious security is the
 //! engine's MAC check, run before every opening that is masked only if earlier openings
-//! were right. One predicate of the secret is revealed by design: a chord addition whose
-//! points have equal `x` aborts with `WitgenError::ZeroDenominator`.
+//! were right. No division reveals whether its denominator is zero for a secret that
+//! has a valid statement: an addition that can be a doubling selects chord or tangent on
+//! shares ([`witgen`], "Divisions by zero").
+//!
+//! Some relations take inputs beyond the bits of the secret: the length of a master seed,
+//! the steps of a hidden derivation path, a Taproot script-tree root. They are hidden
+//! from the verifier, not from the provers: every custodian of the quorum knows them
+//! ([`CustodyInput`]) and enters them as public constants of the engine, and a seed
+//! shorter than 64 bytes is padded with public zeros.
 //!
 //! Not covered: relations with lookups (a multiplicity is a count over the whole witness;
-//! `ConstraintSystem::finish_recorded` refuses them), and statements whose relation takes
-//! inputs beyond the bits of one secret: a master seed (its length is a hidden input), a
-//! hidden derivation path, a taproot merkle root. [`witgen::generate`] takes any number
-//! of inputs; [`prove_ownership_party`] supplies only the secret and returns
-//! [`ThresholdError::Statement`] for those.
+//! `ConstraintSystem::finish_recorded` refuses them).
 //!
 //! # Preprocessing
 //!
@@ -220,8 +223,13 @@ pub mod witgen;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{ZkHemSplitProof, verify_split};
 
+use alloc::vec::Vec;
+
+use dregg_sig_agg::field::Goldilocks;
+
 use super::relations::{
-    OwnershipStatement, ownership_definitions, ownership_shape, ownership_transcript,
+    OwnershipStatement, ownership_auxiliary_inputs, ownership_definitions, ownership_shape,
+    ownership_transcript,
 };
 use engine::{Engine, Stats};
 use net::Transport;
@@ -229,8 +237,9 @@ use net::Transport;
 /// Why a custodian's [`prove_ownership_party`] produced no proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThresholdError {
-    /// The statement is malformed, or its relation takes inputs other than one secret
-    /// of the length of the custody share.
+    /// The statement is malformed, or the custody input does not fit it: a share of a
+    /// length the key source does not take, a path that the statement does not hide or
+    /// that is too long for it, a script-tree root that is missing or not called for.
     Statement,
     Input(custody::InputError),
     Witness(witgen::WitgenError),
@@ -248,18 +257,44 @@ pub enum Stage {
     Proof,
 }
 
+/// What one custodian brings to [`prove_ownership_party`].
+///
+/// `xor_share` is its XOR share of the legacy secret (see
+/// [`custody::xor_share_from_shamir`]); no custodian holds more of the secret than that.
+/// `path` and `merkle_root` are the parts of the witness that are hidden from the
+/// verifier and known to the whole quorum: the derivation path of a statement with a
+/// hidden path (empty otherwise) and the script-tree root of a Taproot script-tree
+/// lock. The length of a master seed is the length of the share, so the custodians know
+/// it too. Custodians that disagree on these values hold inconsistent shares of the
+/// inputs, which the engine's MAC check reports like any other wrong share.
+#[derive(Clone, Copy, Debug)]
+pub struct CustodyInput<'a> {
+    pub xor_share: &'a [u8],
+    pub path: &'a [u32],
+    pub merkle_root: Option<&'a [u8; 32]>,
+}
+
+impl<'a> CustodyInput<'a> {
+    /// A share of a secret whose statement has no hidden path and no script tree.
+    pub fn secret(xor_share: &'a [u8]) -> Self {
+        Self {
+            xor_share,
+            path: &[],
+            merkle_root: None,
+        }
+    }
+}
+
 /// Triples and uniform values one custodian consumes in [`prove_ownership_party`], by
-/// stage, for a secret of `secret_bytes` bytes. `None` for a statement it refuses.
+/// stage, for a secret of `secret_bytes` bytes. `None` for a malformed statement.
 pub fn ownership_demand(
     statement: &OwnershipStatement,
     regime: WhirSecurityRegime,
     parties: usize,
+    secret_bytes: usize,
 ) -> Option<[(Stage, usize, usize); 3]> {
     let (shape, defs) = ownership_definitions(statement)?;
-    let &[bits] = witgen::input_bits(&defs).as_slice() else {
-        return None;
-    };
-    let input = custody::input_demand(parties, bits / 8);
+    let input = custody::input_demand(parties, secret_bytes);
     let witness = witgen::demand(&shape, &defs).ok()?;
     let proof = prover::prover_demand(&shape, regime)?;
     Some([
@@ -269,18 +304,18 @@ pub fn ownership_demand(
     ])
 }
 
-/// One custodian's side of a threshold proof of `statement`, from its XOR share of the
-/// legacy secret (see [`custody::xor_share_from_shamir`]). No custodian holds the secret,
-/// any variable of the assignment or any share of another custodian at any point: the
-/// secret's bits enter as authenticated shares ([`custody`]), the assignment is computed
-/// on shares ([`witgen`]) and proved on shares ([`prover`]).
+/// One custodian's side of a threshold proof of `statement`. No custodian holds the
+/// secret, any variable of the assignment that depends on it or any share of another
+/// custodian at any point: the secret's bits enter as authenticated shares
+/// ([`custody`]), the assignment is computed on shares ([`witgen`]) and proved on shares
+/// ([`prover`]).
 pub fn prove_ownership_party<T: Transport>(
     e: &mut Engine<T>,
     statement: &OwnershipStatement,
     regime: WhirSecurityRegime,
-    xor_share: &[u8],
+    input: CustodyInput<'_>,
 ) -> Result<ZkHemSplitProof, ThresholdError> {
-    prove_ownership_party_observed(e, statement, regime, xor_share, &mut |_, _| {})
+    prove_ownership_party_observed(e, statement, regime, input, &mut |_, _| {})
 }
 
 /// [`prove_ownership_party`], reporting the engine's counters after each stage.
@@ -288,17 +323,41 @@ pub fn prove_ownership_party_observed<T: Transport>(
     e: &mut Engine<T>,
     statement: &OwnershipStatement,
     regime: WhirSecurityRegime,
-    xor_share: &[u8],
+    input: CustodyInput<'_>,
     after: &mut dyn FnMut(Stage, Stats),
 ) -> Result<ZkHemSplitProof, ThresholdError> {
     let (shape, defs) = ownership_definitions(statement).ok_or(ThresholdError::Statement)?;
     let public_inputs = statement.public_inputs().ok_or(ThresholdError::Statement)?;
-    if witgen::input_bits(&defs) != [8 * xor_share.len()] {
+    let auxiliary = ownership_auxiliary_inputs(
+        statement,
+        input.xor_share.len(),
+        input.path,
+        input.merkle_root,
+    )
+    .ok_or(ThresholdError::Statement)?;
+    // The relation's inputs: the secret, zero-padded to its width, then the auxiliary
+    // inputs as public constants.
+    let widths = witgen::input_bits(&defs);
+    let fits = widths.len() == 1 + auxiliary.len()
+        && widths[0] >= 8 * input.xor_share.len()
+        && widths[1..].iter().zip(&auxiliary).all(|(&w, a)| w == a.len());
+    if !fits {
         return Err(ThresholdError::Statement);
     }
-    let bits = custody::input_secret_bits(e, xor_share).map_err(ThresholdError::Input)?;
+    let mut secret =
+        custody::input_secret_bits(e, input.xor_share).map_err(ThresholdError::Input)?;
     after(Stage::Input, e.stats);
-    let z = witgen::generate(e, &shape, &defs, &public_inputs, &[bits])
+    secret.resize(widths[0], e.public(Goldilocks::ZERO));
+    let mut inputs = Vec::with_capacity(widths.len());
+    inputs.push(secret);
+    for bits in &auxiliary {
+        inputs.push(
+            bits.iter()
+                .map(|&b| e.public(Goldilocks::from_u64_reduced(u64::from(b))))
+                .collect(),
+        );
+    }
+    let z = witgen::generate(e, &shape, &defs, &public_inputs, &inputs)
         .map_err(ThresholdError::Witness)?;
     after(Stage::Witness, e.stats);
     let proof = prover::prove_party(
@@ -645,13 +704,22 @@ mod tests {
         use super::custody::xor_share_from_shamir;
         use super::engine::Dealer;
         use super::engine::tests::run_parties;
-        use super::witgen::tests::reference_cases;
+        use super::witgen::tests::{derived_cases, reference_cases};
         use super::*;
         let regime = WhirSecurityRegime::default();
         let only = std::env::var("COLLAB_MEASURE_ONLY").ok();
-        for (parties, case) in [(3usize, 0usize), (3, 1), (5, 0)] {
-            let (st, _, secret) = reference_cases().swap_remove(case);
-            let label = std::format!("{:?} N={parties}", st.lock);
+        let mut cases: Vec<_> = reference_cases()
+            .into_iter()
+            .map(|(st, _, secret)| (st, secret, Vec::new(), None))
+            .collect();
+        cases.extend(
+            derived_cases()
+                .into_iter()
+                .map(|(st, _, secret, path, root)| (st, secret, path, root)),
+        );
+        for (parties, case) in [(3usize, 0usize), (3, 1), (5, 0), (3, 2), (3, 3)] {
+            let (st, secret, path, root) = cases[case].clone();
+            let label = std::format!("{:?} {:?} N={parties}", st.lock, st.source);
             if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
                 continue;
             }
@@ -659,7 +727,7 @@ mod tests {
             // parties + 1 out.
             let shares = shamir(&secret, parties, parties + 2, 9);
             let quorum: Vec<usize> = (0..parties + 2).filter(|&p| p != 1).take(parties).collect();
-            let stages = ownership_demand(&st, regime, parties).unwrap();
+            let stages = ownership_demand(&st, regime, parties, secret.len()).unwrap();
             let triples: usize = stages.iter().map(|s| s.1).sum();
             let randoms: usize = stages.iter().map(|s| s.2).sum();
             let preps = Dealer::new(parties, &[3; 32]).preprocessing(triples, randoms);
@@ -673,7 +741,11 @@ mod tests {
                     &mut e,
                     &st,
                     regime,
-                    &xor,
+                    CustodyInput {
+                        xor_share: &xor,
+                        path: &path,
+                        merkle_root: root.as_ref(),
+                    },
                     &mut |stage, stats| marks.push((stage, stats, start.elapsed().as_secs_f64())),
                 );
                 assert_eq!(e.remaining(), (0, 0), "demand is exact");

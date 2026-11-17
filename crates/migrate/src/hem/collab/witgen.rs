@@ -67,12 +67,36 @@
 //! (an opening that differs from the shared value fails the check except with probability
 //! `2^-126`) is SPDZ's.
 //!
-//! One predicate of the witness is revealed by design: a division whose denominator is
-//! zero modulo `q` aborts with [`WitgenError::ZeroDenominator`]. For the ownership
-//! relations that is the chord slope of an addition whose two points have equal `x`. The
-//! gadget's complete addition handles that case with the tangent; here the quorum aborts
-//! instead, which tells the custodians that the key is one of the few scalars for which
-//! the last window meets the accumulated point.
+//! # Divisions by zero
+//!
+//! A division modulo `q` opens `den rho mod q`, so a zero denominator would show. The
+//! relations divide in three places (`hem/curve.rs`):
+//!
+//! * The chord slope of an addition inside a fixed-base multiplication, between the
+//!   partial sum `S` of the signed windows and the next window's point `T`. There
+//!   `|S| < |T|` and `|S| + |T|` is below the group order for every Boolean scalar, so
+//!   the two points never share `x` (the argument is in the module documentation of
+//!   `curve.rs`, "Scalar multiplication"). The denominator is nonzero whatever the key.
+//! * The slope of a *complete* addition: the last addition of a fixed-base
+//!   multiplication, and `P + [k] G` for a variable point (a BIP-32 public child, a
+//!   Taproot tweak). The points share `x` when they are equal, which is one scalar per
+//!   multiplication, and for a variable point when `P = [k] G`. A custodian of a key
+//!   chosen by someone else cannot rule those out, so this case is computed, not
+//!   aborted: [`Source::Slope`] carries the tangent, and [`Witgen::slope`] tests the
+//!   denominator for zero on shares (its canonical residue, then the product of the
+//!   complements of its bits) and selects numerator and denominator before the masked
+//!   division. Nothing depends on which case holds: the same triples, the same
+//!   openings, and the opened `den rho` is that of the selected denominator, which is
+//!   nonzero in both cases. The remaining case, opposite points, has no satisfying
+//!   assignment (the sum is the identity; the scalar is a multiple of the group order,
+//!   which the range rows exclude); a quorum that holds such a secret opens a zero
+//!   there and aborts with [`WitgenError::ZeroDenominator`], and has no statement to
+//!   prove.
+//! * The Edwards `y = (u - 1) / (u + 1)` of an Ed25519 point from its Montgomery `u`.
+//!   `u = -1` belongs to points of order four, which a multiple of the base point is
+//!   not.
+//!
+//! So for every secret that has a valid statement no division aborts.
 //!
 //! The statistical parameter is 40 bits per masked opening.
 
@@ -1026,6 +1050,59 @@ impl<'a, B: Backend> Witgen<'a, B> {
         self.reduce_bits(bits, most, q, Some(&inverse))
     }
 
+    /// `flag ? on_one : on_zero`, coefficient by coefficient.
+    fn int_select(
+        &mut self,
+        flag: B::S,
+        on_one: &Int<B::S>,
+        on_zero: &Int<B::S>,
+    ) -> Result<Int<B::S>, WitgenError> {
+        let n = on_one.len().max(on_zero.len());
+        let get = |x: &Int<B::S>, k: usize| match x.c.get(k) {
+            Some(&c) => (c, x.lo[k], x.hi[k]),
+            None => (self.zero, 0, 0),
+        };
+        let (ones, zeros): (Vec<_>, Vec<_>) =
+            (0..n).map(|k| (get(on_one, k), get(on_zero, k))).unzip();
+        let deltas: Vec<B::S> = ones.iter().zip(&zeros).map(|(a, b)| a.0 - b.0).collect();
+        let moved = self.mul(&vec![flag; n], &deltas)?;
+        Ok(Int {
+            c: zeros.iter().zip(&moved).map(|(z, &m)| z.0 + m).collect(),
+            lo: ones.iter().zip(&zeros).map(|(a, b)| a.1.min(b.1)).collect(),
+            hi: ones.iter().zip(&zeros).map(|(a, b)| a.2.max(b.2)).collect(),
+        })
+    }
+
+    /// The canonical residue of `num / den` modulo `q` where `den` is not zero modulo
+    /// `q`, and of `alt_num / alt_den` where it is. Which one is not revealed.
+    fn slope(
+        &mut self,
+        num: &Int<B::S>,
+        den: &Int<B::S>,
+        alt_num: &Int<B::S>,
+        alt_den: &Int<B::S>,
+        q: &Modulus,
+    ) -> Result<Vec<B::S>, WitgenError> {
+        // den = 0 mod q exactly when every bit of its canonical residue is zero.
+        let one = self.one;
+        let mut level: Vec<B::S> = self
+            .canonical(den, q)?
+            .iter()
+            .map(|&b| one - b)
+            .collect();
+        while level.len() > 1 {
+            let odd = (level.len() % 2 == 1).then(|| level[level.len() - 1]);
+            let (xs, ys): (Vec<B::S>, Vec<B::S>) =
+                level.chunks_exact(2).map(|p| (p[0], p[1])).unzip();
+            level = self.mul(&xs, &ys)?;
+            level.extend(odd);
+        }
+        let is_zero = level[0];
+        let num = self.int_select(is_zero, alt_num, num)?;
+        let den = self.int_select(is_zero, alt_den, den)?;
+        self.quotient_mod(&num, &den, q)
+    }
+
     /// `N / q` for an integer `N` that `q` divides, with the quotient below `2^bits`.
     fn exact_quotient(
         &mut self,
@@ -1121,6 +1198,20 @@ impl<'a, B: Backend> Witgen<'a, B> {
                     let den = self.int_of(z, den);
                     self.quotient_mod(&num, &den, &q)
                 }
+            }
+            Source::Slope {
+                num,
+                den,
+                tangent_products,
+                tangent_linear,
+                tangent_den,
+                modulus,
+            } => {
+                let q = Modulus::new(modulus);
+                let (num, den) = (self.int_of(z, num), self.int_of(z, den));
+                let alt_num = self.int_expr(z, tangent_products, tangent_linear)?;
+                let alt_den = self.int_of(z, tangent_den);
+                self.slope(&num, &den, &alt_num, &alt_den, &q)
             }
             Source::Quotient { num, divisor, bits } => {
                 let q = Modulus::new(divisor);
@@ -1605,7 +1696,8 @@ pub(super) mod tests {
 
     use crate::hem::relations::{
         Bip32Root, Ed25519ExtendedKey, KeySource, Lock, OwnershipStatement, OwnershipWitness,
-        PathSpec, ownership_definitions, ownership_shape, synthesize_ownership,
+        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions,
+        ownership_shape, synthesize_ownership,
     };
 
     fn statement(lock: Lock, source: KeySource, witness: &OwnershipWitness) -> OwnershipStatement {
@@ -1701,6 +1793,226 @@ pub(super) mod tests {
                 vec![0x22; 32],
             ),
         ]
+    }
+
+    /// Statements whose relation takes inputs besides the secret, with their witness, the
+    /// secret, the hidden path and the script-tree root: a master seed with a public
+    /// path (`m/44'`), a longer seed with a hidden path under a Taproot script tree, a
+    /// SLIP-0010 seed with a hidden path, and an extended key with a hidden public step.
+    #[allow(clippy::type_complexity)]
+    pub(in super::super) fn derived_cases() -> Vec<(
+        OwnershipStatement,
+        OwnershipWitness,
+        Vec<u8>,
+        Vec<u32>,
+        Option<[u8; 32]>,
+    )> {
+        const H: u32 = 1 << 31;
+        let mut out = Vec::new();
+        let seed = vec![0x31; 16];
+        let witness = OwnershipWitness::seed(&seed);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Public(vec![H + 44]),
+        };
+        out.push((
+            statement(Lock::P2pkh, source, &witness),
+            witness,
+            seed,
+            Vec::new(),
+            None,
+        ));
+        let seed: Vec<u8> = (0..33).map(|i| 0x40 + i as u8).collect();
+        let (path, root) = (vec![H + 86], [0x5a; 32]);
+        let witness = OwnershipWitness::seed(&seed)
+            .with_path(&path)
+            .with_merkle_root(root);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Hidden { max_depth: 2 },
+        };
+        out.push((
+            statement(Lock::TaprootScriptTree, source, &witness),
+            witness,
+            seed,
+            path,
+            Some(root),
+        ));
+        let seed = vec![0x77; 64];
+        let path = vec![H + 5];
+        let witness = OwnershipWitness::seed(&seed).with_path(&path);
+        let source = KeySource::Slip10 {
+            path: PathSpec::Hidden { max_depth: 1 },
+        };
+        out.push((
+            statement(Lock::Ed25519, source, &witness),
+            witness,
+            seed,
+            path,
+            None,
+        ));
+        let node = bip32_derive(&[0x21; 32], &[H]).unwrap();
+        let secret = [node.private_key, node.chain_code].concat();
+        let path = vec![7];
+        let witness = OwnershipWitness::extended_key(&node).with_path(&path);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::ExtendedKey,
+            path: PathSpec::Hidden { max_depth: 1 },
+        };
+        out.push((
+            statement(Lock::P2pkh, source, &witness),
+            witness,
+            secret,
+            path,
+            None,
+        ));
+        out
+    }
+
+    /// The inputs of a relation as plain values: the secret padded to the first input's
+    /// width, then the auxiliary inputs.
+    fn clear_inputs(defs: &Definitions, secret: &[u8], auxiliary: &[Vec<bool>]) -> Vec<Vec<Clear>> {
+        let widths = input_bits(defs);
+        assert_eq!(widths.len(), 1 + auxiliary.len());
+        assert!(widths[0] >= 8 * secret.len());
+        let mut first: Vec<Clear> = (0..8 * secret.len())
+            .map(|i| Clear(f(u64::from((secret[i / 8] >> (i % 8)) & 1))))
+            .collect();
+        first.resize(widths[0], Clear(F::ZERO));
+        let mut out = vec![first];
+        for (bits, &width) in auxiliary.iter().zip(&widths[1..]) {
+            assert_eq!(bits.len(), width);
+            out.push(bits.iter().map(|&b| Clear(f(u64::from(b)))).collect());
+        }
+        out
+    }
+
+    /// Seeds of hidden length, hidden paths and script-tree roots: the auxiliary inputs
+    /// are the ones the gadgets allocate, in their order, so the definitions evaluated on
+    /// the secret and those inputs give the gadget's assignment.
+    #[test]
+    fn auxiliary_inputs_reproduce_the_gadget_assignment() {
+        const H: u32 = 1 << 31;
+        for (st, witness, secret, path, root) in derived_cases() {
+            let (shape, assignment) = synthesize_ownership(&st, &witness).unwrap();
+            let (recorded, defs) = ownership_definitions(&st).unwrap();
+            assert_eq!(recorded.digest(), shape.digest());
+            let auxiliary =
+                ownership_auxiliary_inputs(&st, secret.len(), &path, root.as_ref()).unwrap();
+            let inputs = clear_inputs(&defs, &secret, &auxiliary);
+            let run = |inputs: &[Vec<Clear>]| {
+                Witgen::new(&mut Plain::new(6)).run(
+                    &shape,
+                    &defs,
+                    &st.public_inputs().unwrap(),
+                    inputs,
+                )
+            };
+            let z = run(&inputs).unwrap();
+            let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
+            assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None, "{:?}", st.source);
+
+            // The auxiliary inputs matter: flipping the first or the last of them moves
+            // the assignment (or leaves the relation without one).
+            for k in [1, inputs.len() - 1] {
+                let mut other = inputs.clone();
+                other[k][0] = Clear(F::ONE - other[k][0].0);
+                assert!(run(&other).map_or(true, |o| o != z), "input {k}");
+            }
+
+            // What does not fit the statement is refused.
+            let aux = |bytes: usize, path: &[u32], root: Option<&[u8; 32]>| {
+                ownership_auxiliary_inputs(&st, bytes, path, root)
+            };
+            assert_eq!(aux(secret.len(), &path, root.as_ref()), Some(auxiliary));
+            assert_eq!(aux(15, &path, root.as_ref()), None);
+            assert_eq!(aux(65, &path, root.as_ref()), None);
+            let long = [path.clone(), vec![H, H, H]].concat();
+            assert_eq!(aux(secret.len(), &long, root.as_ref()), None);
+            let flipped = if root.is_some() { None } else { Some(&[1u8; 32]) };
+            assert_eq!(aux(secret.len(), &path, flipped), None);
+        }
+        // A SLIP-0010 path has hardened steps only.
+        let (st, _, secret, _, _) = derived_cases().swap_remove(2);
+        assert_eq!(ownership_auxiliary_inputs(&st, secret.len(), &[5], None), None);
+    }
+
+    /// An addition that may be a doubling: the chord where the denominator is nonzero
+    /// modulo the prime, the tangent where it is zero modulo the prime (as an integer it
+    /// need not be zero), and the same consumption either way.
+    #[test]
+    fn slopes_select_chord_or_tangent_without_showing_which() {
+        let q = Modulus::new(&SECP_P);
+        let reduce = |values: &[i128]| {
+            let (pos, neg) = int_value(values);
+            let (pos, neg) = (nat_divrem(&pos, &q.p).1, nat_divrem(&neg, &q.p).1);
+            nat_divrem(&nat_sub(&nat_add(&pos, &q.p), &neg), &q.p).1
+        };
+        let num: Vec<i128> = (0..32).map(|k| 3 * k as i128 - 40).collect();
+        let alt_num: Vec<i128> = (0..40).map(|k| 1000 - 77 * k as i128).collect();
+        let alt_den: Vec<i128> = (0..32).map(|k| 2 * (k as i128 % 100) + 1).collect();
+        // The secp256k1 prime written with signed limbs: a denominator that is zero
+        // modulo the prime and not zero as an integer.
+        let mut prime: Vec<i128> = SECP_P.iter().map(|&b| i128::from(b)).collect();
+        prime[0] -= 256;
+        prime[1] += 1;
+        let mut nonzero = vec![0i128; 32];
+        nonzero[5] = -9;
+        let mut counts = Vec::new();
+        for (den, tangent) in [
+            (nonzero, false),
+            (vec![0i128; 32], true),
+            (prime.clone(), true),
+        ] {
+            let mut plain = Plain::new(8);
+            let got = Witgen::new(&mut plain)
+                .slope(
+                    &int(&num, -300, 300),
+                    &int(&den, -300, 300),
+                    &int(&alt_num, -3000, 3000),
+                    &int(&alt_den, -300, 300),
+                    &q,
+                )
+                .unwrap();
+            let (n, d) = if tangent {
+                (reduce(&alt_num), reduce(&alt_den))
+            } else {
+                (reduce(&num), reduce(&den))
+            };
+            assert_eq!(
+                value(&got),
+                nat_mulmod(&n, &nat_invmod(&d, &q.p), &q.p),
+                "tangent={tangent}"
+            );
+            counts.push((plain.count.triples, plain.count.randoms));
+        }
+        assert_eq!(reduce(&prime), Nat::new());
+        assert!(counts.iter().all(|c| c == &counts[0]), "{counts:?}");
+    }
+
+    /// The secp256k1 key `2^250 - 1`: the last addition of its multiplication doubles the
+    /// last window's point. The quorum computes its assignment like any other, with the
+    /// same preprocessing.
+    #[test]
+    fn a_key_whose_last_addition_doubles_is_computed_like_any_other() {
+        let mut key = [0xff; 32];
+        key[0] = 0x03;
+        let mut used = Vec::new();
+        for secret in [key, [0x11; 32]] {
+            let witness = OwnershipWitness::secp256k1_key(&secret);
+            let st = statement(Lock::P2pkh, KeySource::Secp256k1Key, &witness);
+            let (shape, assignment) = synthesize_ownership(&st, &witness).unwrap();
+            let (_, defs) = ownership_definitions(&st).unwrap();
+            let inputs = clear_inputs(&defs, &secret, &[]);
+            let mut plain = Plain::new(6);
+            let z = Witgen::new(&mut plain)
+                .run(&shape, &defs, &st.public_inputs().unwrap(), &inputs)
+                .unwrap();
+            let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
+            assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None);
+            used.push((plain.count.triples, plain.count.randoms));
+        }
+        assert_eq!(used[0], used[1]);
     }
 
     /// The definitions mean what the gadgets compute: evaluated on plain values from the

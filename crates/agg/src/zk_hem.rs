@@ -42,7 +42,10 @@ pub mod relation;
 use crate::field::{
     Goldilocks, GoldilocksExt2, GoldilocksExt2Ops as _, GoldilocksExt4, GoldilocksOps as _,
 };
-use crate::sponge::{FiatShamirTranscript, InstanceBound, cshake256_32};
+use crate::sponge::{
+    FiatShamirTranscript, InstanceBound, cshake256_from_midstate_32,
+    cshake256_seed_counter_words_x4, cshake256_static_midstate,
+};
 
 type E = GoldilocksExt4;
 
@@ -108,20 +111,126 @@ impl NonzeroChallenge {
 
 /// Expands a 32-byte seed into uniform canonical `Goldilocks` elements: 8-byte candidates
 /// from `cSHAKE256(domain, seed || counter)` blocks, rejecting candidates `>= p`.
+///
+/// Block `counter` does not depend on any other block, so [`Self::fill_base`] computes
+/// many blocks at once (four per permutation call, and on several threads with `std`).
+/// The element sequence is that of repeated [`Self::next_base`] in every case.
 pub struct SeedStream {
-    domain: &'static [u8],
+    /// Sponge state after the customization block; public.
+    midstate: [u64; 25],
     input: [u8; 40],
     block: [u8; 32],
     pos: usize,
     counter: u64,
 }
 
+/// Fewest whole blocks for which [`SeedStream::fill_base`] leaves the one-block path.
+const SEED_STREAM_BULK_BLOCKS: usize = 16;
+/// Fewest blocks given to one worker thread.
+#[cfg(feature = "std")]
+const SEED_STREAM_PAR_BLOCKS: usize = 1 << 10;
+
+/// Candidate words of the blocks `counter, counter + 1, ..` in stream order, four per
+/// block; `words.len()` is a multiple of four.
+fn seed_stream_words(midstate: &[u64; 25], seed: &[u64; 4], mut counter: u64, words: &mut [u64]) {
+    let (quads, rest) = words.as_chunks_mut::<16>();
+    for quad in quads {
+        let blocks = cshake256_seed_counter_words_x4(midstate, seed, counter);
+        for (dst, src) in quad.as_chunks_mut::<4>().0.iter_mut().zip(&blocks) {
+            *dst = *src;
+        }
+        counter = counter.wrapping_add(4);
+    }
+    if !rest.is_empty() {
+        let mut blocks = cshake256_seed_counter_words_x4(midstate, seed, counter);
+        for (dst, src) in rest.as_chunks_mut::<4>().0.iter_mut().zip(&blocks) {
+            *dst = *src;
+        }
+        for block in &mut blocks {
+            dregg_sig_asm::volatile_fill(block, 0u64);
+        }
+    }
+}
+
+/// Fill `out` (a multiple of four cells) from the candidate words of the blocks
+/// `counter..counter + out.len() / 4`, which `words(first_block, buffer)` produces. Returns
+/// how many cells were filled: `out.len()` less the rejected candidates. The filled prefix
+/// is the accepted candidates in stream order; the caller draws the rest from the blocks
+/// that follow.
+fn seed_stream_fill_blocks(
+    out: &mut [Goldilocks],
+    counter: u64,
+    words: &(impl Fn(u64, &mut [u64]) + Sync),
+) -> usize {
+    debug_assert!(out.len().is_multiple_of(4));
+    // Cells `base..base + part.len()` of `out`; returns the indices of rejected candidates.
+    let run = |base: usize, part: &mut [Goldilocks]| -> Vec<usize> {
+        let mut rejected = Vec::new();
+        let mut buf = [0u64; 256];
+        for (n, cells) in part.chunks_mut(buf.len()).enumerate() {
+            let at = base + n * buf.len();
+            let buf = &mut buf[..cells.len()];
+            words(counter.wrapping_add((at / 4) as u64), buf);
+            for (i, (cell, &word)) in cells.iter_mut().zip(buf.iter()).enumerate() {
+                match Goldilocks::from_canonical_u64(word) {
+                    Some(x) => *cell = x,
+                    None => {
+                        *cell = Goldilocks::ZERO;
+                        rejected.push(at + i);
+                    }
+                }
+            }
+        }
+        dregg_sig_asm::volatile_fill(&mut buf, 0u64);
+        rejected
+    };
+    #[cfg(feature = "std")]
+    let rejected: Vec<usize> = {
+        let blocks = out.len() / 4;
+        let workers = crate::parallel_workers().min(blocks / SEED_STREAM_PAR_BLOCKS);
+        if workers > 1 {
+            let chunk = 4 * blocks.div_ceil(workers);
+            let run = &run;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = out
+                    .chunks_mut(chunk)
+                    .enumerate()
+                    .map(|(k, part)| crate::spawn_bounded(scope, move || run(k * chunk, part)))
+                    .collect();
+                handles.into_iter().flat_map(crate::join_worker).collect()
+            })
+        } else {
+            run(0, out)
+        }
+    };
+    #[cfg(not(feature = "std"))]
+    let rejected: Vec<usize> = run(0, out);
+
+    // Close the gaps the rejected candidates left (about one candidate in `2^32`).
+    let Some(&first) = rejected.first() else {
+        return out.len();
+    };
+    let mut skip = rejected.iter().copied().peekable();
+    let mut write = first;
+    for read in first..out.len() {
+        if skip.peek() == Some(&read) {
+            skip.next();
+        } else {
+            out[write] = out[read];
+            write += 1;
+        }
+    }
+    dregg_sig_asm::volatile_fill(&mut out[write..], Goldilocks::ZERO);
+    write
+}
+
 impl SeedStream {
+    /// `domain` is a customization string of 1 to 128 bytes.
     pub fn new(domain: &'static [u8], seed: &[u8; 32]) -> Self {
         let mut input = [0u8; 40];
         input[..32].copy_from_slice(seed);
         Self {
-            domain,
+            midstate: cshake256_static_midstate(domain),
             input,
             block: [0u8; 32],
             pos: 32,
@@ -133,7 +242,7 @@ impl SeedStream {
         loop {
             if self.pos == 32 {
                 self.input[32..].copy_from_slice(&self.counter.to_le_bytes());
-                self.block = cshake256_32(self.domain, &self.input);
+                self.block = cshake256_from_midstate_32(&self.midstate, &self.input);
                 self.counter += 1;
                 self.pos = 0;
             }
@@ -143,6 +252,33 @@ impl SeedStream {
             if let Some(x) = Goldilocks::from_canonical_u64(u64::from_le_bytes(word)) {
                 return x;
             }
+        }
+    }
+
+    /// `out[i] = self.next_base()` for every `i` in order, computed many blocks at a time.
+    pub fn fill_base(&mut self, out: &mut [Goldilocks]) {
+        let mut done = 0;
+        // The rest of the block that is open.
+        while done < out.len() && self.pos != 32 {
+            out[done] = self.next_base();
+            done += 1;
+        }
+        let blocks = (out.len() - done) / 4;
+        if blocks >= SEED_STREAM_BULK_BLOCKS {
+            let mut seed: [u64; 4] = core::array::from_fn(|lane| {
+                u64::from_le_bytes(core::array::from_fn(|b| self.input[8 * lane + b]))
+            });
+            let midstate = &self.midstate;
+            done += seed_stream_fill_blocks(
+                &mut out[done..done + 4 * blocks],
+                self.counter,
+                &|counter, words: &mut [u64]| seed_stream_words(midstate, &seed, counter, words),
+            );
+            dregg_sig_asm::volatile_fill(&mut seed, 0u64);
+            self.counter += blocks as u64;
+        }
+        for slot in &mut out[done..] {
+            *slot = self.next_base();
         }
     }
 
@@ -634,6 +770,98 @@ pub fn in_quadratic_subfield(z: E) -> bool {
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    /// The definition of the stream, written without the block kernels.
+    fn reference_stream(domain: &[u8], seed: &[u8; 32], count: usize) -> Vec<Goldilocks> {
+        let mut out = Vec::new();
+        let mut counter = 0u64;
+        while out.len() < count {
+            let mut input = seed.to_vec();
+            input.extend_from_slice(&counter.to_le_bytes());
+            let block = crate::sponge::cshake256_32(domain, &input);
+            counter += 1;
+            for word in block.as_chunks::<8>().0 {
+                if let Some(x) = Goldilocks::from_canonical_u64(u64::from_le_bytes(*word)) {
+                    out.push(x);
+                }
+            }
+        }
+        out.truncate(count);
+        out
+    }
+
+    #[test]
+    fn seed_stream_bulk_fill_is_the_serial_stream() {
+        let seed: [u8; 32] = core::array::from_fn(|i| (7 * i + 3) as u8);
+        let domain = b"QSAG.TEST.ZKHEM.STREAM";
+        // Mixed draws: open blocks before a fill, fills below and above the bulk and the
+        // thread thresholds, lengths that are not whole blocks.
+        let plan = [
+            1usize,
+            3,
+            0,
+            63,
+            64,
+            2,
+            67,
+            1 << 13,
+            5,
+            (1 << 15) + 3,
+            1,
+            4099,
+        ];
+        let total: usize = plan.iter().sum::<usize>() + plan.len();
+        let want = reference_stream(domain, &seed, total);
+        let mut stream = SeedStream::new(domain, &seed);
+        let mut got = Vec::new();
+        for &n in &plan {
+            let mut part = vec![Goldilocks::ZERO; n];
+            stream.fill_base(&mut part);
+            got.extend(part);
+            got.push(stream.next_base());
+        }
+        assert_eq!(got, want);
+        let mut serial = SeedStream::new(domain, &seed);
+        let serial: Vec<Goldilocks> = (0..total).map(|_| serial.next_base()).collect();
+        assert_eq!(serial, want);
+        // A different seed or domain gives a different stream.
+        let mut other = [Goldilocks::ZERO; 64];
+        SeedStream::new(b"QSAG.TEST.ZKHEM.STREAM2", &seed).fill_base(&mut other);
+        assert_ne!(&other[..], &want[..64]);
+    }
+
+    #[test]
+    fn seed_stream_bulk_fill_closes_rejection_gaps() {
+        const P: u64 = 0xFFFF_FFFF_0000_0001;
+        // A stand-in block function: word `w` of the stream is `w + 1`, except that the
+        // listed words are not canonical.
+        for (cells, bad) in [
+            (64usize, vec![0usize]),
+            (64, vec![63]),
+            (1 << 14, vec![5, 6, 7, 4096, 4097, 9000, (1 << 14) - 1]),
+            (1 << 14, vec![]),
+            (256, (0..256).collect()),
+        ] {
+            let words = |counter: u64, buf: &mut [u64]| {
+                for (i, w) in buf.iter_mut().enumerate() {
+                    let index = 4 * (counter as usize - 10) + i;
+                    *w = if bad.contains(&index) {
+                        P + index as u64
+                    } else {
+                        index as u64 + 1
+                    };
+                }
+            };
+            let mut out = vec![Goldilocks::ZERO; cells];
+            let filled = seed_stream_fill_blocks(&mut out, 10, &words);
+            let want: Vec<Goldilocks> = (0..cells)
+                .filter(|i| !bad.contains(i))
+                .map(|i| Goldilocks::from_u64_reduced(i as u64 + 1))
+                .collect();
+            assert_eq!(filled, cells - bad.len());
+            assert_eq!(&out[..filled], &want[..]);
+        }
+    }
 
     fn stream(tag: u8) -> SeedStream {
         SeedStream::new(b"QSAG.TEST.ZKHEM", &[tag; 32])
