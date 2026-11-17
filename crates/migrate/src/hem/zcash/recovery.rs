@@ -55,6 +55,8 @@ use super::orchard::{
 use super::pallas::{Fp, Fq, Point};
 use super::rehash;
 use crate::hem::hash::{alloc_bits, const_bits, pack_bits};
+#[cfg(feature = "std")]
+use crate::hem::relations::credential_identifier;
 
 type F = Goldilocks;
 
@@ -66,7 +68,8 @@ const SIGHASH_PERSONAL: &[u8; 16] = b"QSAG_ZcashRcvSig";
 const SIGNING_NONCE_PERSONAL: &[u8; 16] = b"QSAG_ZcashRcvRnd";
 const ADDRESS_NULLIFIER_PERSONAL: &[u8; 16] = b"QSAG_ZcashAddrNf";
 
-/// Registry tag of an Ironwood note, identified by its nullifier.
+/// Registry tag (`relations::credential_identifier`) of an Ironwood note, identified by
+/// its nullifier. The Zcash tags are 16 to 19; `relations::Credential` uses 1 to 6.
 pub const LEGACY_TAG_IRONWOOD_NOTE: u8 = 16;
 /// Registry tag of an Orchard address `d || pk_d`.
 pub const LEGACY_TAG_ORCHARD_ADDRESS: u8 = 17;
@@ -888,23 +891,12 @@ impl RecoveryStatement {
         crate::hem::registry::MigrationBinding {
             nullifier: self.nullifier,
             migration_domain: self.migration_domain,
-            legacy_id: zcash_legacy_identifier(LEGACY_TAG_IRONWOOD_NOTE, &self.nullifier),
+            legacy_id: credential_identifier(LEGACY_TAG_IRONWOOD_NOTE, &self.nullifier),
             pq_commitment: self.pq_commitment,
             epoch: self.epoch,
             exposure: crate::hem::registry::KeyExposure::Hidden,
         }
     }
-}
-
-/// Registry identifier of a Zcash credential: the registry's legacy identifier function
-/// (`cSHAKE256("QSAG.MIGRATE.REGISTRY.LEGACY.V1", tag, bytes)`) with the Zcash tags, which
-/// are disjoint from those of `registry::legacy_identifier`.
-#[cfg(feature = "std")]
-pub fn zcash_legacy_identifier(tag: u8, bytes: &[u8]) -> [u8; 32] {
-    dregg_sig_accel::keccak::cshake256_framed_32(
-        b"QSAG.MIGRATE.REGISTRY.LEGACY.V1",
-        &[&[tag], bytes],
-    )
 }
 
 /// The public relation of a note recovery; it depends on the key source only.
@@ -1211,7 +1203,7 @@ impl AddressStatement {
         crate::hem::registry::MigrationBinding {
             nullifier: self.nullifier(),
             migration_domain: self.migration_domain,
-            legacy_id: zcash_legacy_identifier(LEGACY_TAG_ORCHARD_ADDRESS, &self.address),
+            legacy_id: credential_identifier(LEGACY_TAG_ORCHARD_ADDRESS, &self.address),
             pq_commitment: self.pq_commitment,
             epoch: self.epoch,
             exposure: crate::hem::registry::KeyExposure::Hidden,
@@ -1727,7 +1719,20 @@ mod tests {
             (again.nullifier, again.legacy_id),
             (b.nullifier, b.legacy_id)
         );
-        // The identifier is not one a Bitcoin, Ethereum or Ed25519 credential can have.
+        // The identifier is not one a Bitcoin, Ethereum, Ed25519 or BLS credential can have.
+        use crate::hem::relations::Credential;
+        let mut twenty_bytes = [0u8; 20];
+        twenty_bytes.copy_from_slice(&st.nullifier[..20]);
+        for other in [
+            Credential::BitcoinKeyHash(twenty_bytes),
+            Credential::BitcoinTaproot(st.nullifier),
+            Credential::EthereumAddress(twenty_bytes),
+            Credential::Ed25519Key(st.nullifier),
+            Credential::BitcoinScriptHash(twenty_bytes),
+            Credential::BlsWithdrawal(st.nullifier),
+        ] {
+            assert_ne!(other.identifier(), b.legacy_id);
+        }
         let mut twenty = [0u8; 20];
         twenty.copy_from_slice(&st.nullifier[..20]);
         for other in [
@@ -1739,7 +1744,7 @@ mod tests {
             assert_ne!(legacy_identifier(&other), b.legacy_id);
         }
         assert_ne!(
-            zcash_legacy_identifier(LEGACY_TAG_ORCHARD_ADDRESS, &st.nullifier),
+            credential_identifier(LEGACY_TAG_ORCHARD_ADDRESS, &st.nullifier),
             b.legacy_id
         );
     }
