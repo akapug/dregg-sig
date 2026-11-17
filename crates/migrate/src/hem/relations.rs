@@ -135,7 +135,7 @@ use dregg_sig_accel::sha2 as sha2_native;
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, Definitions, Lc, Shape, Source};
 
 use super::curve::{
     Element, Lazy, Modulus, bls12_381_enforce_scalar_range, bls12_381_g1_fixed_base_mul,
@@ -640,7 +640,11 @@ pub fn bip39_seed(mnemonic_nfkd: &str, passphrase_nfkd: &str) -> [u8; 64] {
 }
 
 /// The 128 public bytes that precede the secret in a nullifier preimage.
-pub fn nullifier_prefix(kind: u8, migration_domain: &[u8; 32], credential: &Credential) -> [u8; 128] {
+pub fn nullifier_prefix(
+    kind: u8,
+    migration_domain: &[u8; 32],
+    credential: &Credential,
+) -> [u8; 128] {
     let mut out = [0u8; 128];
     out[..29].copy_from_slice(NULLIFIER_TAG);
     out[29] = kind;
@@ -751,9 +755,12 @@ impl KeySource {
     fn is_well_formed(&self) -> bool {
         let spec_ok = |spec: &PathSpec, hardened_only: bool| match spec {
             PathSpec::Public(path) => {
-                path.len() <= MAX_PATH_DEPTH && (!hardened_only || path.iter().all(|&i| i >= HARDENED))
+                path.len() <= MAX_PATH_DEPTH
+                    && (!hardened_only || path.iter().all(|&i| i >= HARDENED))
             }
-            PathSpec::Hidden { max_depth } => (1..=MAX_PATH_DEPTH).contains(&usize::from(*max_depth)),
+            PathSpec::Hidden { max_depth } => {
+                (1..=MAX_PATH_DEPTH).contains(&usize::from(*max_depth))
+            }
         };
         match self {
             Self::Secp256k1Key | Self::Ed25519Seed | Self::Bls12381Key => true,
@@ -962,7 +969,10 @@ fn evaluate(lock: Lock, source: &KeySource, witness: &OwnershipWitness) -> Optio
             })
         }
         KeySource::Bip32 { root: start, path } => {
-            let node = bip32_descend(bip32_root_node(*start, secret)?, resolve_path(path, witness)?)?;
+            let node = bip32_descend(
+                bip32_root_node(*start, secret)?,
+                resolve_path(path, witness)?,
+            )?;
             Some(Evaluated {
                 credential: secp256k1_credential(lock, &node.private_key, root)?,
                 nullifier_secret: bip32_nullifier_secret(*start, secret),
@@ -1161,8 +1171,12 @@ impl OwnershipStatement {
 
     /// The relation's public inputs, one per bit. `None` for a malformed statement.
     pub fn public_inputs(&self) -> Option<Vec<F>> {
-        self.is_well_formed()
-            .then(|| self.public_bits().into_iter().map(|b| fu(u64::from(b))).collect())
+        self.is_well_formed().then(|| {
+            self.public_bits()
+                .into_iter()
+                .map(|b| fu(u64::from(b)))
+                .collect()
+        })
     }
 
     /// The exposure mode the registry records for this statement.
@@ -1208,7 +1222,14 @@ fn pin(cs: &mut ConstraintSystem, got: &[Lc], want: &[Lc]) {
 }
 
 fn alloc_bool(cs: &mut ConstraintSystem, value: bool) -> Lc {
-    let bit: Lc = cs.alloc(fu(u64::from(value))).into();
+    let source = cs.source(|| Source::Input { bits: 1 });
+    let bit: Lc = cs
+        .alloc_defined(fu(u64::from(value)), || Def::Bits {
+            source,
+            lo: 0,
+            width: 1,
+        })
+        .into();
     cs.enforce_boolean(&bit);
     bit
 }
@@ -1241,7 +1262,10 @@ enum Step {
     Public(u32),
     /// `active` is zero for the unused tail of a hidden path; `bits` are the 32 index
     /// bits, least significant first.
-    Hidden { active: Lc, bits: Vec<Lc> },
+    Hidden {
+        active: Lc,
+        bits: Vec<Lc>,
+    },
 }
 
 impl Step {
@@ -1306,7 +1330,9 @@ fn seed_master(cs: &mut ConstraintSystem, hmac_key: &[u8], seed: &[u8]) -> (Vec<
     padded[..seed.len()].copy_from_slice(seed);
     let bits = alloc_bits(cs, &padded);
     wipe(&mut padded);
-    let one_hot: Vec<Lc> = (min..=max).map(|l| alloc_bool(cs, l == seed.len())).collect();
+    let one_hot: Vec<Lc> = (min..=max)
+        .map(|l| alloc_bool(cs, l == seed.len()))
+        .collect();
     let ones: Vec<(F, &Lc)> = one_hot.iter().map(|b| (F::ONE, b)).collect();
     cs.enforce_equal(&Lc::combine(&ones), &Lc::constant(F::ONE));
 
@@ -1334,7 +1360,11 @@ fn seed_master(cs: &mut ConstraintSystem, hmac_key: &[u8], seed: &[u8]) -> (Vec<
             .map(|(_, b)| (F::ONE, b))
             .collect();
         let at = 3 + k;
-        let index = if at < 8 { 8 * 127 + at } else { 8 * 126 + at - 8 };
+        let index = if at < 8 {
+            8 * 127 + at
+        } else {
+            8 * 126 + at - 8
+        };
         block[index] = Lc::combine(&parts);
     }
     block[8 * 126 + 2] = Lc::constant(F::ONE);
@@ -1428,11 +1458,19 @@ fn bip32_root(cs: &mut ConstraintSystem, root: Bip32Root, secret: &[u8]) -> (Sec
     let (key, chain, nullifier_secret) = match root {
         Bip32Root::Seed => {
             let (i, inner) = seed_master(cs, BIP32_MASTER_KEY, secret);
-            (reverse_bytes(&i[..256]), i[256..].to_vec(), inner[..256].to_vec())
+            (
+                reverse_bytes(&i[..256]),
+                i[256..].to_vec(),
+                inner[..256].to_vec(),
+            )
         }
         Bip32Root::ExtendedKey => {
             let bits = alloc_bits(cs, secret);
-            (reverse_bytes(&bits[..256]), bits[256..].to_vec(), bits[256..].to_vec())
+            (
+                reverse_bytes(&bits[..256]),
+                bits[256..].to_vec(),
+                bits[256..].to_vec(),
+            )
         }
     };
     secp256k1_enforce_scalar_range(cs, &key);
@@ -1626,14 +1664,50 @@ fn build(
     public_bits: &[bool],
     witness: &RelationWitness<'_>,
 ) -> (Shape, Vec<F>, usize) {
-    assert_eq!(public_bits.len(), 8 * lock.credential_bytes() + 512);
-    let mut cs = ConstraintSystem::new();
-    let public = alloc_public(&mut cs, public_bits);
-    let (credential, nullifier_secret) = credential_gadget(&mut cs, lock, source, witness);
-    bind_credential(&mut cs, &public, &credential, &nullifier_secret);
+    let cs = build_in(ConstraintSystem::new(), lock, source, public_bits, witness);
     let rows = cs.num_rows();
     let (shape, assignment) = cs.finish();
     (shape, assignment, rows)
+}
+
+fn build_in(
+    mut cs: ConstraintSystem,
+    lock: Lock,
+    source: &KeySource,
+    public_bits: &[bool],
+    witness: &RelationWitness<'_>,
+) -> ConstraintSystem {
+    assert_eq!(public_bits.len(), 8 * lock.credential_bytes() + 512);
+    let public = alloc_public(&mut cs, public_bits);
+    let (credential, nullifier_secret) = credential_gadget(&mut cs, lock, source, witness);
+    bind_credential(&mut cs, &public, &credential, &nullifier_secret);
+    cs
+}
+
+/// The relation of `statement` with the definition of every variable in terms of
+/// earlier ones, for a prover that holds the witness in shares. The first
+/// [`Source::Input`] is the statement's secret, bit `k` of byte `i` at bit `8 i + k`.
+/// `None` for a malformed statement.
+pub fn ownership_definitions(statement: &OwnershipStatement) -> Option<(Shape, Definitions)> {
+    if !statement.is_well_formed() {
+        return None;
+    }
+    let mut secret = placeholder_secret(&statement.source);
+    let cs = build_in(
+        ConstraintSystem::new_recording(),
+        statement.lock,
+        &statement.source,
+        &vec![false; 8 * statement.lock.credential_bytes() + 512],
+        &RelationWitness {
+            secret: &secret,
+            path: &[],
+            merkle_root: [0; 32],
+        },
+    );
+    wipe(&mut secret);
+    let (shape, mut assignment, definitions) = cs.finish_recorded();
+    dregg_sig_asm::volatile_fill(&mut assignment, F::ZERO);
+    Some((shape, definitions))
 }
 
 /// A valid secret for building a shape without a witness.
@@ -2016,8 +2090,12 @@ impl BatchStatement {
     /// The relation's public inputs: those of each entry in order. `None` for a malformed
     /// batch.
     pub fn public_inputs(&self) -> Option<Vec<F>> {
-        self.is_well_formed()
-            .then(|| self.public_bits().into_iter().map(|b| fu(u64::from(b))).collect())
+        self.is_well_formed().then(|| {
+            self.public_bits()
+                .into_iter()
+                .map(|b| fu(u64::from(b)))
+                .collect()
+        })
     }
 
     /// The bindings a verified batch asks the registry to record, one per entry.
@@ -2221,7 +2299,11 @@ pub fn prove_batch(
 
 /// Verify a batch proof. On `true`, [`BatchStatement::bindings`] is what the registry
 /// should record.
-pub fn verify_batch(batch: &BatchStatement, regime: WhirSecurityRegime, proof: &OwnershipProof) -> bool {
+pub fn verify_batch(
+    batch: &BatchStatement,
+    regime: WhirSecurityRegime,
+    proof: &OwnershipProof,
+) -> bool {
     let (Some(shape), Some(public_inputs)) = (batch_shape(batch), batch.public_inputs()) else {
         return false;
     };
@@ -2319,10 +2401,30 @@ mod tests {
         let xprv = OwnershipWitness::extended_key(&bip32_derive(&seed(32), &[H + 1]).unwrap());
         vec![
             ("p2pkh/key", Lock::P2pkh, KeySource::Secp256k1Key, key()),
-            ("p2pkh-uncompressed/key", Lock::P2pkhUncompressed, KeySource::Secp256k1Key, key()),
-            ("p2sh-p2wpkh/key", Lock::P2shP2wpkh, KeySource::Secp256k1Key, key()),
-            ("ethereum/key", Lock::Ethereum, KeySource::Secp256k1Key, key()),
-            ("taproot/key", Lock::TaprootKeyPath, KeySource::Secp256k1Key, key()),
+            (
+                "p2pkh-uncompressed/key",
+                Lock::P2pkhUncompressed,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "p2sh-p2wpkh/key",
+                Lock::P2shP2wpkh,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "ethereum/key",
+                Lock::Ethereum,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "taproot/key",
+                Lock::TaprootKeyPath,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
             (
                 "taproot-tree/key",
                 Lock::TaprootScriptTree,
@@ -2338,13 +2440,17 @@ mod tests {
             (
                 "ed25519/slip10",
                 Lock::Ed25519,
-                KeySource::Slip10 { path: public(&[H, H + 1]) },
+                KeySource::Slip10 {
+                    path: public(&[H, H + 1]),
+                },
                 OwnershipWitness::seed(&seed(16)),
             ),
             (
                 "ed25519/slip10-hidden",
                 Lock::Ed25519,
-                KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 2 } },
+                KeySource::Slip10 {
+                    path: PathSpec::Hidden { max_depth: 2 },
+                },
                 OwnershipWitness::seed(&seed(33)).with_path(&[H + 5]),
             ),
             (
@@ -2581,7 +2687,10 @@ mod tests {
         let order = arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
         assert_eq!(secp256k1_credential(Lock::P2pkh, &[0; 32], None), None);
         assert_eq!(secp256k1_credential(Lock::Ethereum, &order, None), None);
-        assert_eq!(secp256k1_credential(Lock::TaprootScriptTree, &one, None), None);
+        assert_eq!(
+            secp256k1_credential(Lock::TaprootScriptTree, &one, None),
+            None
+        );
     }
 
     #[test]
@@ -2597,24 +2706,41 @@ mod tests {
         let mut want = sha2_native::sha256(&generator);
         assert_ne!(want[0], 0);
         want[0] = 0;
-        assert_eq!(bls_withdrawal_credential(&one), Some(Credential::BlsWithdrawal(want)));
+        assert_eq!(
+            bls_withdrawal_credential(&one),
+            Some(Credential::BlsWithdrawal(want))
+        );
         // Zero and the group order are not keys.
         let order = arr::<32>("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001");
         assert_eq!(bls12_381_public_key(&[0; 32]), None);
         assert_eq!(bls12_381_public_key(&order), None);
         // In the relation, a key with bit 255 set is not a witness even though the
         // multiplication only reads 255 bits.
-        let st = derive(Lock::BlsWithdrawal, KeySource::Bls12381Key, &OwnershipWitness::bls12_381_key(&one));
+        let st = derive(
+            Lock::BlsWithdrawal,
+            KeySource::Bls12381Key,
+            &OwnershipWitness::bls12_381_key(&one),
+        );
         let mut high = one;
         high[0] |= 0x80;
         let forged = OwnershipWitness::bls12_381_key(&high);
         let mut bits = st.public_bits();
-        let (shape, z, _) = build(Lock::BlsWithdrawal, &KeySource::Bls12381Key, &bits, &relation_witness(&forged));
+        let (shape, z, _) = build(
+            Lock::BlsWithdrawal,
+            &KeySource::Bls12381Key,
+            &bits,
+            &relation_witness(&forged),
+        );
         assert!(!shape.is_satisfied(&z));
         // And the credential's first byte is pinned to zero.
         bits[0] = true;
         let honest = OwnershipWitness::bls12_381_key(&one);
-        let (shape, z, _) = build(Lock::BlsWithdrawal, &KeySource::Bls12381Key, &bits, &relation_witness(&honest));
+        let (shape, z, _) = build(
+            Lock::BlsWithdrawal,
+            &KeySource::Bls12381Key,
+            &bits,
+            &relation_witness(&honest),
+        );
         assert!(!shape.is_satisfied(&z));
     }
 
@@ -2653,9 +2779,19 @@ mod tests {
             odd_internal_keys += usize::from(internal[0] == 3);
             let x: [u8; 32] = internal[1..].try_into().unwrap();
             assert_eq!(taproot_tweak(&x, root.as_ref()), arr::<32>(tweak));
-            assert_eq!(taproot_output_key(&key, root.as_ref()).unwrap(), arr::<32>(output));
-            assert_eq!(secp256k1_public_key(&arr(tweaked)).unwrap()[1..], hex(output)[..]);
-            let lock = if root.is_some() { Lock::TaprootScriptTree } else { Lock::TaprootKeyPath };
+            assert_eq!(
+                taproot_output_key(&key, root.as_ref()).unwrap(),
+                arr::<32>(output)
+            );
+            assert_eq!(
+                secp256k1_public_key(&arr(tweaked)).unwrap()[1..],
+                hex(output)[..]
+            );
+            let lock = if root.is_some() {
+                Lock::TaprootScriptTree
+            } else {
+                Lock::TaprootKeyPath
+            };
             assert_eq!(
                 secp256k1_credential(lock, &key, root.as_ref()),
                 Some(Credential::BitcoinTaproot(arr(output)))
@@ -2692,7 +2828,10 @@ mod tests {
             assert_eq!(master.chain_code[..], xprv[13..45]);
             assert_eq!(master.private_key[..], xprv[46..]);
         }
-        assert_ne!(bip39_seed(vectors[0].0, ""), bip39_seed(vectors[0].0, "TREZOR"));
+        assert_ne!(
+            bip39_seed(vectors[0].0, ""),
+            bip39_seed(vectors[0].0, "TREZOR")
+        );
     }
 
     #[test]
@@ -2714,8 +2853,14 @@ mod tests {
         assert_ne!(n, migration_nullifier(1, &KEY, &other_domain, &credential));
         assert_ne!(n, migration_nullifier(2, &KEY, &DOMAIN, &credential));
         assert_ne!(n, migration_nullifier(1, &other_key, &DOMAIN, &credential));
-        assert_ne!(n, migration_nullifier(1, &KEY, &DOMAIN, &Credential::EthereumAddress([7; 20])));
-        assert_ne!(n, migration_nullifier(1, &KEY, &DOMAIN, &Credential::BitcoinKeyHash([8; 20])));
+        assert_ne!(
+            n,
+            migration_nullifier(1, &KEY, &DOMAIN, &Credential::EthereumAddress([7; 20]))
+        );
+        assert_ne!(
+            n,
+            migration_nullifier(1, &KEY, &DOMAIN, &Credential::BitcoinKeyHash([8; 20]))
+        );
 
         // An Ed25519 key proved from its seed or through SLIP-0010 has one nullifier.
         let master = seed(16);
@@ -2723,12 +2868,16 @@ mod tests {
         let leaf = slip10_ed25519_derive(&master, &path).unwrap();
         let via_slip10 = derive(
             Lock::Ed25519,
-            KeySource::Slip10 { path: public(&path) },
+            KeySource::Slip10 {
+                path: public(&path),
+            },
             &OwnershipWitness::seed(&master),
         );
         let via_hidden_path = derive(
             Lock::Ed25519,
-            KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 3 } },
+            KeySource::Slip10 {
+                path: PathSpec::Hidden { max_depth: 3 },
+            },
             &OwnershipWitness::seed(&master).with_path(&path),
         );
         let via_seed = derive(
@@ -2782,7 +2931,10 @@ mod tests {
             &OwnershipWitness::seed(&master),
         );
         assert_ne!(ethereum.nullifier, seeded.nullifier);
-        assert_ne!(ethereum.credential.identifier(), seeded.credential.identifier());
+        assert_ne!(
+            ethereum.credential.identifier(),
+            seeded.credential.identifier()
+        );
     }
 
     /// Row budget of the parts every statement shares.
@@ -2820,18 +2972,60 @@ mod tests {
         let order = arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
         let key = OwnershipWitness::secp256k1_key(&KEY);
         let seed_root = |path| bip32(Bip32Root::Seed, path);
-        assert!(try_derive(Lock::P2pkh, KeySource::Secp256k1Key, &OwnershipWitness::secp256k1_key(&[0; 32])).is_none());
-        assert!(try_derive(Lock::Ethereum, KeySource::Secp256k1Key, &OwnershipWitness::secp256k1_key(&order)).is_none());
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                KeySource::Secp256k1Key,
+                &OwnershipWitness::secp256k1_key(&[0; 32])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::Ethereum,
+                KeySource::Secp256k1Key,
+                &OwnershipWitness::secp256k1_key(&order)
+            )
+            .is_none()
+        );
         // Lock and source of different curves.
         assert!(try_derive(Lock::Ed25519, KeySource::Secp256k1Key, &key).is_none());
         assert!(try_derive(Lock::P2pkh, KeySource::Ed25519Seed, &key).is_none());
         // A script tree without its root.
         assert!(try_derive(Lock::TaprootScriptTree, KeySource::Secp256k1Key, &key).is_none());
         // Seed lengths, path lengths, a hidden path longer than its bound.
-        assert!(try_derive(Lock::P2pkh, seed_root(public(&[])), &OwnershipWitness::seed(&[1; 15])).is_none());
-        assert!(try_derive(Lock::P2pkh, seed_root(public(&[])), &OwnershipWitness::seed(&[1; 65])).is_none());
-        assert!(try_derive(Lock::P2pkh, seed_root(public(&[0; 11])), &OwnershipWitness::seed(&[1; 32])).is_none());
-        assert!(try_derive(Lock::P2pkh, seed_root(public(&[0; 10])), &OwnershipWitness::seed(&[1; 16])).is_some());
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                seed_root(public(&[])),
+                &OwnershipWitness::seed(&[1; 15])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                seed_root(public(&[])),
+                &OwnershipWitness::seed(&[1; 65])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                seed_root(public(&[0; 11])),
+                &OwnershipWitness::seed(&[1; 32])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                seed_root(public(&[0; 10])),
+                &OwnershipWitness::seed(&[1; 16])
+            )
+            .is_some()
+        );
         let hidden = |max_depth| seed_root(PathSpec::Hidden { max_depth });
         let walk = OwnershipWitness::seed(&[1; 32]).with_path(&[1, 2, 3]);
         assert!(try_derive(Lock::P2pkh, hidden(2), &walk).is_none());
@@ -2840,12 +3034,40 @@ mod tests {
         assert!(try_derive(Lock::P2pkh, hidden(11), &walk).is_none());
         // SLIP-0010 has hardened steps only.
         let slip = |path| KeySource::Slip10 { path };
-        assert!(try_derive(Lock::Ed25519, slip(public(&[H, 1])), &OwnershipWitness::seed(&[1; 32])).is_none());
-        assert!(try_derive(Lock::Ed25519, slip(PathSpec::Hidden { max_depth: 3 }), &walk).is_none());
+        assert!(
+            try_derive(
+                Lock::Ed25519,
+                slip(public(&[H, 1])),
+                &OwnershipWitness::seed(&[1; 32])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::Ed25519,
+                slip(PathSpec::Hidden { max_depth: 3 }),
+                &walk
+            )
+            .is_none()
+        );
         // An extended key is 64 bytes with a valid scalar.
         let xprv = |path| bip32(Bip32Root::ExtendedKey, path);
-        assert!(try_derive(Lock::P2pkh, xprv(public(&[1])), &OwnershipWitness::seed(&[1; 32])).is_none());
-        assert!(try_derive(Lock::P2pkh, xprv(public(&[1])), &OwnershipWitness::seed(&[0; 64])).is_none());
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                xprv(public(&[1])),
+                &OwnershipWitness::seed(&[1; 32])
+            )
+            .is_none()
+        );
+        assert!(
+            try_derive(
+                Lock::P2pkh,
+                xprv(public(&[1])),
+                &OwnershipWitness::seed(&[0; 64])
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2853,24 +3075,40 @@ mod tests {
         for (name, lock, source, witness) in cases() {
             let st = derive(lock, source, &witness);
             let bytes = st.to_bytes();
-            assert_eq!(OwnershipStatement::from_bytes(&bytes), Some(st.clone()), "{name}");
+            assert_eq!(
+                OwnershipStatement::from_bytes(&bytes),
+                Some(st.clone()),
+                "{name}"
+            );
             assert_eq!(bytes[29], lock as u8);
             assert_eq!(bytes[30], u8::from(st.source.proves_seed_provenance()));
 
             let mut longer = bytes.clone();
             longer.push(0);
             assert_eq!(OwnershipStatement::from_bytes(&longer), None, "{name}");
-            assert_eq!(OwnershipStatement::from_bytes(&bytes[..bytes.len() - 1]), None, "{name}");
+            assert_eq!(
+                OwnershipStatement::from_bytes(&bytes[..bytes.len() - 1]),
+                None,
+                "{name}"
+            );
             // The tag and the exposure byte are checked; every other byte is a field.
             for at in (0..29).chain([30]) {
                 let mut bad = bytes.clone();
                 bad[at] ^= 1;
-                assert_eq!(OwnershipStatement::from_bytes(&bad), None, "{name} byte {at}");
+                assert_eq!(
+                    OwnershipStatement::from_bytes(&bad),
+                    None,
+                    "{name} byte {at}"
+                );
             }
             for at in (29..bytes.len()).filter(|&at| at != 30) {
                 let mut other = bytes.clone();
                 other[at] ^= 0x40;
-                assert_ne!(OwnershipStatement::from_bytes(&other), Some(st.clone()), "{name} byte {at}");
+                assert_ne!(
+                    OwnershipStatement::from_bytes(&other),
+                    Some(st.clone()),
+                    "{name} byte {at}"
+                );
             }
         }
         // Parameters outside the supported ranges are malformed and do not decode.
@@ -2879,16 +3117,41 @@ mod tests {
         let with = |f: &dyn Fn(&mut OwnershipStatement)| {
             let mut bad = st.clone();
             f(&mut bad);
-            (bad.is_well_formed(), OwnershipStatement::from_bytes(&bad.to_bytes()).is_some())
+            (
+                bad.is_well_formed(),
+                OwnershipStatement::from_bytes(&bad.to_bytes()).is_some(),
+            )
         };
-        let source = |source: KeySource| move |s: &mut OwnershipStatement| s.source = source.clone();
+        let source =
+            |source: KeySource| move |s: &mut OwnershipStatement| s.source = source.clone();
         assert_eq!(with(&|_| {}), (true, true));
-        assert_eq!(with(&source(bip32(Bip32Root::Seed, public(&[0; 11])))), (false, false));
-        assert_eq!(with(&source(bip32(Bip32Root::Seed, public(&[0; 10])))), (true, true));
-        assert_eq!(with(&source(bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 0 }))), (false, false));
-        assert_eq!(with(&source(bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 11 }))), (false, false));
+        assert_eq!(
+            with(&source(bip32(Bip32Root::Seed, public(&[0; 11])))),
+            (false, false)
+        );
+        assert_eq!(
+            with(&source(bip32(Bip32Root::Seed, public(&[0; 10])))),
+            (true, true)
+        );
+        assert_eq!(
+            with(&source(bip32(
+                Bip32Root::Seed,
+                PathSpec::Hidden { max_depth: 0 }
+            ))),
+            (false, false)
+        );
+        assert_eq!(
+            with(&source(bip32(
+                Bip32Root::Seed,
+                PathSpec::Hidden { max_depth: 11 }
+            ))),
+            (false, false)
+        );
         assert_eq!(with(&source(KeySource::Ed25519Seed)), (false, false));
-        assert_eq!(with(&source(KeySource::Slip10 { path: public(&[1]) })), (false, false));
+        assert_eq!(
+            with(&source(KeySource::Slip10 { path: public(&[1]) })),
+            (false, false)
+        );
         // The wire carries the credential's bytes and the lock gives them their type, so a
         // mistyped credential is malformed in memory and cannot be expressed on the wire.
         assert_eq!(with(&|s| s.lock = Lock::Ethereum), (false, true));
@@ -2909,16 +3172,33 @@ mod tests {
             let public = st.public_bits();
             let (shape, z, rows) = build(lock, &source, &public, &relation_witness(&witness));
             assert!(shape.is_satisfied(&z), "{name}");
-            assert_eq!(shape.num_sbox, 0, "the collaborative prover needs mul rows only");
+            assert_eq!(
+                shape.num_sbox, 0,
+                "the collaborative prover needs mul rows only"
+            );
             assert_eq!(shape.num_public, public.len());
-            assert!(rows > 80_000 && rows + 12 <= shape.num_rows(), "{name}: {rows}");
+            assert!(
+                rows > 80_000 && rows + 12 <= shape.num_rows(),
+                "{name}: {rows}"
+            );
             assert_eq!(st.public_inputs().unwrap(), z[1..=public.len()]);
             // The cached shape is built from a placeholder witness and zero public inputs.
-            assert_eq!(shape.digest(), ownership_shape(&st).unwrap().digest(), "{name}");
+            assert_eq!(
+                shape.digest(),
+                ownership_shape(&st).unwrap().digest(),
+                "{name}"
+            );
 
             // One wrong bit in the credential, in the chaining value, in the nullifier.
             let value_bits = 8 * lock.credential_bytes();
-            for at in [3, value_bits - 1, value_bits + 5, value_bits + 255, value_bits + 256, public.len() - 1] {
+            for at in [
+                3,
+                value_bits - 1,
+                value_bits + 5,
+                value_bits + 255,
+                value_bits + 256,
+                public.len() - 1,
+            ] {
                 let mut wrong = public.clone();
                 wrong[at] ^= true;
                 let (shape, z, _) = build(lock, &source, &wrong, &relation_witness(&witness));
@@ -2952,9 +3232,19 @@ mod tests {
         let st = derive(Lock::P2pkh, honest, &witness);
         let public_bits = st.public_bits();
         // Another index, swapped hardening, a shorter and a longer path: this key fails.
-        for path in [vec![H + 45, 1], vec![44, H + 1], vec![H + 44], vec![H + 44, 1, 0]] {
+        for path in [
+            vec![H + 45, 1],
+            vec![44, H + 1],
+            vec![H + 44],
+            vec![H + 44, 1, 0],
+        ] {
             let source = bip32(Bip32Root::Seed, PathSpec::Public(path));
-            let (shape, z, _) = build(Lock::P2pkh, &source, &public_bits, &relation_witness(&witness));
+            let (shape, z, _) = build(
+                Lock::P2pkh,
+                &source,
+                &public_bits,
+                &relation_witness(&witness),
+            );
             assert!(!shape.is_satisfied(&z));
         }
         // The same leaf from an extended key one step up: a different relation with
@@ -2977,7 +3267,13 @@ mod tests {
         let source = bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 2 });
         let mut digests = Vec::new();
         let mut credentials = Vec::new();
-        for (len, path) in [(16usize, vec![]), (17, vec![9]), (40, vec![H + 3]), (64, vec![H, 0]), (63, vec![1, H + 2])] {
+        for (len, path) in [
+            (16usize, vec![]),
+            (17, vec![9]),
+            (40, vec![H + 3]),
+            (64, vec![H, 0]),
+            (63, vec![1, H + 2]),
+        ] {
             let master = seed(len);
             let witness = OwnershipWitness::seed(&master).with_path(&path);
             let st = derive(Lock::P2pkh, source.clone(), &witness);
@@ -2987,7 +3283,12 @@ mod tests {
                 st.credential,
                 secp256k1_credential(Lock::P2pkh, &leaf.private_key, None).unwrap()
             );
-            let (shape, z, _) = build(Lock::P2pkh, &source, &st.public_bits(), &relation_witness(&witness));
+            let (shape, z, _) = build(
+                Lock::P2pkh,
+                &source,
+                &st.public_bits(),
+                &relation_witness(&witness),
+            );
             assert!(shape.is_satisfied(&z), "seed {len}, path {path:?}");
             digests.push(shape.digest());
             credentials.push(st.credential);
@@ -3007,7 +3308,10 @@ mod tests {
                 assert!(shape.is_satisfied(&z));
                 // Variable `1 + 8 * len` is the lowest bit of the first byte past the seed.
                 z[1 + 8 * len] = F::ONE;
-                assert!(!shape.is_satisfied(&z), "seed {len}: trailing byte accepted");
+                assert!(
+                    !shape.is_satisfied(&z),
+                    "seed {len}: trailing byte accepted"
+                );
             }
         }
         assert!(digests.windows(2).all(|w| w[0] == w[1]));
@@ -3040,7 +3344,8 @@ mod tests {
 
     #[test]
     fn bip32_child_key_enforces_the_rejection_rules() {
-        let order_be = arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+        let order_be =
+            arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
         let sub = |a: &[u8; 32], b: u8| {
             let mut out = *a;
             let mut borrow = u16::from(b);
@@ -3096,7 +3401,12 @@ mod tests {
         wrong_key[3] ^= 1;
         let seed = [9; 32];
         assert_eq!(
-            prove_ownership(&st, &OwnershipWitness::secp256k1_key(&wrong_key), REGIME, &seed),
+            prove_ownership(
+                &st,
+                &OwnershipWitness::secp256k1_key(&wrong_key),
+                REGIME,
+                &seed
+            ),
             Err(OwnershipError::WitnessMismatch)
         );
         // The right key cannot claim another nullifier, credential or domain.
@@ -3216,7 +3526,9 @@ mod tests {
                 push("path privacy", &|s| {
                     if let KeySource::Bip32 { path, .. } = &mut s.source {
                         *path = match path {
-                            PathSpec::Public(p) => PathSpec::Hidden { max_depth: p.len() as u8 },
+                            PathSpec::Public(p) => PathSpec::Hidden {
+                                max_depth: p.len() as u8,
+                            },
                             PathSpec::Hidden { .. } => public(&[H + 44, 7]),
                         };
                     }
@@ -3283,7 +3595,9 @@ mod tests {
         assert_eq!(OwnershipProof::from_bytes(&bytes, st).as_ref(), Some(proof));
         check_wire(
             &bytes,
-            &|b| OwnershipProof::from_bytes(b, st).is_some_and(|p| verify_ownership(st, REGIME, &p)),
+            &|b| {
+                OwnershipProof::from_bytes(b, st).is_some_and(|p| verify_ownership(st, REGIME, &p))
+            },
             name,
         );
     }
@@ -3324,7 +3638,11 @@ mod tests {
             let (st, _) = proven(i);
             for j in 0..count {
                 let (_, proof) = proven(j);
-                assert_eq!(verify_ownership(st, REGIME, proof), i == j, "proof {j} as statement {i}");
+                assert_eq!(
+                    verify_ownership(st, REGIME, proof),
+                    i == j,
+                    "proof {j} as statement {i}"
+                );
                 if i != j {
                     // Also with the other proof's own statement values under this kind.
                     let (other, _) = proven(j);
@@ -3333,12 +3651,21 @@ mod tests {
                     crossed.source = st.source.clone();
                     if let Some(credential) = st.lock.credential(other.credential.value()) {
                         crossed.credential = credential;
-                        assert!(!verify_ownership(&crossed, REGIME, proof), "{j} relabelled as {i}");
+                        assert!(
+                            !verify_ownership(&crossed, REGIME, proof),
+                            "{j} relabelled as {i}"
+                        );
                     }
                 }
             }
-            assert!(!verify_ownership(st, REGIME, batch_proof), "batch proof as {i}");
-            assert!(!verify_batch(batch, REGIME, &proven(i).1), "proof {i} as batch");
+            assert!(
+                !verify_ownership(st, REGIME, batch_proof),
+                "batch proof as {i}"
+            );
+            assert!(
+                !verify_batch(batch, REGIME, &proven(i).1),
+                "proof {i} as batch"
+            );
         }
         // A batch proof is not a proof of one of its entries either.
         let entry = batch.statement(0).unwrap();
@@ -3367,7 +3694,14 @@ mod tests {
         let tails: Vec<Vec<u32>> = batch.entries.iter().map(|e| e.tail.clone()).collect();
         let public_bits = batch.public_bits();
         let run = |bits: &[bool], secret: &[u8]| {
-            let (shape, z, rows) = build_batch(Lock::P2pkh, Bip32Root::Seed, &batch.prefix, &tails, bits, secret);
+            let (shape, z, rows) = build_batch(
+                Lock::P2pkh,
+                Bip32Root::Seed,
+                &batch.prefix,
+                &tails,
+                bits,
+                secret,
+            );
             (shape.is_satisfied(&z), shape, rows)
         };
         let (ok, shape, rows) = run(&public_bits, &witness.secret);
@@ -3386,8 +3720,16 @@ mod tests {
         // Sharing: two entries cost less than two single statements.
         let single = bip32(Bip32Root::Seed, public(&[H + 44, 0]));
         let st = derive(Lock::P2pkh, single.clone(), &witness);
-        let (_, _, single_rows) = build(Lock::P2pkh, &single, &st.public_bits(), &relation_witness(&witness));
-        assert!(rows + 300_000 < 2 * single_rows, "{rows} vs 2 x {single_rows}");
+        let (_, _, single_rows) = build(
+            Lock::P2pkh,
+            &single,
+            &st.public_bits(),
+            &relation_witness(&witness),
+        );
+        assert!(
+            rows + 300_000 < 2 * single_rows,
+            "{rows} vs 2 x {single_rows}"
+        );
 
         // Encoding.
         let bytes = batch.to_bytes();
@@ -3399,7 +3741,11 @@ mod tests {
         for at in 0..bytes.len() {
             let mut other = bytes.clone();
             other[at] ^= 0x10;
-            assert_ne!(BatchStatement::from_bytes(&other), Some(batch.clone()), "byte {at}");
+            assert_ne!(
+                BatchStatement::from_bytes(&other),
+                Some(batch.clone()),
+                "byte {at}"
+            );
         }
         let mut empty = batch.clone();
         empty.entries.clear();
@@ -3444,7 +3790,10 @@ mod tests {
         let bytes = proof.to_bytes();
         check_wire(
             &bytes,
-            &|b| OwnershipProof::from_bytes_batch(b, batch).is_some_and(|p| verify_batch(batch, REGIME, &p)),
+            &|b| {
+                OwnershipProof::from_bytes_batch(b, batch)
+                    .is_some_and(|p| verify_batch(batch, REGIME, &p))
+            },
             "batch",
         );
     }
@@ -3462,7 +3811,11 @@ mod tests {
             assert_eq!(binding.pq_commitment, PQ);
             assert_eq!(binding.epoch, EPOCH);
             assert_eq!(binding.legacy_id, st.credential.identifier());
-            let exposure = if hidden { KeyExposure::Hidden } else { KeyExposure::Revealed };
+            let exposure = if hidden {
+                KeyExposure::Hidden
+            } else {
+                KeyExposure::Revealed
+            };
             assert_eq!(binding.exposure, exposure, "{name}");
         }
         let (batch, _) = batch_case();
@@ -3552,10 +3905,30 @@ mod tests {
         let cardano = [H + 1852, H + 1815, H, 0, 0];
         let singles: Vec<(&str, Lock, KeySource, OwnershipWitness)> = vec![
             ("p2pkh, key", Lock::P2pkh, KeySource::Secp256k1Key, key()),
-            ("p2pkh uncompressed, key", Lock::P2pkhUncompressed, KeySource::Secp256k1Key, key()),
-            ("p2sh-p2wpkh, key", Lock::P2shP2wpkh, KeySource::Secp256k1Key, key()),
-            ("ethereum, key", Lock::Ethereum, KeySource::Secp256k1Key, key()),
-            ("taproot key path, key", Lock::TaprootKeyPath, KeySource::Secp256k1Key, key()),
+            (
+                "p2pkh uncompressed, key",
+                Lock::P2pkhUncompressed,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "p2sh-p2wpkh, key",
+                Lock::P2shP2wpkh,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "ethereum, key",
+                Lock::Ethereum,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
+            (
+                "taproot key path, key",
+                Lock::TaprootKeyPath,
+                KeySource::Secp256k1Key,
+                key(),
+            ),
             (
                 "taproot script tree, key",
                 Lock::TaprootScriptTree,
@@ -3577,23 +3950,39 @@ mod tests {
             (
                 "ed25519, slip10 m/44'/501'/0'/0'",
                 Lock::Ed25519,
-                KeySource::Slip10 { path: public(&[H + 44, H + 501, H, H]) },
+                KeySource::Slip10 {
+                    path: public(&[H + 44, H + 501, H, H]),
+                },
                 master(),
             ),
             (
                 "ed25519, slip10 hidden path (max 4)",
                 Lock::Ed25519,
-                KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 4 } },
+                KeySource::Slip10 {
+                    path: PathSpec::Hidden { max_depth: 4 },
+                },
                 master().with_path(&[H + 44, H + 501, H, H]),
             ),
             (
                 "ed25519, bip32-ed25519 m/1852'/1815'/0'/0/0",
                 Lock::Ed25519,
-                KeySource::Bip32Ed25519 { path: cardano.to_vec() },
+                KeySource::Bip32Ed25519 {
+                    path: cardano.to_vec(),
+                },
                 OwnershipWitness::ed25519_extended_key(&cardano_root()),
             ),
-            ("p2pkh, bip32 seed m/44'", Lock::P2pkh, seeded(&[H + 44]), master()),
-            ("p2pkh, bip32 seed m/44'/0'/0'/0/0", Lock::P2pkh, seeded(&standard), master()),
+            (
+                "p2pkh, bip32 seed m/44'",
+                Lock::P2pkh,
+                seeded(&[H + 44]),
+                master(),
+            ),
+            (
+                "p2pkh, bip32 seed m/44'/0'/0'/0/0",
+                Lock::P2pkh,
+                seeded(&standard),
+                master(),
+            ),
             (
                 "p2pkh, bip32 master xprv m/44'/0'/0'/0/0",
                 Lock::P2pkh,
@@ -3637,7 +4026,12 @@ mod tests {
             }
             let st = derive(lock, source.clone(), &witness);
             let t = std::time::Instant::now();
-            let (shape, _, rows) = build(lock, &source, &st.public_bits(), &relation_witness(&witness));
+            let (shape, _, rows) = build(
+                lock,
+                &source,
+                &st.public_bits(),
+                &relation_witness(&witness),
+            );
             let synth_s = t.elapsed().as_secs_f64();
             report(
                 name,
@@ -3646,7 +4040,8 @@ mod tests {
                 synth_s,
                 &|| prove_ownership(&st, &witness, REGIME, &[3; 32]).unwrap(),
                 &|bytes| {
-                    OwnershipProof::from_bytes(bytes, &st).is_some_and(|p| verify_ownership(&st, REGIME, &p))
+                    OwnershipProof::from_bytes(bytes, &st)
+                        .is_some_and(|p| verify_ownership(&st, REGIME, &p))
                 },
             );
         }
@@ -3660,15 +4055,30 @@ mod tests {
             if !wanted(&name) {
                 continue;
             }
-            let targets: Vec<(Vec<u32>, [u8; 32])> = (0..n).map(|i| (vec![i], [i as u8; 32])).collect();
+            let targets: Vec<(Vec<u32>, [u8; 32])> =
+                (0..n).map(|i| (vec![i], [i as u8; 32])).collect();
             let witness = master();
             let prefix = [H + 44, H, H, 0];
-            let batch = BatchStatement::derive(Lock::P2pkh, Bip32Root::Seed, &prefix, &targets, &witness, DOMAIN, EPOCH)
-                .unwrap();
+            let batch = BatchStatement::derive(
+                Lock::P2pkh,
+                Bip32Root::Seed,
+                &prefix,
+                &targets,
+                &witness,
+                DOMAIN,
+                EPOCH,
+            )
+            .unwrap();
             let tails: Vec<Vec<u32>> = targets.iter().map(|(t, _)| t.clone()).collect();
             let t = std::time::Instant::now();
-            let (shape, _, rows) =
-                build_batch(Lock::P2pkh, Bip32Root::Seed, &prefix, &tails, &batch.public_bits(), &witness.secret);
+            let (shape, _, rows) = build_batch(
+                Lock::P2pkh,
+                Bip32Root::Seed,
+                &prefix,
+                &tails,
+                &batch.public_bits(),
+                &witness.secret,
+            );
             let synth_s = t.elapsed().as_secs_f64();
             report(
                 &name,
@@ -3677,7 +4087,8 @@ mod tests {
                 synth_s,
                 &|| prove_batch(&batch, &witness, REGIME, &[4; 32]).unwrap(),
                 &|bytes| {
-                    OwnershipProof::from_bytes_batch(bytes, &batch).is_some_and(|p| verify_batch(&batch, REGIME, &p))
+                    OwnershipProof::from_bytes_batch(bytes, &batch)
+                        .is_some_and(|p| verify_batch(&batch, REGIME, &p))
                 },
             );
         }
@@ -3705,7 +4116,8 @@ mod tests {
             let (prk, t) = (input(cs, 32), input(cs, 33));
             let key = HmacKey::sha256(cs, &prk);
             let _ = key.mac(cs, &t);
-        }) - key_rows - 8 * 65;
+        }) - key_rows
+            - 8 * 65;
         let chunk_hash = rows(&|cs| {
             let chunk = input(cs, 32);
             let _ = sha256(cs, &chunk);

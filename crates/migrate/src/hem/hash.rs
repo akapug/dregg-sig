@@ -22,7 +22,7 @@
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc};
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, Lc, Source};
 
 type F = Goldilocks;
 
@@ -71,9 +71,18 @@ pub fn const_bits(bytes: &[u8]) -> Vec<Lc> {
 /// Fresh Boolean-constrained bits holding `bytes` (one row per bit).
 pub fn alloc_bits(cs: &mut ConstraintSystem, bytes: &[u8]) -> Vec<Lc> {
     let mut out = Vec::with_capacity(8 * bytes.len());
-    for &b in bytes {
+    let source = cs.source(|| Source::Input {
+        bits: 8 * bytes.len() as u32,
+    });
+    for (at, &b) in bytes.iter().enumerate() {
         for i in 0..8 {
-            let bit: Lc = cs.alloc(fu(u64::from(b >> i) & 1)).into();
+            let bit: Lc = cs
+                .alloc_defined(fu(u64::from(b >> i) & 1), || Def::Bits {
+                    source,
+                    lo: (8 * at + i) as u32,
+                    width: 1,
+                })
+                .into();
             cs.enforce_boolean(&bit);
             out.push(bit);
         }
@@ -197,7 +206,12 @@ fn affine(co: &[i64; 4], x: &Lc, y: &Lc, z: &Lc) -> Lc {
 
 fn one_row(cs: &mut ConstraintSystem, g: &OneRow, x: &Lc, y: &Lc, z: &Lc) -> Lc {
     let value = (g.f)(bit_value(cs, x), bit_value(cs, y), bit_value(cs, z)) & 1;
-    let p = cs.alloc(fu(value));
+    let p = cs.alloc_defined(fu(value), || Def::Ratio {
+        num: affine(&g.c, x, y, z),
+        den: affine(&g.b, x, y, z),
+        minus: affine(&g.a, x, y, z),
+        scale: fi(g.pk).inv(),
+    });
     cs.enforce_mul(
         affine(&g.a, x, y, z).plus(&Lc::term(p, fi(g.pk))),
         affine(&g.b, x, y, z),
@@ -309,10 +323,17 @@ impl Word {
 
     /// Fresh Boolean-constrained word holding the low `width` bits of `value`.
     pub fn alloc(cs: &mut ConstraintSystem, value: u64, width: usize) -> Self {
+        let source = cs.source(|| Source::Input { bits: width as u32 });
         Self::from_bits(
             (0..width)
                 .map(|i| {
-                    let bit: Lc = cs.alloc(fu((value >> i) & 1)).into();
+                    let bit: Lc = cs
+                        .alloc_defined(fu((value >> i) & 1), || Def::Bits {
+                            source,
+                            lo: i as u32,
+                            width: 1,
+                        })
+                        .into();
                     cs.enforce_boolean(&bit);
                     bit
                 })
@@ -347,7 +368,9 @@ impl Word {
         self.bits
             .iter()
             .enumerate()
-            .try_fold(0u64, |acc, (i, bit)| Some(acc | ((const_of(bit)? & 1) << i)))
+            .try_fold(0u64, |acc, (i, bit)| {
+                Some(acc | ((const_of(bit)? & 1) << i))
+            })
     }
 
     pub fn rotr(&self, n: usize) -> Self {
@@ -474,10 +497,20 @@ pub fn add_mod(cs: &mut ConstraintSystem, plus: &[&Word], minus: &[&Word]) -> Wo
         }
         let sum = Lc::combine(&parts).plus_const(fu(offset));
         let total = cs.eval(&sum).to_canonical_u64();
+        let source = cs.source(|| Source::Form {
+            lc: sum.clone(),
+            bits: (64 - max.leading_zeros()).max(limb as u32),
+        });
 
         let result: Vec<Lc> = (0..limb)
             .map(|i| {
-                let bit: Lc = cs.alloc(fu((total >> i) & 1)).into();
+                let bit: Lc = cs
+                    .alloc_defined(fu((total >> i) & 1), || Def::Bits {
+                        source,
+                        lo: i as u32,
+                        width: 1,
+                    })
+                    .into();
                 cs.enforce_boolean(&bit);
                 bit
             })
@@ -493,7 +526,13 @@ pub fn add_mod(cs: &mut ConstraintSystem, plus: &[&Word], minus: &[&Word]) -> Wo
         } else {
             let low: Vec<Lc> = (0..carry_bits - 1)
                 .map(|j| {
-                    let bit: Lc = cs.alloc(fu((total >> (limb + j)) & 1)).into();
+                    let bit: Lc = cs
+                        .alloc_defined(fu((total >> (limb + j)) & 1), || Def::Bits {
+                            source,
+                            lo: (limb + j) as u32,
+                            width: 1,
+                        })
+                        .into();
                     cs.enforce_boolean(&bit);
                     bit
                 })
@@ -519,9 +558,19 @@ pub fn add_wide(cs: &mut ConstraintSystem, a: &[Lc], b: &[Lc]) -> Vec<Lc> {
         let limb = x.len();
         let sum = pack_bits(x).plus(&pack_bits(y)).plus(&carry);
         let total = cs.eval(&sum).to_canonical_u64();
+        let source = cs.source(|| Source::Form {
+            lc: sum.clone(),
+            bits: limb as u32 + 1,
+        });
         let result: Vec<Lc> = (0..limb)
             .map(|i| {
-                let bit: Lc = cs.alloc(fu((total >> i) & 1)).into();
+                let bit: Lc = cs
+                    .alloc_defined(fu((total >> i) & 1), || Def::Bits {
+                        source,
+                        lo: i as u32,
+                        width: 1,
+                    })
+                    .into();
                 cs.enforce_boolean(&bit);
                 bit
             })
@@ -743,11 +792,7 @@ impl Sha2 {
             if t + 1 == self.rounds {
                 // The last round's `a` and `e` are used only by the feed-forward sum, so
                 // they are never decomposed on their own.
-                let out_a = add_mod(
-                    cs,
-                    &[&state[0], &h, &s1, &choose, &k, wt, &s0, &major],
-                    &[],
-                );
+                let out_a = add_mod(cs, &[&state[0], &h, &s1, &choose, &k, wt, &s0, &major], &[]);
                 let out_e = add_mod(cs, &[&state[4], &d, &h, &s1, &choose, &k, wt], &[]);
                 return [
                     out_a,
@@ -1309,7 +1354,8 @@ mod tests {
         ] {
             for v in 0..8u64 {
                 let (x, y, z) = (v & 1, (v >> 1) & 1, (v >> 2) & 1);
-                let at = |co: &[i64; 4]| co[0] + co[1] * x as i64 + co[2] * y as i64 + co[3] * z as i64;
+                let at =
+                    |co: &[i64; 4]| co[0] + co[1] * x as i64 + co[2] * y as i64 + co[3] * z as i64;
                 let f = (g.f)(x, y, z) as i64;
                 assert!(f == 0 || f == 1);
                 // Nonzero small integers stay nonzero in the field, so `p` is unique.
@@ -1332,7 +1378,12 @@ mod tests {
                 assert!(shape.is_satisfied(&w));
                 // Variables 1..=3 are the inputs, 4 is the output.
                 assert_eq!(w[4], fu(f as u64));
-                for wrong in [fu(1 - f as u64), fu(2), F::ZERO - F::ONE, fu(1) - fu(2).inv()] {
+                for wrong in [
+                    fu(1 - f as u64),
+                    fu(2),
+                    F::ZERO - F::ONE,
+                    fu(1) - fu(2).inv(),
+                ] {
                     let mut bad = w.clone();
                     bad[4] = wrong;
                     assert!(!shape.is_satisfied(&bad), "{name} at {v}");
@@ -1504,25 +1555,26 @@ mod tests {
                             (0..n_plus).map(|i| pick(&mut cs, i, false)).collect();
                         let minus: Vec<(Word, u64)> =
                             (0..n_minus).map(|i| pick(&mut cs, i + 1, true)).collect();
-                        let want = plus
-                            .iter()
-                            .fold(0u64, |acc, (_, v)| acc.wrapping_add(*v));
-                        let want = minus
-                            .iter()
-                            .fold(want, |acc, (_, v)| acc.wrapping_sub(*v))
-                            & mask;
+                        let want = plus.iter().fold(0u64, |acc, (_, v)| acc.wrapping_add(*v));
+                        let want =
+                            minus.iter().fold(want, |acc, (_, v)| acc.wrapping_sub(*v)) & mask;
                         let before = cs.num_rows();
                         let p: Vec<&Word> = plus.iter().map(|(w, _)| w).collect();
                         let m: Vec<&Word> = minus.iter().map(|(w, _)| w).collect();
                         let sum = add_mod(&mut cs, &p, &m);
                         let added_rows = cs.num_rows() - before;
                         assert_eq!(sum.width(), width);
-                        assert_eq!(sum.value(&cs), want, "w{width} +{n_plus} -{n_minus} m{mode}");
+                        assert_eq!(
+                            sum.value(&cs),
+                            want,
+                            "w{width} +{n_plus} -{n_minus} m{mode}"
+                        );
                         let (shape, z) = cs.finish();
                         assert!(shape.is_satisfied(&z));
                         if added_rows > 0 {
                             // Every result and carry bit is pinned by the limb equation.
-                            let first = shape.mask_var_base - added_rows.min(shape.mask_var_base - 1);
+                            let first =
+                                shape.mask_var_base - added_rows.min(shape.mask_var_base - 1);
                             for i in first..shape.mask_var_base {
                                 let mut bad = z.clone();
                                 bad[i] = F::ONE - bad[i];
@@ -1666,9 +1718,16 @@ mod tests {
                 .collect();
             let out = select(&mut cs, &bits[0], &bits[1], &bits[2]);
             assert_eq!(cs.num_rows(), 4);
-            let want = if v & 1 == 1 { (v >> 1) & 1 } else { (v >> 2) & 1 };
+            let want = if v & 1 == 1 {
+                (v >> 1) & 1
+            } else {
+                (v >> 2) & 1
+            };
             assert_eq!(cs.eval(&out), fu(want));
-            assert_eq!(select(&mut cs, &Lc::constant(F::ONE), &bits[1], &bits[2]), bits[1]);
+            assert_eq!(
+                select(&mut cs, &Lc::constant(F::ONE), &bits[1], &bits[2]),
+                bits[1]
+            );
             assert_eq!(select(&mut cs, &Lc::zero(), &bits[1], &bits[2]), bits[2]);
             assert_eq!(cs.num_rows(), 4);
         }
@@ -1717,8 +1776,10 @@ mod tests {
         let reference = |m: &[u8]| native::sha512(m).to_vec();
         assert_eq!(
             reference(b"abc"),
-            hex("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
-                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+            hex(
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
+                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+            )
         );
         check(&[b"abc"], &reference(b"abc"), |cs, i| sha512(cs, &i[0]));
         check_hash(sha512, reference, &[0, 1, 111, 112, 127, 128, 129]);
@@ -1825,9 +1886,11 @@ mod tests {
         }
         for (key_len, msg_len) in [(0, 0), (32, 55), (64, 56), (65, 1)] {
             let (key, msg) = (bytes(key_len, 11), bytes(msg_len, 12));
-            check(&[&key, &msg], &hmac_sha256_reference(&key, &msg), |cs, i| {
-                hmac_sha256(cs, &i[0], &i[1])
-            });
+            check(
+                &[&key, &msg],
+                &hmac_sha256_reference(&key, &msg),
+                |cs, i| hmac_sha256(cs, &i[0], &i[1]),
+            );
         }
     }
 
