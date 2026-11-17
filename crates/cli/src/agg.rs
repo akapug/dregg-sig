@@ -55,6 +55,32 @@ pub fn enroll_committee(seed: &[u8; 32], validators: u32, wal_dir: &str) -> Resu
     Ok(())
 }
 
+/// A committee reserves `validators + 1` TPM2 NV counters from `--anchor-tpm-nv <base>`:
+/// validator `i` has `base + i` and the ceremony anchor has `base + validators`. Every
+/// anchor seals its own counter value, so no two may share an index.
+fn committee_tpm_slots(validators: u32) -> Result<u32, CliError> {
+    validators
+        .checked_add(1)
+        .ok_or_else(|| CliError::usage("committee TPM2 anchor count overflow"))
+}
+
+/// Refuse a committee whose TPM2 NV range is invalid or not fully readable, before any
+/// write-ahead log or anchor record of the enrollment exists.
+pub fn check_committee_anchor_range(
+    cfg: &crate::anchor::AnchorConfig,
+    validators: u32,
+) -> Result<(), CliError> {
+    cfg.check_tpm_range(committee_tpm_slots(validators)?)
+}
+
+fn committee_anchor_config(
+    cfg: &crate::anchor::AnchorConfig,
+    index: u32,
+    validators: u32,
+) -> Result<crate::anchor::AnchorConfig, CliError> {
+    cfg.tpm_slot(index, committee_tpm_slots(validators)?)
+}
+
 /// Provision the committee's ceremony reservation journal and optional external anchors.
 pub fn enroll_committee_ceremony(
     secret_path: &str,
@@ -67,13 +93,14 @@ pub fn enroll_committee_ceremony(
     let ceremony_path = format!("{secret_path}.ceremony");
     let ceremony_mac = derive_secret(seed, b"committee ceremony journal mac");
     let (journal, ceremony_seal) = if let Some(cfg) = anchor_cfg {
+        check_committee_anchor_range(cfg, validators)?;
         cfg.validate_isolation(&[secret_path], &[wal_dir], true)?;
         for index in 0..validators {
             let root = digest4_to_bytes(&validator(seed, index).pk.pk_root);
             let anchor_mac =
                 derive_secret(seed, format!("agg validator anchor {index}").as_bytes());
             let val_anchor = crate::anchor::FsExternalMountAnchor::provision_fresh(
-                cfg,
+                &committee_anchor_config(cfg, index, validators)?,
                 &[secret_path],
                 &[wal_dir],
                 "agg_wal",
@@ -84,7 +111,7 @@ pub fn enroll_committee_ceremony(
         }
         let ceremony_anchor_mac = derive_secret(seed, b"committee ceremony anchor mac");
         let ceremony_anchor = crate::anchor::FsExternalMountAnchor::provision_fresh(
-            cfg,
+            &committee_anchor_config(cfg, validators, validators)?,
             &[secret_path],
             &[wal_dir],
             "agg_ceremony",
@@ -363,6 +390,8 @@ Third form: committee-vault demo signing + aggregation backed by per-validator F
   --passphrase-env <VAR> / --passphrase-file <PATH>  unlock a sealed committee vault
   --deterministic     derive the proof blinding seed from the inputs instead of OS entropy
   --anchor-dir <dir>  verify and advance external monotone anchors before releasing proof
+  --anchor-tpm-nv <base>  use the committee's reserved range: validator i=base+i,
+                         ceremony=base+validators; all counters must be predefined and exclusive
   --vault-dir <dir>   explicit local custody directory verified disjoint from --anchor-dir
   --ephemeral-unanchored  allow disposable committee signing without rollback protection
   --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
@@ -604,7 +633,7 @@ pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
         let mut ceremony_journal = if let Some(cfg) = &anchor_cfg {
             let ceremony_anchor_mac = derive_secret(&seed, b"committee ceremony anchor mac");
             let ceremony_anchor = crate::anchor::FsExternalMountAnchor::open_existing(
-                cfg,
+                &committee_anchor_config(cfg, size, size)?,
                 &[secret_path],
                 &[wal_dir],
                 "agg_ceremony",
@@ -673,7 +702,7 @@ pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
                 let anchor_mac =
                     derive_secret(&seed, format!("agg validator anchor {index}").as_bytes());
                 let val_anchor = crate::anchor::FsExternalMountAnchor::open_existing(
-                    cfg,
+                    &committee_anchor_config(cfg, index as u32, size)?,
                     &[secret_path],
                     &[wal_dir],
                     "agg_wal",
@@ -1083,6 +1112,104 @@ mod tests {
         assert!(enroll_committee(&[7; 32], 1, &path("shared")).is_err());
         assert_eq!(std::fs::read_dir(path("shared")).unwrap().count(), 0);
         assert_eq!(mode("shared"), 0o755);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tpm_anchor_tests {
+    use super::*;
+    use crate::anchor::{AnchorConfig, FsExternalMountAnchor, tpm_model};
+
+    const BASE: u32 = 0x0180_0101;
+    const VALIDATORS: u32 = 3;
+
+    // The real committee enrollment call chain against one TPM. With a single shared NV
+    // index each validator's provisioning increment left the earlier seals behind, so
+    // validator 0 could not be reopened with the configuration it was enrolled under.
+    #[test]
+    fn tpm_anchored_committee_reopens_and_refuses_rollback_of_each_domain() {
+        let root = std::env::temp_dir().join(format!(
+            "qsag-committee-tpm-{}",
+            crate::codec::to_hex(&os_random_32().unwrap()[..8])
+        ));
+        crate::cli::private_dir(root.to_str().unwrap(), true).unwrap();
+        let wal_dir = root.join("wal").to_str().unwrap().to_owned();
+        let secret_path = root.join("wal").join("committee.sk");
+        let secret_path = secret_path.to_str().unwrap();
+        let installed = tpm_model::install(BASE, VALIDATORS + 1, 41);
+        let tpm = &installed.0;
+        let seed = [0x42; 32];
+        let cfg = AnchorConfig {
+            tpm_nv_index: Some(BASE),
+            ..Default::default()
+        };
+
+        enroll_committee(&seed, VALIDATORS, &wal_dir).unwrap();
+        let committee: Vec<ValidatorPublicKey> =
+            (0..VALIDATORS).map(|i| validator(&seed, i).pk).collect();
+        let committee_root = compute_committee_root(&committee);
+        enroll_committee_ceremony(
+            secret_path,
+            &seed,
+            VALIDATORS,
+            &wal_dir,
+            committee_root,
+            Some(&cfg),
+        )
+        .unwrap();
+
+        // What `aggregate` does for validator 0: the layout helper, the same paths.
+        let validator_mac =
+            |i: u32| derive_secret(&seed, format!("agg validator anchor {i}").as_bytes()).0;
+        let validator_root = |i: u32| digest4_to_bytes(&committee[i as usize].pk_root);
+        let reopened = FsExternalMountAnchor::open_existing(
+            &committee_anchor_config(&cfg, 0, VALIDATORS).unwrap(),
+            &[secret_path],
+            &[&wal_dir],
+            "agg_wal",
+            validator_root(0),
+            validator_mac(0),
+        )
+        .unwrap_or_else(|e| panic!("honest validator 0 must reopen: {e:?}"));
+        reopened.verify_floor_at_least(b"agg_wal", 0).unwrap();
+        drop(reopened);
+        assert!(
+            tpm.counters().values().all(|n| *n > 41),
+            "every reserved counter backs one domain: {:?}",
+            tpm.counters()
+        );
+
+        for i in 0..VALIDATORS {
+            tpm_model::assert_domain_reopens_and_refuses_rollback(
+                tpm,
+                &cfg,
+                &wal_dir,
+                BASE + i,
+                "agg_wal",
+                validator_root(i),
+                validator_mac(i),
+            );
+        }
+        tpm_model::assert_domain_reopens_and_refuses_rollback(
+            tpm,
+            &cfg,
+            &wal_dir,
+            BASE + VALIDATORS,
+            "agg_ceremony",
+            committee_root,
+            derive_secret(&seed, b"committee ceremony anchor mac").0,
+        );
+
+        // A committee one counter short is refused before anything is written.
+        drop(installed);
+        let short = tpm_model::install(BASE, VALIDATORS, 41);
+        let err = check_committee_anchor_range(&cfg, VALIDATORS).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("TPM2 NV counter 0x01800104"),
+            "{err:?}"
+        );
+        assert!(short.0.counters().values().all(|n| *n == 41));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

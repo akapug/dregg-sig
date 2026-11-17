@@ -592,6 +592,9 @@ The secret file is created with owner-only permissions.
   --wal-dir <dir>       agg-jorts-poseidon2: directory in which each validator's epoch
                         write-ahead log is created (required for that scheme)
   --anchor-dir <dir>    stateful schemes: owner-only 0700 external monotone anchor directory
+  --anchor-tpm-nv <base>  predefined, initialized TPM counter; committees reserve validators+1
+                        exclusive counters: validator i=base+i, ceremony=base+validators
+  --anchor-vmgenid     optional snapshot/clone guard; requires disjoint --anchor-dir or TPM
   --vault-dir <dir>     explicit local custody directory verified disjoint from --anchor-dir
   --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
   --policy-ledger-dir <dir>  enroll the key against this custody policy ledger: it will then
@@ -875,6 +878,9 @@ pub fn keygen(raw: &[String]) -> Result<(), CliError> {
             let wal_dir = args
                 .get("wal-dir")
                 .ok_or_else(|| CliError::usage("agg-jorts-poseidon2 requires --wal-dir"))?;
+            if let Some(cfg) = &anchor_cfg {
+                crate::agg::check_committee_anchor_range(cfg, validators as u32)?;
+            }
             crate::agg::enroll_committee(&seed, validators as u32, wal_dir)?;
             let keys: Vec<Json> = (0..validators as u32)
                 .map(|i| Json::hex(&crate::agg::validator(&seed, i).pk.to_bytes()))

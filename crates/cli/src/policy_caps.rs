@@ -70,7 +70,8 @@ Post-quantum public-key capability chains over one-time Compact1122 (FrontierSum
 
   keygen     --secret-out <sk.json> --public-out <pk.json> [--tree-height <0..=8>]
              [--authority-id-hex <64-hex>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> |
-             --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>]
+             --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>]
+             --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM.
   mint       --secret <sk.json> --audience-hex <64-hex> [--token-id-hex <64-hex>]
              --token-out <biscuit.json> --step-key-out <step1.sk> [caveats] [anchor options]
   attenuate  --in <biscuit.json> --step-key <step.sk> --token-out <next.json>

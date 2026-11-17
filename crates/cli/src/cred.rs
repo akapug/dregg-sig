@@ -260,8 +260,8 @@ impl voprf::Transport for LocalToprfEndpoint {
 
 /// Vault-wide external monotone anchor + MAC-authenticated per-party generation ledger (`QSCRPST1`),
 /// binding every custodian's durable burn/counter generation AND the vault-wide high-water
-/// counter/epoch into a single [`FsExternalMountAnchor`] (`--anchor-dir`, `--anchor-tpm-nv`,
-/// `--anchor-vmgenid`).
+/// counter/epoch into a single [`FsExternalMountAnchor`] (`--anchor-dir` or `--anchor-tpm-nv`,
+/// optionally combined with the `--anchor-vmgenid` snapshot/clone guard).
 struct VaultPartyGenAnchor {
     anchor: FsExternalMountAnchor,
     pstate_record: LockedRecord,
@@ -1407,7 +1407,7 @@ fn voprf_keygen(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig cred voprf-keygen --vault-dir <dir> --public-out <path> [--threshold 2 --parties 5] [--backend rss|shamir-spdz] [--max-evaluations <n>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <name> | --passphrase-file <path> | --allow-unencrypted] [--deterministic] [--json]\n  rss: replicated (2, 5), all five servers evaluate. shamir-spdz: any 2 <= threshold <= parties <= 64, any `threshold` servers evaluate (default when the committee is not (2, 5))."
+            "dregg-sig cred voprf-keygen --vault-dir <dir> --public-out <path> [--threshold 2 --parties 5] [--backend rss|shamir-spdz] [--max-evaluations <n>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <name> | --passphrase-file <path> | --allow-unencrypted] [--deterministic] [--json]\n  rss: replicated (2, 5), all five servers evaluate. shamir-spdz: any 2 <= threshold <= parties <= 64, any `threshold` servers evaluate (default when the committee is not (2, 5)).\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }
@@ -1603,7 +1603,7 @@ fn voprf_eval(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig cred voprf-eval --vault-dir <dir> --public <path> --counter <n> --in <path|-> --out <path> [--signers 0,1,2,3,4] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <name> | --passphrase-file <path>] [--deterministic] [--json]\n  Replicated vaults need all five servers. Shamir-SPDZ vaults evaluate with any `threshold` servers: --signers, or by default the first `threshold` share files present."
+            "dregg-sig cred voprf-eval --vault-dir <dir> --public <path> --counter <n> --in <path|-> --out <path> [--signers 0,1,2,3,4] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <name> | --passphrase-file <path>] [--deterministic] [--json]\n  Replicated vaults need all five servers. Shamir-SPDZ vaults evaluate with any `threshold` servers: --signers, or by default the first `threshold` share files present.\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }
@@ -2319,7 +2319,7 @@ fn mldsa_keygen(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig cred mldsa-keygen [--threshold <t>] [--parties <n>] [--level <44|65|87>] [--backend rss|shamir] --vault-dir <dir> --public-out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>] [--allow-unencrypted] [--deterministic] [--json]\n  rss: replicated key shares, at most 16 custodians. shamir: one Shamir share per custodian, at most 64 custodians and threshold 8 (default above 16). Both sign with >= 2t - 1 custodians."
+            "dregg-sig cred mldsa-keygen [--threshold <t>] [--parties <n>] [--level <44|65|87>] [--backend rss|shamir] --vault-dir <dir> --public-out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>] [--allow-unencrypted] [--deterministic] [--json]\n  rss: replicated key shares, at most 16 custodians. shamir: one Shamir share per custodian, at most 64 custodians and threshold 8 (default above 16). Both sign with >= 2t - 1 custodians.\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }
@@ -2591,7 +2591,7 @@ fn mldsa_sign(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig cred mldsa-sign --vault-dir <dir> [--signers <i,j,..>] --epoch <n> --in <path|-> [--context-hex <hex>] --out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>] [--deterministic] [--json]"
+            "dregg-sig cred mldsa-sign --vault-dir <dir> [--signers <i,j,..>] --epoch <n> --in <path|-> [--context-hex <hex>] --out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <PATH>] [--deterministic] [--json]\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }

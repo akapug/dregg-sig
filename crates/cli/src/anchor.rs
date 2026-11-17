@@ -1,15 +1,23 @@
 //! External monotone anchor backend (`FsExternalMountAnchor`) for CLI custody state.
 //!
-//! Defends local stateful signing against full vault-directory snapshot rollback and VM/volume
-//! forks by composing up to three independent anti-rollback authorities via
+//! Defends local stateful signing against vault-directory rollback using independent
+//! monotone storage, optionally composed with VM snapshot/clone detection via
 //! [`CompositeAntiRollbackAnchor`]:
 //! 1. `--anchor-dir <dir>`: a `LockedRecord` single-use ceremony ticket seal (`QSAGANC1`) paired
 //!    with a mirrored dual-slot [`FsDirectoryMonotoneAnchor`] (`TwoSlotRecord` surviving loss of
 //!    either slot).
 //! 2. `--anchor-tpm-nv <nv-index>`: hardware TPM 2.0 `TPM_NT_COUNTER` NV index accessed directly
-//!    through `/dev/tpmrm0` ([`Tpm2NvMonotoneAnchor<DevTpmRm0>`]).
+//!    through `/dev/tpmrm0` ([`Tpm2NvMonotoneAnchor<DevTpmRm0>`]). Multi-domain workflows
+//!    treat this index as a range base: RSS quorum party `p` uses `base + 2*p` for its
+//!    belt and `base + 2*p + 1` for its ceremony (six counters); committee validator
+//!    `i` uses `base + i`, with `base + validators` for the ceremony. All indices must
+//!    be predefined, initialized counters with the configured authorization, exclusive
+//!    to this enrollment. Do not overlap ranges or reset/delete enrolled counters.
+//!    Old shared-counter enrollments fail closed; this does not migrate their seals.
 //! 3. `--anchor-vmgenid`: hypervisor generation-ID + kernel `boot_id` + inode continuity fence
-//!    ([`HypervisorGenerationAnchor<LinuxSysfsVmGenSource>`]).
+//!    ([`HypervisorGenerationAnchor<LinuxSysfsVmGenSource>`]). This is snapshot/clone detection
+//!    only, not protection against in-guest file restore. It requires a disjoint-device
+//!    directory anchor or TPM counter. Without hypervisor VMGENID, it only pins boot/file identity.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,6 +30,7 @@ use dregg_sig_asm::durable::LockedRecord;
 use dregg_sig_core::anti_rollback::{
     CompositeAntiRollbackAnchor, DevTpmRm0, HypervisorGenerationAnchor, LinuxSysfsVmGenSource,
     Tpm2NvMonotoneAnchor, Tpm2Transport, VmGenPolicy, is_valid_tpm2_nv_index,
+    marshal_tpm2_nv_read_u64_cmd, parse_tpm2_nv_read_u64_rsp,
 };
 use dregg_sig_core::ceremony_journal::CeremonyContext;
 use dregg_sig_core::{ExternalMonotoneAnchor, LedgerCheckpoint};
@@ -112,6 +121,56 @@ fn read_tpm_password(auth_env: Option<&str>) -> Result<ZeroizingBuf, CliError> {
 }
 
 impl AnchorConfig {
+    /// Select an independent counter from a workflow's contiguous NV range. The CLI
+    /// never defines or resets NV indices: the operator must provision every counter
+    /// in this exclusive range, with the same authorization, before enrollment.
+    /// Checking the entire range on every selection prevents overflow/aliasing and
+    /// keeps enrollment and recovery on the same deterministic allocation.
+    pub fn tpm_slot(&self, offset: u32, slots: u32) -> Result<Self, CliError> {
+        if slots == 0 || offset >= slots {
+            return Err(CliError::state("invalid TPM2 anchor domain allocation"));
+        }
+        let mut scoped = self.clone();
+        if let Some(base) = self.tpm_nv_index {
+            let last = base
+                .checked_add(slots - 1)
+                .filter(|n| is_valid_tpm2_nv_index(*n));
+            if !is_valid_tpm2_nv_index(base) || last.is_none() {
+                return Err(CliError::usage(format!(
+                    "TPM2 anchor range starting at {base:#010x} needs {slots} distinct NV indices within 0x01000000..=0x01ffffff"
+                )));
+            }
+            scoped.tpm_nv_index = Some(base + offset);
+        }
+        Ok(scoped)
+    }
+
+    /// Validate a workflow's whole NV range and read every counter in it once, so a
+    /// missing or unauthorized index is refused before any enrollment state exists
+    /// rather than after part of the vault has been written.
+    pub fn check_tpm_range(&self, slots: u32) -> Result<(), CliError> {
+        self.tpm_slot(0, slots)?;
+        let Some(base) = self.tpm_nv_index else {
+            return Ok(());
+        };
+        let password = read_tpm_password(self.tpm_auth_env.as_deref())?;
+        #[cfg(all(test, unix))]
+        if let Some(tpm) = tpm_model::active() {
+            return probe_tpm_range(&tpm, base, slots, &password);
+        }
+        let dev_path = self
+            .tpm_device_path
+            .as_deref()
+            .unwrap_or(DevTpmRm0::DEFAULT_DEVICE_PATH);
+        let dev = DevTpmRm0::open_path(dev_path).map_err(|e| {
+            CliError::state(format!(
+                "opening TPM2 resource manager {dev_path}: {}",
+                e.into_io_error()
+            ))
+        })?;
+        probe_tpm_range(&dev, base, slots, &password)
+    }
+
     #[cfg(test)]
     pub fn dir_only(
         anchor_dir: impl Into<String>,
@@ -154,10 +213,11 @@ impl AnchorConfig {
                 "--allow-single-disk-anchor requires --anchor-dir",
             ));
         }
-        let any_anchor = anchor_dir.is_some() || tpm_nv_index.is_some() || vmgenid;
+        require_vmgenid_backing(vmgenid, anchor_dir.is_some(), tpm_nv_index.is_some())?;
+        let any_anchor = anchor_dir.is_some() || tpm_nv_index.is_some();
         if !any_anchor && vault_dir.is_some() {
             return Err(CliError::usage(
-                "--vault-dir requires an anchor (--anchor-dir, --anchor-tpm-nv, or --anchor-vmgenid)",
+                "--vault-dir requires an anchor (--anchor-dir or --anchor-tpm-nv)",
             ));
         }
         if !any_anchor {
@@ -236,7 +296,8 @@ impl AnchorConfig {
                 None => (None, None, None, false, false),
             };
 
-        if anchor_dir.is_none() && tpm_nv_index.is_none() && !vmgenid {
+        require_vmgenid_backing(vmgenid, anchor_dir.is_some(), tpm_nv_index.is_some())?;
+        if anchor_dir.is_none() && tpm_nv_index.is_none() {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -259,6 +320,11 @@ impl AnchorConfig {
         explicit_dirs: &[&str],
         create_anchor_dir: bool,
     ) -> Result<(), CliError> {
+        require_vmgenid_backing(
+            self.vmgenid,
+            self.anchor_dir.is_some(),
+            self.tpm_nv_index.is_some(),
+        )?;
         let explicit_vault = match &self.vault_dir {
             Some(vd) => {
                 let vault = Location {
@@ -344,6 +410,11 @@ impl AnchorConfig {
         other: &Location,
         what: &str,
     ) -> Result<(), CliError> {
+        if other.id.0 == anchor.id.0 && self.vmgenid && self.tpm_nv_index.is_none() {
+            return Err(CliError::state(
+                "VMGENID provides snapshot/clone detection only; --anchor-dir must be on a disjoint device unless --anchor-tpm-nv is also supplied; --allow-single-disk-anchor cannot waive this requirement",
+            ));
+        }
         if other.id.0 == anchor.id.0 && !self.allow_single_disk {
             return Err(CliError::state(format!(
                 "--anchor-dir resides on the same filesystem device as {what}; mount an independent device or pass --allow-single-disk-anchor"
@@ -351,6 +422,40 @@ impl AnchorConfig {
         }
         Ok(())
     }
+}
+
+// VM/file identities attest continuity, not a signing-state floor. In particular,
+// restoring authenticated local records in place leaves these identities intact.
+fn require_vmgenid_backing(vmgenid: bool, directory: bool, tpm: bool) -> Result<(), CliError> {
+    if vmgenid && !directory && !tpm {
+        return Err(CliError::usage(
+            "VMGENID provides snapshot/clone detection only; combine with --anchor-dir on a disjoint device or --anchor-tpm-nv (policy vaults use the corresponding policy options)",
+        ));
+    }
+    Ok(())
+}
+
+fn probe_tpm_range<T: Tpm2Transport>(
+    transport: &T,
+    base: u32,
+    slots: u32,
+    password: &[u8],
+) -> Result<(), CliError> {
+    for index in base..base + slots {
+        let mut cmd = marshal_tpm2_nv_read_u64_cmd(index, index, password).map_err(|e| {
+            CliError::state(format!("TPM2 NV {index:#010x}: {}", e.into_io_error()))
+        })?;
+        let rsp = transport.transmit(&cmd);
+        ct_zeroize_bytes(&mut cmd);
+        rsp.and_then(|rsp| parse_tpm2_nv_read_u64_rsp(&rsp)).map_err(|e| {
+            CliError::state(format!(
+                "TPM2 NV counter {index:#010x} (slot {} of the {slots} reserved from {base:#010x}) cannot be read: {}",
+                index - base,
+                e.into_io_error()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// A directory as the isolation rules see it: `(device, inode)` and resolved path.
@@ -428,7 +533,7 @@ pub fn enforce_anchor_requirement(
     anchor_requirement(secret, anchor_cfg.is_some()).map_err(|e| match e {
         AnchorRequirementError::Malformed => crate::vault::corrupt(),
         AnchorRequirementError::AnchorMissing => CliError::state(
-            "key requires an external monotone anchor (--anchor-dir, --anchor-tpm-nv, or --anchor-vmgenid)",
+            "key requires an external monotone anchor (--anchor-dir or --anchor-tpm-nv)",
         ),
         AnchorRequirementError::NotEnrolled => {
             CliError::state("key was not enrolled with an external monotone anchor")
@@ -630,7 +735,8 @@ impl AnchorInner {
 /// - `O_NOFOLLOW` `0600` [`LockedRecord`] single-use ticket seal (`lock_identity_seal`),
 /// - mirrored dual-slot [`FsDirectoryMonotoneAnchor`] (`--anchor-dir`),
 /// - hardware TPM 2.0 NV counter [`Tpm2NvMonotoneAnchor<DevTpmRm0>`] (`--anchor-tpm-nv`), and
-/// - hypervisor generation-ID + `boot_id` + inode continuity [`HypervisorGenerationAnchor`] (`--anchor-vmgenid`)
+/// - optional hypervisor generation-ID + `boot_id` + inode continuity fork guard
+///   [`HypervisorGenerationAnchor`] (`--anchor-vmgenid`), requiring independent monotone backing
 ///   via [`CompositeAntiRollbackAnchor`].
 #[derive(Clone)]
 pub struct FsExternalMountAnchor {
@@ -827,6 +933,19 @@ impl FsExternalMountAnchor {
         key_id: [u8; 32],
         mac_key: [u8; 32],
     ) -> Result<Self, CliError> {
+        #[cfg(all(test, unix))]
+        if let Some(tpm) = tpm_model::active() {
+            return Self::open_composite(
+                config,
+                custody_files,
+                explicit_dirs,
+                domain,
+                key_id,
+                mac_key,
+                true,
+                Some(tpm),
+            );
+        }
         Self::open_composite::<DevTpmRm0>(
             config,
             custody_files,
@@ -848,6 +967,19 @@ impl FsExternalMountAnchor {
         key_id: [u8; 32],
         mac_key: [u8; 32],
     ) -> Result<Self, CliError> {
+        #[cfg(all(test, unix))]
+        if let Some(tpm) = tpm_model::active() {
+            return Self::open_composite(
+                config,
+                custody_files,
+                explicit_dirs,
+                domain,
+                key_id,
+                mac_key,
+                false,
+                Some(tpm),
+            );
+        }
         Self::open_composite::<DevTpmRm0>(
             config,
             custody_files,
@@ -1241,9 +1373,216 @@ impl ExternalMonotoneAnchor for FsExternalMountAnchor {
     }
 }
 
+/// In-process TPM 2.0 NV counters for tests that drive the real CLI provisioning call
+/// chain (`quorum keygen/sign`, committee enrollment), which opens its own transport.
+#[cfg(all(test, unix))]
+pub(crate) mod tpm_model {
+    use super::*;
+    use dregg_sig_core::anti_rollback::{
+        AntiRollbackError, TPM_CC_NV_INCREMENT, TPM_CC_NV_READ, TPM_RC_SUCCESS, TPM_ST_SESSIONS,
+        marshal_tpm2_nv_increment_cmd,
+    };
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// Defined `TPM_NT_COUNTER` indices with empty index authorization. Counters only
+    /// ever increase and live outside every directory a test snapshots or restores.
+    #[derive(Clone)]
+    pub(crate) struct ModelTpm(Arc<Mutex<BTreeMap<u32, u64>>>);
+
+    impl ModelTpm {
+        pub(crate) fn counters(&self) -> BTreeMap<u32, u64> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Tpm2Transport for ModelTpm {
+        fn transmit(&self, cmd: &[u8]) -> Result<Vec<u8>, AntiRollbackError> {
+            if cmd.len() < 18 {
+                return Err(AntiRollbackError::ProtocolFramingError("short cmd"));
+            }
+            let cc = u32::from_be_bytes(cmd[6..10].try_into().unwrap());
+            let nv = u32::from_be_bytes(cmd[14..18].try_into().unwrap());
+            // Only the two commands the anchor issues, byte-exact, self-authorized.
+            let expected = match cc {
+                TPM_CC_NV_INCREMENT => marshal_tpm2_nv_increment_cmd(nv, nv, b"")?,
+                TPM_CC_NV_READ => marshal_tpm2_nv_read_u64_cmd(nv, nv, b"")?,
+                _ => return Err(AntiRollbackError::Tpm2ResponseError(0x0000_0143)),
+            };
+            if cmd != expected {
+                return Err(AntiRollbackError::Tpm2ResponseError(0x0000_0084));
+            }
+            let mut counters = self.0.lock().unwrap();
+            // TPM_RC_HANDLE for an index that was never defined.
+            let counter = counters
+                .get_mut(&nv)
+                .ok_or(AntiRollbackError::Tpm2ResponseError(0x0000_018B))?;
+            let mut params = Vec::new();
+            if cc == TPM_CC_NV_INCREMENT {
+                *counter = counter.checked_add(1).unwrap();
+            } else {
+                params.extend_from_slice(&8u16.to_be_bytes());
+                params.extend_from_slice(&counter.to_be_bytes());
+            }
+            let mut rsp = Vec::new();
+            rsp.extend_from_slice(&TPM_ST_SESSIONS.to_be_bytes());
+            rsp.extend_from_slice(&(19u32 + params.len() as u32).to_be_bytes());
+            rsp.extend_from_slice(&TPM_RC_SUCCESS.to_be_bytes());
+            rsp.extend_from_slice(&(params.len() as u32).to_be_bytes());
+            rsp.extend_from_slice(&params);
+            rsp.extend_from_slice(&[0, 0, 1, 0, 0]);
+            Ok(rsp)
+        }
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<ModelTpm>> = const { RefCell::new(None) };
+    }
+
+    /// The model this test thread installed, used in place of `/dev/tpmrm0`.
+    pub(crate) fn active() -> Option<ModelTpm> {
+        ACTIVE.with(|t| t.borrow().clone())
+    }
+
+    /// Keeps a model installed for the current test thread.
+    pub(crate) struct Installed(pub(crate) ModelTpm);
+
+    /// Define counters `first..first + count`, each starting at `start`.
+    pub(crate) fn install(first: u32, count: u32, start: u64) -> Installed {
+        let tpm = ModelTpm(Arc::new(Mutex::new(
+            (first..first + count).map(|i| (i, start)).collect(),
+        )));
+        ACTIVE.with(|t| {
+            assert!(t.borrow().is_none(), "one model TPM per test thread");
+            *t.borrow_mut() = Some(tpm.clone());
+        });
+        Installed(tpm)
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            ACTIVE.with(|t| *t.borrow_mut() = None);
+        }
+    }
+
+    /// One enrolled anchor domain: honest storage reopens; an advance moves only its
+    /// own counter `nv_index`; restoring every local record of the domain in place
+    /// (ticket and TPM seal, inodes kept) is refused; the current records reopen.
+    pub(crate) fn assert_domain_reopens_and_refuses_rollback(
+        tpm: &ModelTpm,
+        config: &AnchorConfig,
+        dir: &str,
+        nv_index: u32,
+        domain: &str,
+        key_id: [u8; 32],
+        mac_key: [u8; 32],
+    ) {
+        let scoped = AnchorConfig {
+            tpm_nv_index: Some(nv_index),
+            ..config.clone()
+        };
+        let stem = slot_stem(domain, &key_id);
+        let files: Vec<PathBuf> = ["anchor", "tpm"]
+            .iter()
+            .map(|ext| Path::new(dir).join(format!(".qsag-{stem}.{ext}")))
+            .collect();
+        let read_all = || -> Vec<Vec<u8>> {
+            files
+                .iter()
+                .map(|p| {
+                    std::fs::read(p).unwrap_or_else(|e| panic!("{domain} {}: {e}", p.display()))
+                })
+                .collect()
+        };
+        let write_all = |contents: &[Vec<u8>]| {
+            for (path, bytes) in files.iter().zip(contents) {
+                std::fs::write(path, bytes).unwrap();
+            }
+        };
+        let open =
+            || FsExternalMountAnchor::open_existing(&scoped, &[], &[dir], domain, key_id, mac_key);
+
+        let anchor = open()
+            .unwrap_or_else(|e| panic!("honest {domain} at {nv_index:#x} must reopen: {e:?}"));
+        let checkpoint = anchor.load().unwrap().expect("enrolled checkpoint");
+        let before_records = read_all();
+        let before_counters = tpm.counters();
+        anchor
+            .advance(LedgerCheckpoint {
+                generation: checkpoint.generation + 1,
+                tag: [0x9b; 32],
+            })
+            .unwrap();
+        drop(anchor);
+        let mut expected = before_counters.clone();
+        *expected.get_mut(&nv_index).unwrap() += 1;
+        assert_eq!(
+            tpm.counters(),
+            expected,
+            "{domain} owns exactly {nv_index:#x}"
+        );
+
+        let current_records = read_all();
+        write_all(&before_records);
+        let err = match open() {
+            Ok(_) => panic!("rolled-back {domain} reopened"),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(err.contains("lags TPM2 NV monotonic counter"), "{err}");
+        write_all(&current_records);
+        drop(open().unwrap_or_else(|e| panic!("current {domain} must reopen: {e:?}")));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vmgenid_requires_an_independent_monotone_backend() {
+        let raw = vec!["--anchor-vmgenid".to_owned()];
+        let args = Args::parse(&raw, ANCHOR_VALUE_OPTIONS, ANCHOR_FLAG_OPTIONS).unwrap();
+        assert!(AnchorConfig::from_args(&args).is_err());
+        assert!(AnchorConfig::from_quorum_args(&args, "/vault").is_err());
+        let raw = vec!["--policy-vmgenid".to_owned()];
+        let args = Args::parse(&raw, &[], &["policy-vmgenid"]).unwrap();
+        assert!(
+            AnchorConfig::for_vault(
+                &args,
+                "/vault",
+                "policy-anchor-dir",
+                "policy-allow-single-disk-anchor"
+            )
+            .is_err()
+        );
+        // Direct users of the configuration cannot bypass the parser's requirement.
+        let config = AnchorConfig {
+            vmgenid: true,
+            ..AnchorConfig::default()
+        };
+        assert!(config.validate_isolation(&[], &[], false).is_err());
+    }
+
+    #[test]
+    fn vmgenid_same_device_waiver_cannot_supply_monotonicity() {
+        let root = temp_root("vmgenid-disjoint-device");
+        let vault = root.join("vault");
+        let anchor_dir = root.join("anchor");
+        private_dir(vault.to_str().unwrap(), true).unwrap();
+        private_dir(anchor_dir.to_str().unwrap(), true).unwrap();
+        let mut config = AnchorConfig {
+            anchor_dir: Some(anchor_dir.to_string_lossy().into_owned()),
+            vault_dir: Some(vault.to_string_lossy().into_owned()),
+            allow_single_disk: true,
+            vmgenid: true,
+            ..AnchorConfig::default()
+        };
+        assert!(config.validate_isolation(&[], &[], false).is_err());
+        // A TPM counter supplies the independent monotone state even on one disk.
+        config.tpm_nv_index = Some(0x01800001);
+        config.validate_isolation(&[], &[], false).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn floor_checkpoint_rejects_generation_overflow() {

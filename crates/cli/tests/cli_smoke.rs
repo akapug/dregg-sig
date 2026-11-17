@@ -1040,6 +1040,184 @@ fn restore_dir_files_in_place(snapshot: &[(PathBuf, Vec<u8>)]) {
     }
 }
 
+/// Restore the custody bytes of a vault in place: every inode is kept, and the anchor
+/// `.lock` sidecars and VMGENID `.target` files are not touched at all. A vault's own
+/// `.vault.lock` holds its state MAC, so its contents are part of the old state.
+#[cfg(target_os = "linux")]
+fn restore_custody_bytes_in_place(snapshot: &[(PathBuf, Vec<u8>)]) {
+    let custody: Vec<_> = snapshot
+        .iter()
+        .filter(|(path, _)| {
+            path.to_string_lossy().ends_with(".vault.lock")
+                || !matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("lock" | "target")
+                )
+        })
+        .cloned()
+        .collect();
+    restore_dir_files_in_place(&custody);
+}
+
+// A VM generation id changes when the hypervisor restores or clones the whole VM. It
+// does not change when the guest's files are put back in place, and the VMGENID seal
+// lives on the disk being restored. Before `--anchor-vmgenid` stopped counting as an
+// anchor, the first half of this test enrolled with it alone, signed epoch 0, restored
+// the vault bytes in place and signed epoch 0 again for a different message: two valid
+// signatures from one one-time leaf.
+#[cfg(target_os = "linux")]
+#[test]
+fn vmgenid_alone_is_refused_and_in_place_restore_cannot_respend_a_leaf() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = Workdir::new("vmgenid-in-place");
+    let private = |path: &Path| {
+        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    };
+    let vault = dir.0.join("vault");
+    private(&vault);
+    let vault_s = vault.to_str().unwrap();
+    let pk = dir.path("pk");
+    let keygen = |vault: &str, pk: &str, anchor: &[&str]| {
+        let mut args = vec![
+            "quorum",
+            "keygen",
+            "--vault-dir",
+            vault,
+            "--public-out",
+            pk,
+            "--tree-height",
+            "1",
+        ];
+        args.extend_from_slice(anchor);
+        qsag(&args)
+    };
+    let sign = |vault: &str, message: &str, output: &str, anchor: &[&str]| {
+        let mut args = vec![
+            "quorum",
+            "sign",
+            "--vault-dir",
+            vault,
+            "--epoch",
+            "0",
+            "--in",
+            message,
+            "--out",
+            output,
+        ];
+        args.extend_from_slice(anchor);
+        qsag(&args)
+    };
+    let verify = |pk: &str, message: &str, sig: &str| {
+        expect(
+            &[
+                "quorum", "verify", "--public", pk, "--in", message, "--sig", sig,
+            ],
+            0,
+        );
+    };
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // 1. VMGENID on its own.
+    let enrolled = keygen(vault_s, &pk, &["--anchor-vmgenid"]);
+    if code(&enrolled) == 0 {
+        let genesis = snapshot_dir_files(&vault);
+        let first = dir.path("first.sig");
+        let second = dir.path("second.sig");
+        let signed = sign(vault_s, &dir.path("msg"), &first, &["--anchor-vmgenid"]);
+        assert_eq!(code(&signed), 0, "{}", stderr(&signed));
+        let identity = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let inodes: Vec<_> = genesis.iter().map(|(path, _)| identity(path)).collect();
+        restore_custody_bytes_in_place(&genesis);
+        let after: Vec<_> = genesis.iter().map(|(path, _)| identity(path)).collect();
+        assert_eq!(inodes, after);
+        let resigned = sign(vault_s, &dir.path("other"), &second, &["--anchor-vmgenid"]);
+        if code(&resigned) == 0 {
+            verify(&pk, &dir.path("msg"), &first);
+            verify(&pk, &dir.path("other"), &second);
+            panic!(
+                "VMGENID-only vault reopened its restored state: two valid epoch-0 signatures over different messages"
+            );
+        }
+        panic!(
+            "--anchor-vmgenid alone was accepted as a rollback anchor: {}",
+            stderr(&resigned)
+        );
+    }
+    assert_eq!(code(&enrolled), 1, "{}", stderr(&enrolled));
+    assert!(
+        stderr(&enrolled).contains("snapshot/clone detection only"),
+        "{}",
+        stderr(&enrolled)
+    );
+    assert!(!Path::new(&pk).exists());
+    assert_eq!(std::fs::read_dir(&vault).unwrap().count(), 0);
+
+    // 2. A directory anchor on the vault's own device is restored by the same restore;
+    //    the single-disk waiver does not turn VMGENID into the monotone half.
+    let same_disk = dir.0.join("anchor");
+    private(&same_disk);
+    let refused = keygen(
+        vault_s,
+        &pk,
+        &[
+            "--anchor-vmgenid",
+            "--anchor-dir",
+            same_disk.to_str().unwrap(),
+            "--allow-single-disk-anchor",
+        ],
+    );
+    assert_eq!(code(&refused), 4, "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("snapshot/clone detection only"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!Path::new(&pk).exists());
+
+    // 3. With a directory anchor on another device the same in-place restore is refused.
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir()
+        || std::fs::metadata(shm).unwrap().dev() == std::fs::metadata(&vault).unwrap().dev()
+    {
+        eprintln!("no second filesystem device for the disjoint-anchor half of this test");
+        return;
+    }
+    let disjoint = shm.join(format!("qsag-cli-vmgenid-anchor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&disjoint);
+    private(&disjoint);
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(disjoint.clone());
+    let vault2 = dir.0.join("vault2");
+    private(&vault2);
+    let vault2_s = vault2.to_str().unwrap();
+    let pk2 = dir.path("pk2");
+    let anchored = [
+        "--anchor-vmgenid",
+        "--anchor-dir",
+        disjoint.to_str().unwrap(),
+    ];
+    let enrolled = keygen(vault2_s, &pk2, &anchored);
+    assert_eq!(code(&enrolled), 0, "{}", stderr(&enrolled));
+    let genesis = snapshot_dir_files(&vault2);
+    let first = dir.path("anchored-first.sig");
+    let second = dir.path("anchored-second.sig");
+    let signed = sign(vault2_s, &dir.path("msg"), &first, &anchored);
+    assert_eq!(code(&signed), 0, "{}", stderr(&signed));
+    verify(&pk2, &dir.path("msg"), &first);
+    restore_custody_bytes_in_place(&genesis);
+    let resigned = sign(vault2_s, &dir.path("other"), &second, &anchored);
+    assert_eq!(code(&resigned), 4, "{}", stderr(&resigned));
+    assert!(!Path::new(&second).exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn external_anchor_isolation_and_full_vault_snapshot_rollback_refused() {

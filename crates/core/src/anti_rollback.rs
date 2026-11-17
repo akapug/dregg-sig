@@ -4,13 +4,14 @@
 //! Two orthogonal rollback/fork surfaces threaten stateful hash-based signers (`XMSS`,
 //! `LMS/HSS`, `Jorts`, `FTS`):
 //!
-//! 1. **VM snapshot restore / live-fork / EBS volume clone / container checkpoint-restore:**
-//!    Restoring a hypervisor snapshot or cloning a block volume rewinds the filesystem WAL
-//!    together with any same-disk sidecar. [`VmGenIdForkGuard`] and [`HypervisorGenerationAnchor`]
-//!    bind every checkpoint to the hypervisor's 128-bit ACPI `VMGENID`
-//!    (`/sys/devices/virtual/misc/vmgenid` / `QEMU0002:00`), Linux `/proc/sys/kernel/random/boot_id`,
-//!    and the guarded state file's `(st_dev, st_ino, st_ctime)` tuple, hard-halting signing with
-//!    [`AntiRollbackError::RollbackOrForkDetected`] the instant any fork/clone/restore occurs.
+//! 1. **VM snapshot restore / clone:** [`VmGenIdForkGuard`] and
+//!    [`HypervisorGenerationAnchor`] bind checkpoints to hypervisor ACPI `VMGENID`,
+//!    Linux `boot_id`, and a guarded file's `(st_dev, st_ino, st_ctime)` tuple. A changed
+//!    hypervisor generation detects whole-VM snapshot restore or cloning when the
+//!    hypervisor exposes and updates it. Boot/file identity checks add continuity fences.
+//!    These are **not independently monotone signing state**: restoring the local seal
+//!    and custody bytes in place can preserve every checked identity. Always combine
+//!    this guard with an independent monotone authority for storage rollback protection.
 //! 2. **Offline disk image rollback across host reboots:**
 //!    [`Tpm2NvMonotoneAnchor`] speaks raw big-endian ISO/IEC 11889 TPM 2.0 command/response
 //!    packets (`TPM2_NV_Increment = 0x00000134`, `TPM2_NV_Read = 0x0000014E` under
@@ -154,8 +155,8 @@ impl VmGenPolicy {
     };
 
     /// Ephemeral/container fork-guard policy: does not require ACPI `VMGENID`, but pins both
-    /// `boot_id` and `(dev, ino)` (and `vmgenid` if present), halting on any VM restore,
-    /// container checkpoint/restore, or host reboot without TPM2 re-verification.
+    /// `boot_id` and `(dev, ino)` (and `vmgenid` if present), halting when those identities
+    /// change. Without hypervisor VMGENID, a restore preserving them is undetectable.
     pub const PINNED_BOOT_SESSION: Self = Self {
         require_vmgenid: false,
         pin_boot_id: true,
@@ -428,8 +429,11 @@ const VMGEN_RECORD_LEN: usize = 146;
 //   [106..114] monotonic_update_seq (u64 LE)
 //   [114..146] CSHAKE256 MAC ([u8; 32])
 
-/// Durable [`ExternalMonotoneAnchor`] sealing [`LedgerCheckpoint`] alongside hypervisor
-/// `VMGENID`, Linux `boot_id`, and guarded WAL `(dev, ino, ctime)` continuity.
+/// VM snapshot/clone continuity guard implementing [`ExternalMonotoneAnchor`] for composition.
+/// Seals [`LedgerCheckpoint`] alongside hypervisor `VMGENID`, Linux `boot_id`, and guarded
+/// file `(dev, ino, ctime)` continuity. This guard alone cannot detect in-place restoration
+/// of custody and seal bytes: its checkpoint and sequence are on the same rollbackable
+/// storage. Pair with an independently monotone anchor to protect stateful signing.
 pub struct HypervisorGenerationAnchor<S: VmGenSource = LinuxSysfsVmGenSource> {
     record: LockedRecord,
     guarded_target: PathBuf,
@@ -945,6 +949,11 @@ struct TpmSealedState {
 
 /// Hardware-backed [`ExternalMonotoneAnchor`] binding [`LedgerCheckpoint`] progression to a
 /// 64-bit TPM 2.0 `TPM_NT_COUNTER` NVRAM index over `/dev/tpmrm0`.
+///
+/// Each independent sealed record requires its own exclusively assigned NV index.
+/// Sharing an index between records makes an honest advance of either record invalidate
+/// the other. Callers managing several domains must allocate distinct counters; they
+/// must never relax the exact hardware/seal equality below to tolerate shared counters.
 ///
 /// ### Two-Phase Crash-Safe & Zero-Slack Anti-Rollback Protocol
 /// 1. Before issuing `TPM2_NV_Increment`, [`Tpm2NvMonotoneAnchor::advance_checked`] stages

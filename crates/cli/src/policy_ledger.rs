@@ -92,7 +92,8 @@ pub const GATE_HELP: &str = "\
   --policy-intent <id>        the proposed and approved intent this signature releases
   --policy-anchor-dir <dir>   the ledger's external monotone anchor (required if enrolled with one)
   --policy-anchor-tpm-nv <idx> [--policy-anchor-tpm-device <path>] [--policy-anchor-tpm-auth-env <VAR>]
-  --policy-vmgenid [--policy-vmgenid-strict]  use the ledger's VM generation fence
+  --policy-vmgenid [--policy-vmgenid-strict]  add the ledger's VM snapshot/clone guard; needs
+                              --policy-anchor-dir on a disjoint device or --policy-anchor-tpm-nv
   --policy-allow-single-disk-anchor  permit that anchor on the ledger's filesystem device
   --policy-passphrase-env <VAR> / --policy-passphrase-file <PATH>  unlock a sealed ledger
 ";

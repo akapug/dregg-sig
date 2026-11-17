@@ -1474,7 +1474,7 @@ fn open_vault_anchored(
     let anchor = match (meta.anchor_info, anchor_cfg) {
         (Some(_), None) => {
             return Err(CliError::state(
-                "Hem quorum vault requires an external monotone anchor (--anchor-dir, --anchor-tpm-nv, or --anchor-vmgenid)",
+                "Hem quorum vault requires an external monotone anchor (--anchor-dir or --anchor-tpm-nv)",
             ));
         }
         (None, Some(_)) => {
