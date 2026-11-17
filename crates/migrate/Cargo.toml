@@ -20,3 +20,5 @@ dregg-sig-asm = { path = "../asm", default-features = false }
 dregg-sig-accel = { path = "../accel", default-features = false }
 dregg-sig-addr = { path = "../addr", default-features = false }
 dregg-sig-agg = { path = "../agg", default-features = false, features = ["alloc"] }
+# Only `wire_channel::ConfidentialWireChannel`, the sealed channel under `hem::collab::net`.
+dregg-sig-quorum = { path = "../quorum", default-features = false }

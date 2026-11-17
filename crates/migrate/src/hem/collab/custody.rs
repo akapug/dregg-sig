@@ -102,14 +102,14 @@ pub fn input_secret_bits<T: Transport>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::engine::Dealer;
     use super::super::engine::tests::run_parties;
     use super::*;
     use dregg_sig_core::field::tower::eval_poly_gf256;
 
     /// `(k, n)` Shamir shares of `secret`, custodian `p` at point `p + 1`.
-    fn shamir(secret: &[u8], k: usize, n: usize, tag: u8) -> Vec<Vec<u8>> {
+    pub(in super::super) fn shamir(secret: &[u8], k: usize, n: usize, tag: u8) -> Vec<Vec<u8>> {
         let mut shares = alloc::vec![Vec::new(); n];
         for (i, &byte) in secret.iter().enumerate() {
             let coeffs: Vec<TowerGf256> = (0..k)

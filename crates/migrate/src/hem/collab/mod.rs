@@ -1,12 +1,14 @@
 //! Threshold proving: the zk-Hem prover run by a quorum of custodians on a secret-shared
 //! assignment.
 //!
-//! * [`net`]: framed message transport between custodians.
+//! * [`net`]: authenticated, encrypted message transport between custodians.
 //! * [`engine`]: MAC-authenticated additive sharing over Goldilocks (SPDZ).
 //! * [`custody`]: from `(k, n)` Shamir or XOR custody shares of a secret to authenticated
 //!   shares of its bits.
 //! * [`prep`]: the dealerless ceremony that produces [`engine::Preprocessing`].
+//! * [`witgen`]: from shares of the secret's bits to shares of the whole assignment.
 //! * [`prover`]: one custodian's side of the proof, [`prover::prove_party`].
+//! * [`prove_ownership_party`]: the three in order, from a custody share to a proof.
 //! * [`verify_threshold_ownership`]: the verifier for ownership statements.
 //!
 //! # What the proof is
@@ -137,23 +139,28 @@
 //!
 //! # Witness generation
 //!
-//! [`prover::prove_party`] starts from authenticated shares of the whole assignment.
-//! From custody shares, [`custody::input_secret_bits`] produces the shares of the secret's
-//! bits. The step in between, shares of every other variable of the relation, is not in
-//! this module. It needs, for every variable, how it is computed from earlier ones:
-//! `ConstraintSystem::mul` outputs are products (one triple each), but `hash.rs` and
-//! `curve.rs` also allocate hints with `ConstraintSystem::alloc(value)`, where the
-//! relation records only the value: bits of sums, 8-bit limbs of quotients and of
-//! canonical residues modulo the curve primes, carries, field inverses. A generic
-//! generator needs those allocations to say what they are (bit `i` of a linear form of
-//! known width; limb `i` of `(d + K p) / p`; limb `i` of `d mod p`; inverse-or-zero of a
-//! linear form), and a subprotocol per kind: bit decomposition of a shared value by a
-//! mask of shared random bits and a borrow chain (the arithmetic-only variant of the
-//! conversions of edaBits, `2020-edabits-mixed-arithmetic-binary-338` Section 5, and
-//! Rabbit's `LTBits`, `2021-rabbit-efficient-comparison-119` Figure 3), exact division by
-//! a public prime limb by limb with those decompositions, and reduction modulo the prime
-//! with a shared uniform residue. None of it exists here; the measurements below deal
-//! shares of the assignment from a clear witness.
+//! [`prove_ownership_party`] is one custodian's whole run: [`custody::input_secret_bits`]
+//! turns its custody share into authenticated shares of the secret's bits,
+//! [`witgen::generate`] computes authenticated shares of every other variable, and
+//! [`prover::prove_party`] proves. No custodian holds the secret, a variable of the
+//! assignment or another custodian's share at any point.
+//!
+//! The relation says how each variable follows from earlier ones: the gadgets allocate
+//! with `ConstraintSystem::alloc_defined`, and `relations::ownership_definitions` returns
+//! the definitions of a statement
+//! (`witgen::tests::every_ownership_statement_defines_every_variable` checks that none is
+//! missing for every lock and key source). The subprotocols, their sources and what each
+//! opens are in the module documentation of [`witgen`]; malicious security is the
+//! engine's MAC check, run before every opening that is masked only if earlier openings
+//! were right. One predicate of the secret is revealed by design: a chord addition whose
+//! points have equal `x` aborts with `WitgenError::ZeroDenominator`.
+//!
+//! Not covered: relations with lookups (a multiplicity is a count over the whole witness;
+//! `ConstraintSystem::finish_recorded` refuses them), and statements whose relation takes
+//! inputs beyond the bits of one secret: a master seed (its length is a hidden input), a
+//! hidden derivation path, a taproot merkle root. [`witgen::generate`] takes any number
+//! of inputs; [`prove_ownership_party`] supplies only the secret and returns
+//! [`ThresholdError::Statement`] for those.
 //!
 //! # Preprocessing
 //!
@@ -167,42 +174,145 @@
 //! `engine::Dealer` (tests and the `test-dealer` feature only) generates the same
 //! material from one seed and knows both keys.
 //!
-//! `prep::tests::measure_ceremony_rates` on hbox, three members, one thread: 1.93 ms
-//! per triple (65,536 triples in 126.2 s) and 63 microseconds per uniform value, after
-//! 1.1 s for the OT mesh. The 2,228,208 triples of one ownership statement below are
-//! therefore about 4,290 s (1.2 h) of ceremony for the quorum.
+//! `prep::tests::measure_ceremony` on hbox, three members, for the 2,228,208 triples and
+//! 9,156 uniform values of the proof stage of one ownership statement: 4,502.5 s
+//! (1.25 h) wall-clock on a loaded machine, 8,269.5 s of CPU, 2.02 ms per triple, 55
+//! microseconds per uniform value, 74.5 GiB of payload sent per member, 685 MB peak
+//! memory; every produced triple and value was reconstructed and checked. Witness
+//! generation adds about 1.23 million triples and 0.61 million uniform values per
+//! statement, which at these rates is a further 0.7 h; that part was not run.
 //! `prep::tests::ceremony_output_drives_the_threshold_prover` runs the ceremony for a
 //! small relation (528 triples, 4,424 uniform values), inputs a clear assignment and
 //! proves on the result.
 //!
 //! # Measured cost
 //!
-//! `prover::tests::measure_threshold_ownership` on hbox (16 cores), default regime, all
-//! custodians as threads of one process over channel links, dealer preprocessing, shares
-//! of the assignment dealt from a clear witness. Both relations have `2^17` rows and a
-//! committed table of `2^18` cells. Wall-clock includes dealing.
+//! `tests::measure_threshold_ownership` on hbox (16 cores), default regime, all custodians
+//! as threads of one process over sealed channel links, dealer preprocessing. The secret is
+//! held as `(N, N + 2)` Shamir shares; each custodian runs [`prove_ownership_party`]. Both
+//! relations have `2^17` rows and a committed table of `2^18` cells. Per custodian:
 //!
-//! | statement | N | triples per custodian | uniform values | sent per custodian | rounds | MAC checks | proof | wall | verify |
-//! |---|---|---|---|---|---|---|---|---|---|
-//! | Bitcoin HASH160 | 3 | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 1,282,759 B | 10.8 s | 0.23 s |
-//! | Ed25519 seed | 3 | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 1,282,311 B | 12.4 s | 0.25 s |
-//! | Bitcoin HASH160 | 5 | 2,228,208 | 9,156 | 177.8 MB | 138 | 39 | 2,054,657 B | 18.9 s | - |
+//! | statement | N | stage | triples | uniform values | sent | rounds | MAC checks | time |
+//! |---|---|---|---|---|---|---|---|---|
+//! | Bitcoin HASH160 | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.3 s |
+//! | | | witness | 1,227,533 | 613,164 | 49.7 MB | 512,410 | 584 | 17.5 s |
+//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 6.1 s |
+//! | Ed25519 seed | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.3 s |
+//! | | | witness | 1,309,300 | 645,436 | 52.9 MB | 536,671 | 559 | 16.4 s |
+//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 5.6 s |
+//! | Bitcoin HASH160 | 5 | input | 2,304 | 1,280 | 206,080 B | 10 | 2 | 0.3 s |
+//! | | | witness | 1,227,533 | 613,164 | 99.4 MB | 512,410 | 584 | 31.7 s |
+//! | | | proof | 2,228,208 | 9,156 | 177.8 MB | 138 | 39 | 7.8 s |
 //!
-//! "Sent" counts every broadcast once per recipient. The triples are Goldilocks triples:
-//! `2^17` for round 0 and sixteen per extension-field product after it. Not measured:
-//! witness generation. The ceremony for this many triples is extrapolated in
-//! "Preprocessing", not run.
+//! Proofs: 1,288,007 B, 1,286,823 B and 2,051,169 B; verification 0.18 s. "Sent" counts
+//! every broadcast once per recipient. Witness generation is round-bound, not
+//! compute-bound: its borrow chains are sequential, one product per round, so on a
+//! network its time is about half a million round trips. Batching independent chains
+//! into shared rounds is not done.
 
 pub mod custody;
 pub mod engine;
 pub mod net;
 pub mod prep;
 pub mod prover;
+pub mod witgen;
 
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{ZkHemSplitProof, verify_split};
 
-use super::relations::{OwnershipStatement, ownership_shape, ownership_transcript};
+use super::relations::{
+    OwnershipStatement, ownership_definitions, ownership_shape, ownership_transcript,
+};
+use engine::{Engine, Stats};
+use net::Transport;
+
+/// Why a custodian's [`prove_ownership_party`] produced no proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThresholdError {
+    /// The statement is malformed, or its relation takes inputs other than one secret
+    /// of the length of the custody share.
+    Statement,
+    Input(custody::InputError),
+    Witness(witgen::WitgenError),
+    Prove(prover::ProveError),
+}
+
+/// The stages of [`prove_ownership_party`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Custody shares to authenticated shares of the secret's bits.
+    Input,
+    /// Shares of the secret's bits to shares of the assignment.
+    Witness,
+    /// The proof.
+    Proof,
+}
+
+/// Triples and uniform values one custodian consumes in [`prove_ownership_party`], by
+/// stage, for a secret of `secret_bytes` bytes. `None` for a statement it refuses.
+pub fn ownership_demand(
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    parties: usize,
+) -> Option<[(Stage, usize, usize); 3]> {
+    let (shape, defs) = ownership_definitions(statement)?;
+    let &[bits] = witgen::input_bits(&defs).as_slice() else {
+        return None;
+    };
+    let input = custody::input_demand(parties, bits / 8);
+    let witness = witgen::demand(&shape, &defs).ok()?;
+    let proof = prover::prover_demand(&shape, regime)?;
+    Some([
+        (Stage::Input, input.0, input.1),
+        (Stage::Witness, witness.triples, witness.randoms),
+        (Stage::Proof, proof.0, proof.1),
+    ])
+}
+
+/// One custodian's side of a threshold proof of `statement`, from its XOR share of the
+/// legacy secret (see [`custody::xor_share_from_shamir`]). No custodian holds the secret,
+/// any variable of the assignment or any share of another custodian at any point: the
+/// secret's bits enter as authenticated shares ([`custody`]), the assignment is computed
+/// on shares ([`witgen`]) and proved on shares ([`prover`]).
+pub fn prove_ownership_party<T: Transport>(
+    e: &mut Engine<T>,
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    xor_share: &[u8],
+) -> Result<ZkHemSplitProof, ThresholdError> {
+    prove_ownership_party_observed(e, statement, regime, xor_share, &mut |_, _| {})
+}
+
+/// [`prove_ownership_party`], reporting the engine's counters after each stage.
+pub fn prove_ownership_party_observed<T: Transport>(
+    e: &mut Engine<T>,
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    xor_share: &[u8],
+    after: &mut dyn FnMut(Stage, Stats),
+) -> Result<ZkHemSplitProof, ThresholdError> {
+    let (shape, defs) = ownership_definitions(statement).ok_or(ThresholdError::Statement)?;
+    let public_inputs = statement.public_inputs().ok_or(ThresholdError::Statement)?;
+    if witgen::input_bits(&defs) != [8 * xor_share.len()] {
+        return Err(ThresholdError::Statement);
+    }
+    let bits = custody::input_secret_bits(e, xor_share).map_err(ThresholdError::Input)?;
+    after(Stage::Input, e.stats);
+    let z = witgen::generate(e, &shape, &defs, &public_inputs, &[bits])
+        .map_err(ThresholdError::Witness)?;
+    after(Stage::Witness, e.stats);
+    let proof = prover::prove_party(
+        e,
+        &shape,
+        &public_inputs,
+        &ownership_transcript(statement, regime),
+        regime,
+        z,
+    )
+    .map_err(ThresholdError::Prove)?;
+    after(Stage::Proof, e.stats);
+    Ok(proof)
+}
 
 /// Verify a threshold proof of an ownership statement: the ordinary zk-Hem verifier on
 /// the statement's relation, public inputs and transcript, with the Stage-0 fibers
@@ -522,5 +632,88 @@ mod tests {
             }
         }
         core::array::from_fn(|j| m[j][4])
+    }
+
+    /// Threshold proofs of real ownership statements from `(k, n)` Shamir shares of the
+    /// secret, with dealer preprocessing (test-only).
+    /// `cargo test --release -p dregg-sig-migrate --features std --lib --
+    /// hem::collab::tests::measure_threshold_ownership --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_threshold_ownership() {
+        use super::custody::tests::shamir;
+        use super::custody::xor_share_from_shamir;
+        use super::engine::Dealer;
+        use super::engine::tests::run_parties;
+        use super::witgen::tests::reference_cases;
+        use super::*;
+        let regime = WhirSecurityRegime::default();
+        let only = std::env::var("COLLAB_MEASURE_ONLY").ok();
+        for (parties, case) in [(3usize, 0usize), (3, 1), (5, 0)] {
+            let (st, _, secret) = reference_cases().swap_remove(case);
+            let label = std::format!("{:?} N={parties}", st.lock);
+            if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
+                continue;
+            }
+            // Custody: parties-of-(parties + 2); the quorum leaves custodians 1 and
+            // parties + 1 out.
+            let shares = shamir(&secret, parties, parties + 2, 9);
+            let quorum: Vec<usize> = (0..parties + 2).filter(|&p| p != 1).take(parties).collect();
+            let stages = ownership_demand(&st, regime, parties).unwrap();
+            let triples: usize = stages.iter().map(|s| s.1).sum();
+            let randoms: usize = stages.iter().map(|s| s.2).sum();
+            let preps = Dealer::new(parties, &[3; 32]).preprocessing(triples, randoms);
+            let t = std::time::Instant::now();
+            let out = run_parties(preps, |mut e| {
+                let me = quorum[e.me()];
+                let xor = xor_share_from_shamir(&quorum, me, &shares[me]).unwrap();
+                let mut marks = Vec::new();
+                let start = std::time::Instant::now();
+                let proof = prove_ownership_party_observed(
+                    &mut e,
+                    &st,
+                    regime,
+                    &xor,
+                    &mut |stage, stats| marks.push((stage, stats, start.elapsed().as_secs_f64())),
+                );
+                assert_eq!(e.remaining(), (0, 0), "demand is exact");
+                (proof, marks)
+            });
+            let total_s = t.elapsed().as_secs_f64();
+            let proof = out[0].0.clone().unwrap();
+            assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
+            let bytes = proof.to_bytes();
+            let t = std::time::Instant::now();
+            assert!(verify_threshold_ownership(&st, regime, &proof));
+            let verify_s = t.elapsed().as_secs_f64();
+            let mut other = st.clone();
+            other.epoch += 1;
+            assert!(!verify_threshold_ownership(&other, regime, &proof));
+            std::println!(
+                "{label}: proof={} bytes wall={total_s:.1}s verify={verify_s:.2}s",
+                bytes.len()
+            );
+            let mut before = (Stats::default(), 0.0);
+            for ((stage, stats, at), demand) in out[0].1.iter().zip(&stages) {
+                std::println!(
+                    "  {stage:?}: triples={} randoms={} sent={} bytes rounds={} mac_checks={} time={:.1}s",
+                    stats.triples_used - before.0.triples_used,
+                    stats.randoms_used - before.0.randoms_used,
+                    stats.bytes_sent - before.0.bytes_sent,
+                    stats.rounds - before.0.rounds,
+                    stats.mac_checks - before.0.mac_checks,
+                    at - before.1,
+                );
+                assert_eq!(
+                    (stats.triples_used - before.0.triples_used) as usize,
+                    demand.1
+                );
+                assert_eq!(
+                    (stats.randoms_used - before.0.randoms_used) as usize,
+                    demand.2
+                );
+                before = (*stats, *at);
+            }
+        }
     }
 }

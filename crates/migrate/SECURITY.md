@@ -251,9 +251,13 @@ the module, and measured costs. `hem::collab::prep` is its dealerless preprocess
 ceremony; the soundness arguments there are written out, not machine-checked and not
 independently reviewed.
 
-Not in this tree: computing the shared assignment from shares of the legacy secret.
-`hem::collab::custody` turns `(k, n)` Shamir or XOR custody shares into authenticated
-shares of the secret's bits; the remaining variables of a relation (hash and curve
-intermediates and their hint variables) have no secure computation here. Until that
-exists, a legacy secret held as shares has to be reconstructed in one place to
-produce the assignment.
+`hem::collab::prove_ownership_party` starts from a custodian's share of the legacy
+secret (`(k, n)` Shamir or XOR custody): the secret's bits enter as authenticated
+shares, `hem::collab::witgen` computes the rest of the assignment on shares, and the
+prover runs on those. The secret is not reconstructed anywhere. Witness generation
+uses statistical masking with 40 bits for range-limited openings and reveals one
+predicate of the key by aborting (an elliptic-curve addition of two points with equal
+`x`); its privacy argument is written in the module and is not machine-checked.
+Statements from a master seed, with a hidden derivation path or with a taproot script
+tree (their relations take inputs beyond the bits of one secret), and relations with
+lookups, are not supported by the threshold prover.

@@ -166,7 +166,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc};
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, IntCoef, Lc, Source, SourceId};
 
 type F = Goldilocks;
 /// Words of a native integer: enough for the 381-bit BLS12-381 base field.
@@ -942,6 +942,10 @@ fn mul_poly(cs: &mut Ctx, a: &Poly, b: &Poly) -> Poly {
     let mut av: Vec<F> = a.0.iter().map(|c| cs.eval(&c.lc)).collect();
     let mut bv: Vec<F> = b.0.iter().map(|c| cs.eval(&c.lc)).collect();
     let mut out = Vec::with_capacity(n);
+    let source = cs.source(|| Source::PolyProduct {
+        a: a.0.iter().map(|c| c.lc.clone()).collect(),
+        b: b.0.iter().map(|c| c.lc.clone()).collect(),
+    });
     for k in 0..n {
         let mut v = F::ZERO;
         let (mut lo, mut hi) = (0i128, 0i128);
@@ -954,7 +958,12 @@ fn mul_poly(cs: &mut Ctx, a: &Poly, b: &Poly) -> Poly {
         }
         assert!(lo > -COEF_BOUND && hi < COEF_BOUND, "product too wide");
         out.push(Coef {
-            lc: cs.alloc(v).into(),
+            lc: cs
+                .alloc_defined(v, || Def::Coefficient {
+                    product: source,
+                    index: k as u32,
+                })
+                .into(),
             lo,
             hi,
         });
@@ -1029,32 +1038,73 @@ impl Element {
     }
 }
 
+/// The coefficients of `p` for a recorded definition.
+fn int_coefs(p: &Poly) -> Vec<IntCoef> {
+    p.0.iter()
+        .map(|c| IntCoef {
+            lc: c.lc.clone(),
+            lo: c.lo,
+            hi: c.hi,
+        })
+        .collect()
+}
+
+/// The source of the canonical residue of `(sum of products + linear) / den` modulo `m`.
+fn residue_source(
+    cs: &mut Ctx,
+    m: &Modulus,
+    products: &[(&Poly, &Poly)],
+    linear: &Poly,
+    den: Option<&Poly>,
+) -> SourceId {
+    cs.source(|| Source::Residue {
+        products: products
+            .iter()
+            .map(|(a, b)| (int_coefs(a), int_coefs(b)))
+            .collect(),
+        linear: int_coefs(linear),
+        den: den.map(int_coefs).unwrap_or_default(),
+        modulus: big_to_bytes(&m.p)[..m.limbs].to_vec(),
+    })
+}
+
 /// Allocate `value mod 2^nbits`. Each limb is one variable; its low bits are variables and
 /// its top bit is the linear form that completes it, so a limb costs as many rows as bits.
-fn alloc_int(cs: &mut Ctx, value_le: &[u8], nbits: usize) -> Element {
+fn alloc_int(cs: &mut Ctx, source: SourceId, value_le: &[u8], nbits: usize) -> Element {
     cs.hints.elements += 1;
     cs.hints.element_bits += nbits;
     cs.hints.range_lookups += range_lookups(nbits);
-    alloc_bits(cs, value_le, nbits)
+    alloc_bits(cs, source, value_le, nbits)
 }
 
-fn alloc_bits(cs: &mut Ctx, value_le: &[u8], nbits: usize) -> Element {
+fn alloc_bits(cs: &mut Ctx, source: SourceId, value_le: &[u8], nbits: usize) -> Element {
+    let part = |lo: usize, width: usize| Def::Bits {
+        source,
+        lo: lo as u32,
+        width: width as u32,
+    };
     let mut bytes_le = Vec::with_capacity(nbits.div_ceil(8));
     let mut bits_le = Vec::with_capacity(nbits);
     for i in 0..nbits.div_ceil(8) {
         let width = (nbits - 8 * i).min(8);
         let byte = value_le.get(i).copied().unwrap_or(0) & (0xffu16 >> (8 - width)) as u8;
         if width == 1 {
-            let bit: Lc = cs.alloc(F::from_u64_reduced(byte as u64)).into();
+            let bit: Lc = cs
+                .alloc_defined(F::from_u64_reduced(byte as u64), || part(8 * i, 1))
+                .into();
             cs.enforce_boolean(&bit);
             bits_le.push(bit.clone());
             bytes_le.push(bit);
             continue;
         }
-        let limb: Lc = cs.alloc(F::from_u64_reduced(byte as u64)).into();
+        let limb: Lc = cs
+            .alloc_defined(F::from_u64_reduced(byte as u64), || part(8 * i, width))
+            .into();
         let mut top = limb.clone();
         for k in 0..width - 1 {
-            let bit = cs.alloc(F::from_u64_reduced(((byte >> k) & 1) as u64));
+            let bit = cs.alloc_defined(F::from_u64_reduced(((byte >> k) & 1) as u64), || {
+                part(8 * i + k, 1)
+            });
             cs.enforce_boolean(&bit.into());
             top = top.minus(&Lc::term(bit, F::from_u64_reduced(1 << k)));
             bits_le.push(bit.into());
@@ -1114,7 +1164,8 @@ impl Lazy {
 
 fn reduce_poly(cs: &mut Ctx, m: &Modulus, a: &Poly) -> Element {
     let value = big_to_bytes(&m.canon(&m.poly_value(cs, a)));
-    let out = alloc_int(cs, &value, m.bits);
+    let source = residue_source(cs, m, &[], a, None);
+    let out = alloc_int(cs, source, &value, m.bits);
     enforce_zero_mod(cs, m, &out.poly().sub(a));
     out
 }
@@ -1122,7 +1173,12 @@ fn reduce_poly(cs: &mut Ctx, m: &Modulus, a: &Poly) -> Element {
 impl Modulus {
     /// A fresh witness of [`Self::bits`] bits holding `value_le mod 2^bits`.
     pub fn alloc(&self, cs: &mut impl Host, value_le: &[u8]) -> Element {
-        run(cs, |cs| alloc_int(cs, value_le, self.bits))
+        run(cs, |cs| {
+            let source = cs.source(|| Source::Input {
+                bits: self.bits as u32,
+            });
+            alloc_int(cs, source, value_le, self.bits)
+        })
     }
 
     /// The canonical residue of `a` under the current assignment, little-endian, one byte
@@ -1177,7 +1233,12 @@ pub fn integer_bits(cs: &mut impl Host, a: &Lazy, bits: usize) -> Element {
     run(cs, |cs| {
         assert!(a.0.0.len() <= 8 * WIDE - 8 && bits <= 64 * (WIDE - 1));
         let value = wide_to_bytes(&signed_value(cs, &a.0));
-        let out = alloc_int(cs, &value, bits);
+        let source = cs.source(|| Source::Integer {
+            products: Vec::new(),
+            linear: int_coefs(&a.0),
+            bits: bits as u32,
+        });
+        let out = alloc_int(cs, source, &value, bits);
         let diff = a.0.sub(&out.poly());
         for c in &diff.0 {
             assert!(c.lo > -COEF_BOUND && c.hi < COEF_BOUND);
@@ -1250,8 +1311,27 @@ fn enforce_zero_mod(cs: &mut Ctx, m: &Modulus, d: &Poly) -> Element {
     let q_bytes = wide_to_bytes(&wide_mul_lo(&numer, &m.pinv));
     cs.hints.quotients += 1;
     cs.hints.quotient_bits += qbits;
+    let source = cs.source(|| {
+        let offset_bytes = wide_to_bytes(&offset_p);
+        let mut num = int_coefs(d);
+        num.resize(
+            num.len().max(wide_bitlen(&offset_p).div_ceil(8)),
+            int_coefs(&Poly(vec![Coef::zero()])).remove(0),
+        );
+        for (k, c) in num.iter_mut().enumerate() {
+            let b = offset_bytes[k] as i128;
+            c.lc = c.lc.plus_const(f_int(b));
+            c.lo += b;
+            c.hi += b;
+        }
+        Source::Quotient {
+            num,
+            divisor: big_to_bytes(&m.p)[..m.limbs].to_vec(),
+            bits: qbits as u32,
+        }
+    });
     cs.hints.range_lookups += range_lookups(qbits);
-    let q = alloc_bits(cs, &q_bytes, qbits);
+    let q = alloc_bits(cs, source, &q_bytes, qbits);
     let qp = q.poly();
 
     // e = d + K p - q p, coefficient by coefficient.
@@ -1340,9 +1420,20 @@ fn enforce_integer_zero(cs: &mut Ctx, e: &[Coef]) {
             let mut top = next.plus_const(f_int(-clo));
             cs.hints.carries += 1;
             cs.hints.carry_bits += nbits as usize;
+            let source = cs.source(|| Source::Form {
+                lc: top.clone(),
+                bits: nbits,
+            });
             cs.hints.range_lookups += range_lookups(nbits as usize);
             for k in 0..nbits - 1 {
-                let bit = cs.alloc(F::from_u64_reduced(((shifted >> k) & 1) as u64));
+                let bit =
+                    cs.alloc_defined(F::from_u64_reduced(((shifted >> k) & 1) as u64), || {
+                        Def::Bits {
+                            source,
+                            lo: k,
+                            width: 1,
+                        }
+                    });
                 cs.enforce_boolean(&bit.into());
                 top = top.minus(&Lc::term(bit, F::from_u64_reduced(1 << k)));
             }
@@ -1379,7 +1470,10 @@ fn all_ones(cs: &mut Ctx, bits: &[Lc]) -> Lc {
             let missing = Lc::combine(&parts).plus_const(F::from_u64_reduced(bits.len() as u64));
             cs.hints.zero_tests += 1;
             let inverse = cs.eval(&missing).inv_or_zero();
-            let inv = cs.alloc(inverse);
+            let inv = cs.alloc_defined(inverse, || Def::InverseOrZero {
+                of: missing.clone(),
+                max: bits.len() as u32,
+            });
             let nonzero = cs.mul(&missing, &inv.into());
             let flag = Lc::constant(F::ONE).minus(&nonzero.into());
             cs.enforce_mul(missing, flag.clone(), Lc::zero());
@@ -1444,7 +1538,10 @@ fn enforce_nonzero(cs: &mut Ctx, bits: &[Lc]) {
     let sum = Lc::combine(&parts);
     cs.hints.zero_tests += 1;
     let inverse = cs.eval(&sum).inv_or_zero();
-    let inv = cs.alloc(inverse);
+    let inv = cs.alloc_defined(inverse, || Def::InverseOrZero {
+        of: sum.clone(),
+        max: bits.len() as u32,
+    });
     cs.enforce_mul(sum, inv.into(), Lc::constant(F::ONE));
 }
 
@@ -1533,7 +1630,17 @@ fn lookup(
         for (sel, form) in selectors.iter().zip(&forms) {
             value += cs.eval(sel).const_mul(cs.eval(form));
         }
-        let var: Lc = cs.alloc(value).into();
+        let var: Lc = cs
+            .alloc_defined(value, || Def::SumOfProducts {
+                base: forms[0].clone(),
+                products: selectors
+                    .iter()
+                    .zip(&forms)
+                    .skip(1)
+                    .map(|(sel, form)| (sel.clone(), form.minus(&forms[0])))
+                    .collect(),
+            })
+            .into();
         let mut rest = var.minus(&forms[0]);
         let last = forms.len() - 1;
         for h in 1..last {
@@ -1947,10 +2054,19 @@ fn add_step(cs: &mut Ctx, curve: &Curve, acc: &Acc, xt: &Poly, yt: &Poly, comple
         &x2,
     );
     cs.hints.divisions += 1;
-    let lam = alloc_int(cs, &big_to_bytes(&f.canon(&lam)), f.bits);
-    let x3 = alloc_int(cs, &big_to_bytes(&f.canon(&x3)), f.bits);
-    let (lam_p, x3_p) = (lam.poly(), x3.poly());
     let a2 = Poly::constant_bytes(&curve.a2.to_le_bytes()[..3]);
+    let source = residue_source(cs, f, &[], &yt.sub(&acc.y), Some(&xt.sub(&acc.x)));
+    let lam = alloc_int(cs, source, &big_to_bytes(&f.canon(&lam)), f.bits);
+    let lam_p = lam.poly();
+    let source = residue_source(
+        cs,
+        f,
+        &[(&lam_p, &lam_p)],
+        &acc.x.scale(-1).sub(xt).sub(&a2),
+        None,
+    );
+    let x3 = alloc_int(cs, source, &big_to_bytes(&f.canon(&x3)), f.bits);
+    let x3_p = x3.poly();
 
     let chord = mul_poly(cs, &lam_p, &xt.sub(&acc.x));
     enforce_zero_mod(cs, f, &chord.sub(yt).add(&acc.y));
@@ -2235,8 +2351,15 @@ pub fn secp256k1_alloc_point(
 ) -> Secp256k1PublicKey {
     run(cs, |cs| {
         let f = Modulus::secp256k1_base();
-        let x = alloc_int(cs, x_le, f.bits);
-        let y = alloc_int(cs, y_le, f.bits);
+        let input = |cs: &mut Ctx| {
+            cs.source(|| Source::Input {
+                bits: f.bits as u32,
+            })
+        };
+        let source = input(cs);
+        let x = alloc_int(cs, source, x_le, f.bits);
+        let source = input(cs);
+        let y = alloc_int(cs, source, y_le, f.bits);
         canonical(cs, &f, &x);
         canonical(cs, &f, &y);
         let xx = mul_poly(cs, &x.poly(), &x.poly());
@@ -2380,10 +2503,18 @@ fn ed_key(cs: &mut Ctx, curve: &Curve, acc: Acc) -> Ed25519PublicKey {
     let root = big4(&ED_SQRT_M486664);
     let xn = f.mmul(&f.mmul(&f.mont(&root), &un), &f.inv(&vn));
     cs.hints.divisions += 2;
-    let y = alloc_int(cs, &big_to_bytes(&f.canon(&yn)), f.bits);
-    let x = alloc_int(cs, &big_to_bytes(&f.canon(&xn)), f.bits);
-
     let one = Poly::constant_bytes(&[1]);
+    let source = residue_source(cs, f, &[], &u.sub(&one), Some(&u.add(&one)));
+    let y = alloc_int(cs, source, &big_to_bytes(&f.canon(&yn)), f.bits);
+    let source = residue_source(
+        cs,
+        f,
+        &[],
+        &u.mul_const(&big_to_bytes(&root)[..32]),
+        Some(&v),
+    );
+    let x = alloc_int(cs, source, &big_to_bytes(&f.canon(&xn)), f.bits);
+
     let yu = mul_poly(cs, &y.poly(), &u.add(&one));
     enforce_zero_mod(cs, f, &yu.sub(&u).add(&one));
     let xv = mul_poly(cs, &x.poly(), &v);
@@ -2765,7 +2896,11 @@ mod tests {
         let (ea, eb) = (m.alloc(&mut cs, &a), m.alloc(&mut cs, &b));
         let product = mul_poly(&mut ctx(&mut cs), &ea.poly(), &eb.poly());
         let value = m.value(&cs, &Lazy(product.clone()));
-        let r = alloc_int(&mut ctx(&mut cs), &value, m.bits());
+        let mut c = ctx(&mut cs);
+        let source = c.source(|| Source::Input {
+            bits: m.bits() as u32,
+        });
+        let r = alloc_int(&mut c, source, &value, m.bits());
         let q = enforce_zero_mod(&mut ctx(&mut cs), &m, &r.poly().sub(&product));
         let (shape, z) = cs.finish();
         assert!(shape.is_satisfied(&z));

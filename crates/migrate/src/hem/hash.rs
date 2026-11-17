@@ -23,7 +23,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc};
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, Lc, Source};
 
 type F = Goldilocks;
 
@@ -72,9 +72,18 @@ pub fn const_bits(bytes: &[u8]) -> Vec<Lc> {
 /// Fresh Boolean-constrained bits holding `bytes` (one row per bit).
 pub fn alloc_bits(cs: &mut ConstraintSystem, bytes: &[u8]) -> Vec<Lc> {
     let mut out = Vec::with_capacity(8 * bytes.len());
-    for &b in bytes {
+    let source = cs.source(|| Source::Input {
+        bits: 8 * bytes.len() as u32,
+    });
+    for (at, &b) in bytes.iter().enumerate() {
         for i in 0..8 {
-            let bit: Lc = cs.alloc(fu(u64::from(b >> i) & 1)).into();
+            let bit: Lc = cs
+                .alloc_defined(fu(u64::from(b >> i) & 1), || Def::Bits {
+                    source,
+                    lo: (8 * at + i) as u32,
+                    width: 1,
+                })
+                .into();
             cs.enforce_boolean(&bit);
             out.push(bit);
         }
@@ -198,7 +207,12 @@ fn affine(co: &[i64; 4], x: &Lc, y: &Lc, z: &Lc) -> Lc {
 
 fn one_row(cs: &mut ConstraintSystem, g: &OneRow, x: &Lc, y: &Lc, z: &Lc) -> Lc {
     let value = (g.f)(bit_value(cs, x), bit_value(cs, y), bit_value(cs, z)) & 1;
-    let p = cs.alloc(fu(value));
+    let p = cs.alloc_defined(fu(value), || Def::Ratio {
+        num: affine(&g.c, x, y, z),
+        den: affine(&g.b, x, y, z),
+        minus: affine(&g.a, x, y, z),
+        scale: fi(g.pk).inv(),
+    });
     cs.enforce_mul(
         affine(&g.a, x, y, z).plus(&Lc::term(p, fi(g.pk))),
         affine(&g.b, x, y, z),
@@ -310,10 +324,17 @@ impl Word {
 
     /// Fresh Boolean-constrained word holding the low `width` bits of `value`.
     pub fn alloc(cs: &mut ConstraintSystem, value: u64, width: usize) -> Self {
+        let source = cs.source(|| Source::Input { bits: width as u32 });
         Self::from_bits(
             (0..width)
                 .map(|i| {
-                    let bit: Lc = cs.alloc(fu((value >> i) & 1)).into();
+                    let bit: Lc = cs
+                        .alloc_defined(fu((value >> i) & 1), || Def::Bits {
+                            source,
+                            lo: i as u32,
+                            width: 1,
+                        })
+                        .into();
                     cs.enforce_boolean(&bit);
                     bit
                 })
@@ -477,10 +498,20 @@ pub fn add_mod(cs: &mut ConstraintSystem, plus: &[&Word], minus: &[&Word]) -> Wo
         }
         let sum = Lc::combine(&parts).plus_const(fu(offset));
         let total = cs.eval(&sum).to_canonical_u64();
+        let source = cs.source(|| Source::Form {
+            lc: sum.clone(),
+            bits: (64 - max.leading_zeros()).max(limb as u32),
+        });
 
         let result: Vec<Lc> = (0..limb)
             .map(|i| {
-                let bit: Lc = cs.alloc(fu((total >> i) & 1)).into();
+                let bit: Lc = cs
+                    .alloc_defined(fu((total >> i) & 1), || Def::Bits {
+                        source,
+                        lo: i as u32,
+                        width: 1,
+                    })
+                    .into();
                 cs.enforce_boolean(&bit);
                 bit
             })
@@ -496,7 +527,13 @@ pub fn add_mod(cs: &mut ConstraintSystem, plus: &[&Word], minus: &[&Word]) -> Wo
         } else {
             let low: Vec<Lc> = (0..carry_bits - 1)
                 .map(|j| {
-                    let bit: Lc = cs.alloc(fu((total >> (limb + j)) & 1)).into();
+                    let bit: Lc = cs
+                        .alloc_defined(fu((total >> (limb + j)) & 1), || Def::Bits {
+                            source,
+                            lo: (limb + j) as u32,
+                            width: 1,
+                        })
+                        .into();
                     cs.enforce_boolean(&bit);
                     bit
                 })
@@ -522,9 +559,19 @@ pub fn add_wide(cs: &mut ConstraintSystem, a: &[Lc], b: &[Lc]) -> Vec<Lc> {
         let limb = x.len();
         let sum = pack_bits(x).plus(&pack_bits(y)).plus(&carry);
         let total = cs.eval(&sum).to_canonical_u64();
+        let source = cs.source(|| Source::Form {
+            lc: sum.clone(),
+            bits: limb as u32 + 1,
+        });
         let result: Vec<Lc> = (0..limb)
             .map(|i| {
-                let bit: Lc = cs.alloc(fu((total >> i) & 1)).into();
+                let bit: Lc = cs
+                    .alloc_defined(fu((total >> i) & 1), || Def::Bits {
+                        source,
+                        lo: i as u32,
+                        width: 1,
+                    })
+                    .into();
                 cs.enforce_boolean(&bit);
                 bit
             })

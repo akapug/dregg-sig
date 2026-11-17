@@ -135,7 +135,7 @@ use dregg_sig_accel::sha2 as sha2_native;
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Def, Definitions, Lc, Shape, Source};
 
 use super::curve::{
     Element, Lazy, Modulus, bls12_381_enforce_scalar_range, bls12_381_g1_fixed_base_mul,
@@ -1222,7 +1222,14 @@ fn pin(cs: &mut ConstraintSystem, got: &[Lc], want: &[Lc]) {
 }
 
 fn alloc_bool(cs: &mut ConstraintSystem, value: bool) -> Lc {
-    let bit: Lc = cs.alloc(fu(u64::from(value))).into();
+    let source = cs.source(|| Source::Input { bits: 1 });
+    let bit: Lc = cs
+        .alloc_defined(fu(u64::from(value)), || Def::Bits {
+            source,
+            lo: 0,
+            width: 1,
+        })
+        .into();
     cs.enforce_boolean(&bit);
     bit
 }
@@ -1657,14 +1664,50 @@ fn build(
     public_bits: &[bool],
     witness: &RelationWitness<'_>,
 ) -> (Shape, Vec<F>, usize) {
-    assert_eq!(public_bits.len(), 8 * lock.credential_bytes() + 512);
-    let mut cs = ConstraintSystem::new();
-    let public = alloc_public(&mut cs, public_bits);
-    let (credential, nullifier_secret) = credential_gadget(&mut cs, lock, source, witness);
-    bind_credential(&mut cs, &public, &credential, &nullifier_secret);
+    let cs = build_in(ConstraintSystem::new(), lock, source, public_bits, witness);
     let rows = cs.num_rows();
     let (shape, assignment) = cs.finish();
     (shape, assignment, rows)
+}
+
+fn build_in(
+    mut cs: ConstraintSystem,
+    lock: Lock,
+    source: &KeySource,
+    public_bits: &[bool],
+    witness: &RelationWitness<'_>,
+) -> ConstraintSystem {
+    assert_eq!(public_bits.len(), 8 * lock.credential_bytes() + 512);
+    let public = alloc_public(&mut cs, public_bits);
+    let (credential, nullifier_secret) = credential_gadget(&mut cs, lock, source, witness);
+    bind_credential(&mut cs, &public, &credential, &nullifier_secret);
+    cs
+}
+
+/// The relation of `statement` with the definition of every variable in terms of
+/// earlier ones, for a prover that holds the witness in shares. The first
+/// [`Source::Input`] is the statement's secret, bit `k` of byte `i` at bit `8 i + k`.
+/// `None` for a malformed statement.
+pub fn ownership_definitions(statement: &OwnershipStatement) -> Option<(Shape, Definitions)> {
+    if !statement.is_well_formed() {
+        return None;
+    }
+    let mut secret = placeholder_secret(&statement.source);
+    let cs = build_in(
+        ConstraintSystem::new_recording(),
+        statement.lock,
+        &statement.source,
+        &vec![false; 8 * statement.lock.credential_bytes() + 512],
+        &RelationWitness {
+            secret: &secret,
+            path: &[],
+            merkle_root: [0; 32],
+        },
+    );
+    wipe(&mut secret);
+    let (shape, mut assignment, definitions) = cs.finish_recorded();
+    dregg_sig_asm::volatile_fill(&mut assignment, F::ZERO);
+    Some((shape, definitions))
 }
 
 /// A valid secret for building a shape without a witness.

@@ -12,15 +12,16 @@
 //! # Where this comes from
 //!
 //! This is the Goldilocks part of the ceremony of the earlier general-quorum engine,
-//! `threshold_prep/dealerless.rs` (removed; last present in commit 894d7dc), carried over as self-contained code. Copied from that
-//! file, specialised to Goldilocks and otherwise unchanged in what is sent, checked and
-//! erased: `xof`, `element_from`, `pad_element`, `Prg` (its field stream), `Challenges`,
-//! `commitment`, `Transcript`, `Pair`, `FieldQueue`, `Check`, `Fault`, and of `Ceremony`
-//! the methods `coin`, `commit_then_open`, `sample`, `field_key_for` (here `key_for`),
-//! `sample_field_keys` (`sample_keys`), `establish_pairs`, `cope`, `authenticate`, `open`,
-//! `expect_zero`, `check_field_queue` (`check_queue`), `multiply`, `sacrifice` and the
-//! triple, random and key-consistency part of `field_stage`. The share arithmetic
-//! (`mac_add`, `mac_sub`, `mac_scale`) is that of `threshold_mpc.rs` for Goldilocks.
+//! `threshold_prep/dealerless.rs` (removed; last present in commit 894d7dc), carried over
+//! as self-contained code. Copied from that file, specialised to Goldilocks and otherwise
+//! unchanged in what is sent, checked and erased: `xof`, `element_from`, `pad_element`,
+//! `Prg` (its field stream), `Challenges`, `commitment`, `Transcript`, `Pair`,
+//! `FieldQueue`, `Check`, `Fault`, and of `Ceremony` the methods `coin`,
+//! `commit_then_open`, `sample`, `field_key_for` (here `key_for`), `sample_field_keys`
+//! (`sample_keys`), `establish_pairs`, `cope`, `authenticate`, `open`, `expect_zero`,
+//! `check_field_queue` (`check_queue`), `multiply`, `sacrifice` and the triple, random
+//! and key-consistency part of `field_stage`. The share arithmetic (`mac_add`, `mac_sub`,
+//! `mac_scale`) is that of `threshold_mpc.rs` for Goldilocks.
 //!
 //! Not carried over, because nothing of [`super::engine`] uses it: Boolean triples and
 //! the Boolean MAC key, doubly authenticated bits (with the bit proof `prove_bits`, the
@@ -29,11 +30,11 @@
 //! openings.
 //!
 //! Changed: the base OT batch of a pair has 192 OTs instead of 1472 (two key words and
-//! the zero word); a share is `[value, MAC_0, MAC_1]` of `Goldilocks` instead of two
-//! six-limb values; commit-then-open payloads carry two words per MAC instead of six;
-//! every domain-separation string is new (`QSAG.COLLAB.PREP.*/v1`); and a demand is
-//! produced in batches (below). The output of the two ceremonies is therefore not
-//! byte-identical for equal inputs.
+//! the zero word; see the review below); a share is `[value, MAC_0, MAC_1]` of
+//! `Goldilocks` instead of two six-limb values; commit-then-open payloads carry two words
+//! per MAC instead of six; every domain-separation string is new
+//! (`QSAG.COLLAB.PREP.*/v1`); and a demand is produced in batches (below). The output of
+//! the two ceremonies is therefore not byte-identical for equal inputs.
 //!
 //! # The sharing
 //!
@@ -83,12 +84,10 @@
 //!   drawn independently per key, or (owner input check) twice with every instance
 //!   checked under both keys, so that no event of probability `2^-64` defeats both.
 //! * Batch MAC check: a wrong opened value passes with probability at most `2/|F|` per
-//!   key, `2^-126`. Key consistency: `2^-128`. Input check: see `Ceremony::authenticate`.
+//!   key, `2^-126`. Key consistency: `2^-128`. Input check: see the review below.
 //!
-//! These arguments are written out in the comments of the functions below as they were
-//! in the earlier file; they are not machine-checked and have not had an independent
-//! review, and the ceremony relies on the security of the `dregg-sig-core` OT mesh and
-//! commit-and-open coin.
+//! None of this is machine-checked, and the ceremony relies on the security of the
+//! `dregg-sig-core` OT mesh and commit-and-open coin.
 //!
 //! # Batches
 //!
@@ -101,9 +100,158 @@
 //! coins over the one transcript chain. This is this module's change, not the earlier
 //! file's; the per-batch checks are the same checks, and the earlier ceremony already
 //! authenticated several batches on one base correlation (its second authentication of
-//! a stage). The selective-failure argument of `Ceremony::authenticate` is per key and
-//! multiplicative across checks: guessing `c` key bits over any number of batches
-//! succeeds with probability `2^-c` in total.
+//! a stage).
+//!
+//! # Review: the base correlation, and selective failure across batches
+//!
+//! Written by a second reader of this file (not its author) against the code and the
+//! papers. Papers, in `/Users/ember/paperbin/`: **MASCOT**,
+//! `2016-keller-orsini-scholl-mascot-2016-505`; **KOS**,
+//! `2015-keller-orsini-scholl-actively-secure-ot-extension-kos-2015-546`; **Roy**,
+//! `2022-roy-softspokenot-2022-192`. "Theorem" below means a statement proven in a
+//! paper; "claim" means an argument of this module that no paper states in this form.
+//!
+//! ## What the 192 base OTs are, and why the count is not a security parameter
+//!
+//! The 192 OTs of a pair are not the base OTs of an OT extension. They are 192 OTs
+//! taken *from* the mesh's extension (three choice words; the mesh works in 64-bit
+//! words), used as the Initialize step of COPE (MASCOT Section 3, Protocol 1): one OT
+//! per bit of the holder's key share, the holder choosing with that bit. COPE needs
+//! exactly `k = 64` OTs per key, no more and no fewer, so `2 * 64 = 128` OTs carry the
+//! two Goldilocks keys; of the third (zero) word only OT 128 is used, for the pair's
+//! common mask stream, and OTs 129..191 are drawn and never read. The earlier file's
+//! 1,472 were 23 words for the keys of five fields and the Boolean key plus the same
+//! zero word (its `BASE_WORDS`); 192 is that count restricted to Goldilocks, which is
+//! all [`super::engine`] has. Nothing was traded away, and no larger count would buy
+//! anything: there is no bound in which this count appears.
+//!
+//! What stands in for the count is the length of what is derived from the 128 pads.
+//! Theorem (MASCOT Theorem 1, proven as Lemma 1 of its Appendix A): COPE realises its
+//! functionality in the OT-hybrid model for any number of Extend calls if the function
+//! expanding the pads is a PRF. Here a pad is 48 bytes and its PRF is the cSHAKE256
+//! stream of `Prg`; a batch reads `7 t + r + 4` elements from each stream, so one HASH160
+//! statement (2,228,208 triples) reads about `1.6 * 10^7` elements, 125 MB, per stream.
+//! Claim: what a corrupted party of a pair gains from this reuse is its advantage in
+//! distinguishing that much cSHAKE256 output under an unknown 384-bit seed from uniform,
+//! per stream; the batches do not enter otherwise, because the streams are read on, never
+//! restarted.
+//!
+//! The OTs of the triple multiplication (448 per triple and ordered pair, `10^9` per
+//! pair for one statement) are not derived from the 192: every batch draws them fresh
+//! from the mesh.
+//!
+//! ## The extension underneath: KOS, whose proof is known to be flawed
+//!
+//! Every OT above comes from one `dregg-sig-core` mesh channel per ordered pair: 128
+//! base OTs (combined from 384 Ring-LWE OTs), one correlation `Delta` in `GF(2^128)`
+//! fixed for the life of the mesh, IKNP columns, and per frame the correlation check of
+//! KOS Fig. 7 (one random linear combination over `GF(2^128)` of all rows and 256
+//! sacrificial rows, challenge sent after the columns), the channel poisoned for good on
+//! a failed check. KOS Theorem 1 would bound a corrupted receiver's advantage by
+//! `O(q 2^-128)` for `q` hash queries, independently of the number of extended OTs and
+//! of how many frames reuse `Delta`: guessing `c` bits of `Delta` passes with
+//! probability `2^-c` and leaves `2^(128-c)` work.
+//!
+//! That theorem's proof does not stand. Roy, Section 4.1.3 and Appendix D: KOS's Lemma 1,
+//! on which Theorem 1 rests, is false (collision attack, D.1); for field sizes divisible
+//! by 20 and a suitable field representation an attack passes the check with
+//! probability `2^(-3 lambda/5)` and then recovers `Delta` with `2^(lambda/5)` hash
+//! queries, where Theorem 1 allows `2^(-4 lambda/5)` (D.2, under a stated heuristic);
+//! Roy calls KOS "still secure enough in practice" and leaves a sound proof open. So
+//! the security of this ceremony against a corrupted OT receiver (the holder in COPE,
+//! the holder of `a` in a multiplication) rests on an extension with no valid proof,
+//! not on a 128-bit theorem. No attack on it at 128 bits is published. Reader's
+//! remark, unverified and not a result of any paper: the mesh represents `GF(2^128)`
+//! as a Wiedemann tower, in which the subfield `GF(2^32)` is a block of coordinates,
+//! which is the structure D.2 uses; the same counting for degree 4 suggests a check
+//! that passes with probability about `2^-64` and leaves `Delta` in a known set of
+//! `2^64`, no better than plain guessing unless a single pad can be tested against 32
+//! bits of `Delta` (the common mask stream of OT 128 may allow that to a coalition
+//! that knows every other term of an opened key-consistency sum).
+//!
+//! What follows if a receiver does learn a channel's `Delta`: it reads both pads of
+//! every OT the other party ever sent on that channel, hence, as COPE holder, every
+//! value the owner authenticated (its shares of all triples and uniform values of the
+//! ceremony), and as multiplication receiver the sender's `b` shares. With all but one
+//! member corrupted that is the whole preprocessing in the clear: privacy of everything
+//! the engine masks with it is lost. The MAC keys are not exposed this way (an honest
+//! party's key share is its *choice* input, and Roy's findings concern a corrupted
+//! receiver only), so soundness of the engine's MAC check is not affected.
+//! The cure is in the mesh, not here: replace the KOS check by a check with a proof,
+//! Roy Fig. 9 (proven as Theorem 4.5, with the OT step of Theorem 5.1), whose
+//! selective-abort leakage is an affine set of `Delta`; its cost is a universal hash
+//! of the rows in place of the `GF(2^128)` combination. Until then the statement for
+//! this module is: 128-bit computational security against a corrupted OT
+//! receiver is conjectured, not proven.
+//!
+//! ## Selective failure across batches
+//!
+//! Three checks can fail depending on a secret of an honest party. Every failure
+//! aborts the ceremony, and the keys and all material of the run are discarded; so a
+//! predicate is learnt for good only by passing, and what must be bounded is the
+//! probability of passing times what passing is worth.
+//!
+//! 1. *Input check of `Ceremony::authenticate`: bits of an honest holder's key share.*
+//!    A corrupted owner may encode different values under different key bits of an honest
+//!    holder (MASCOT Section 4.1). The sum of the opened check shares is then, per key
+//!    and instance, a function fixed by the owner's messages and the coin
+//!    (`sum_l 2^l bit_l E_l` minus what the owner adds), linear in the *bits* of the
+//!    honest holders' shares of that one key. All of it is independent of the key shares, which are
+//!    uniform in `F`. Claim: after any number of input checks, in any number of batches,
+//!    chosen adaptively, the event "all passed" is `key in S` for a set `S = S_0 x S_1`
+//!    (one factor per key, since no equation mixes the keys) that the adversary's view
+//!    determines; it has probability `|S_0| |S_1| / |F|^2`, and given it the keys are
+//!    uniform on `S`. That is the whole cross-batch argument: the batches intersect sets,
+//!    and the probability of an intersection is its size. "Guessing `c` key bits succeeds
+//!    with probability `2^-c`" is the special case of coordinate sets; an `S` need not be
+//!    one, but its cost is always its density. A later forgery against key `j` (a MAC
+//!    share for a value other than the committed one) amounts to naming the sum of the
+//!    honest parties' shares of key `j`, so `Pr[all checks pass and key j is forged]` is
+//!    at most the largest probability of one value of that sum, `1/|F|`, whatever was
+//!    guessed, and `|F|^-2`, about `2^-128`, for a forgery under both keys, which is
+//!    what the engine's MAC check and the batch MAC check here require (the check
+//!    shares of both keys must sum to zero). A key whose 64 bits were all guessed
+//!    (probability `2^-64`) leaves the other key untouched. MASCOT proves the
+//!    single-check version of this as Theorem 2 (Appendix B, with Lemma 2 for prime
+//!    fields, where bit vectors and field elements do not correspond one to one); the
+//!    extension to repeated checks on one key, which MASCOT also performs (every Input
+//!    call reuses the COPE instance), and to two keys is this module's claim.
+//!
+//!    Binding is a second matter. A check that passes without any guess still
+//!    commits the owner to one value per item only
+//!    if no two of the up to 64 per-bit encodings collide under the random combination.
+//!    Theorem (MASCOT Theorem 2): one check gives statistical security
+//!    `log|F| - 2 log log|F|`, which is 52 bits for Goldilocks, not 64, and "a repeated
+//!    check would suffice for security parameter `log |F|`" (Section 4.1). This module
+//!    runs two instances with independent coefficients and masks, each under both keys.
+//!    Claim: to keep two encodings of one key open the same pair must collide in both
+//!    instances, probability at most `C(64,2) |F|^-2 < 2^-116` per owner, key and
+//!    batch, below `2^-102` over the 2,178 batches of a HASH160 statement for three
+//!    members.
+//!
+//! 2. *Sacrifice: bits of an honest receiver's `a`.* A corrupted sender of
+//!    `Ceremony::multiply` learns a predicate of the `tau = 7` components of `a` of the
+//!    triples it attacked (MASCOT Section 5.1). Those components are fresh per triple,
+//!    so nothing accumulates across batches except the abort. Theorem (MASCOT Theorem
+//!    3, Appendix C): with one sacrificial pair, `tau = 4` gives statistical security
+//!    `k`. Claim (the parameter item above): with two pairs and `tau = 7` each output
+//!    triple is within `2^-129` of uniform to the adversary, `2^-107` summed over the
+//!    `2^21.1` triples of a statement; a wrong triple survives both sacrificial pairs
+//!    with probability `2^-128`, once for the whole ceremony since a failure aborts.
+//!
+//! 3. *The mesh's correlation check: bits of a sender's `Delta`.* See the previous
+//!    section; a failed check poisons the channel, so the guesses over all frames, all
+//!    batches and all ceremonies on one mesh are one attempt.
+//!
+//! The key-consistency check and the batch MAC checks fail on the adversary's own
+//! deviation only, independently of honest secrets.
+//!
+//! Against the targets: per MAC key the bound is `1/|F|`, `2^-64`, and for both keys
+//! together `2^-128` up to the `2^-102` binding term, per ceremony, for any number of
+//! batches. A ceremony that aborts teaches the adversary nothing it can use against a
+//! rerun (fresh keys), but each rerun is a new attempt, so these are per-attempt
+//! figures. All of it holds in the hybrid model with ideal OTs, coins, commitments and
+//! broadcast; the first of these is where the caveat of the previous section sits.
 
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
@@ -112,7 +260,9 @@ use alloc::{vec, vec::Vec};
 use dregg_sig_accel::keccak::{Shake256, cshake256_framed_32, finalize_cshake256, init_cshake256};
 use dregg_sig_core::{
     field::goldilocks::Goldilocks,
-    preprocessing::{OtMesh, PartyPrivateRng, run_commit_and_open_coin},
+    preprocessing::{
+        MAX_FRAME_BUDGET, OtBatchPads, OtMesh, PartyPrivateRng, run_commit_and_open_coin,
+    },
     wipe::{SecretBuffer as Secret, SecretScratch as SecretVec, wipe_bytes},
 };
 
@@ -494,6 +644,8 @@ struct Ceremony<'a> {
     /// `[o][h]`: the key `h` committed to in its base OTs with `o`.
     pair_keys: Vec<SecretVec<Mac>>,
     pairs: Vec<Vec<Option<Pair>>>,
+    /// Payload bytes each party has sent so far (see [`Ceremony::sends`]).
+    sent: Vec<u64>,
 }
 
 impl<'a> Ceremony<'a> {
@@ -519,7 +671,45 @@ impl<'a> Ceremony<'a> {
             keys: SecretVec::new(),
             pair_keys: Vec::new(),
             pairs: Vec::new(),
+            sent: vec![0; parties],
         })
+    }
+
+    /// Accounts `bytes` of payload that `party` sends to each of `peers` parties. The
+    /// ceremony runs in one process, so this is the size of what a wire run would carry
+    /// (field elements as 8 bytes, digests and nonces as 32, no framing), with a
+    /// broadcast counted once per other party.
+    fn sends(&mut self, party: usize, bytes: usize, peers: usize) {
+        self.sent[party] += (bytes * peers) as u64;
+    }
+
+    /// Accounts every party's broadcast of `bytes`.
+    fn all_send(&mut self, bytes: usize) {
+        for party in 0..self.parties {
+            self.sends(party, bytes, self.parties - 1);
+        }
+    }
+
+    /// One batch of `64 * choices.len()` random OTs from the mesh with `receiver`'s
+    /// choice bits, and its traffic: per frame of the mesh the receiver's 128 columns
+    /// over the frame's words and four sacrificial words and its 32-byte proof, and the
+    /// sender's 32-byte challenge.
+    fn random_ots(
+        &mut self,
+        sender: usize,
+        receiver: usize,
+        choices: &[u64],
+    ) -> Result<OtBatchPads, PrepError> {
+        const FRAME_WORDS: usize = MAX_FRAME_BUDGET / (128 * 8) - 4;
+        let pads = self
+            .mesh
+            .run_correlated_ot_words(sender, receiver, choices, self.rngs)
+            .map_err(|_| Check::Ot)?;
+        for frame in choices.chunks(FRAME_WORDS) {
+            self.sends(receiver, 128 * 8 * (frame.len() + 4) + 32, 1);
+            self.sends(sender, 32, 1);
+        }
+        Ok(pads)
     }
 
     /// Jointly random public coin over the transcript so far, as a challenge stream.
@@ -535,6 +725,8 @@ impl<'a> Ceremony<'a> {
         self.coins = self.coins.checked_add(1).ok_or(Check::Coin)?;
         let coin = run_commit_and_open_coin(&self.session, &phase, &digest, self.rngs)
             .map_err(|_| Check::Coin)?;
+        // Every party broadcasts a commitment and then its 32-byte share.
+        self.all_send(64);
         self.transcript.label(b"coin");
         self.transcript.bytes(&coin);
         Ok(Challenges(xof(
@@ -598,6 +790,8 @@ impl<'a> Ceremony<'a> {
             for word in payload.iter() {
                 self.transcript.bytes(&word.to_le_bytes());
             }
+            // Commitment, then payload and nonce.
+            self.sends(party, 64 + 8 * payload.len(), payloads.len() - 1);
         }
         Ok(())
     }
@@ -654,10 +848,7 @@ impl<'a> Ceremony<'a> {
                 let mut choices: SecretVec<u64> = SecretVec::with_capacity(BASE_WORDS);
                 choices.extend_from_slice(&mac_words(*key));
                 choices.push(0);
-                let (send, receive) = self
-                    .mesh
-                    .run_correlated_ot_words(owner, holder, &choices, self.rngs)
-                    .map_err(|_| Check::Ot)?;
+                let (send, receive) = self.random_ots(owner, holder, &choices)?;
                 let session = &self.session;
                 row.push(Some(Pair {
                     send: send
@@ -705,6 +896,7 @@ impl<'a> Ceremony<'a> {
             fault,
             transcript,
             pair_keys,
+            sent,
             ..
         } = self;
         let key_share = Secret(pair_keys[owner][holder][key].to_canonical_u64());
@@ -713,6 +905,7 @@ impl<'a> Ceremony<'a> {
         let (mut t, mut q) = (zeros(), zeros());
         let (mut zero, mut one, mut chosen, mut encoded) = (zeros(), zeros(), zeros(), zeros());
         transcript.label(b"cope");
+        sent[owner] += (8 * 64 * count) as u64;
         for bit in (0..64).rev() {
             pair.send[base + bit][0].elements(&mut zero);
             pair.send[base + bit][1].elements(&mut one);
@@ -754,18 +947,21 @@ impl<'a> Ceremony<'a> {
     /// If the owner encoded different values under different key bits of an honest
     /// holder, the holder's share is off by `sum_l 2^l bit_l e_l` with `e_l` fixed by the
     /// corrections; the sum of the `sigma` is that error (combined by `r`) plus what the
-    /// owner adds without knowing the key bits. Either the combined `e_l` vanish for the
-    /// bits where they could matter (probability at most `1/|F|` per instance over `r`),
-    /// or the check passes exactly when the holder's key lies in a set `S` that the
-    /// adversary fixed in advance, which happens with probability `|S|/|F|`. So a failed
-    /// check tells the adversary that the key is outside `S` (and the ceremony's keys
-    /// are then discarded), and a passed check that it is inside: guessing `c` key bits
-    /// succeeds with probability `2^-c` and leaves a later forgery probability of
-    /// `2^c/|F|`, the product staying at `1/|F|` per key. Nothing about any shared value
-    /// is revealed either way: `y` is masked, and whether the check passes depends on
-    /// key bits only. A holder cannot choose its key per value (its pads are fixed), and
-    /// a wrong MAC share of the holder changes the sum of the `sigma` by a nonzero
-    /// amount it cannot cancel without the owner's pads.
+    /// owner adds without knowing the key bits. The check then passes exactly when the
+    /// holder's key lies in a set `S` that the owner's messages and the coin determine,
+    /// which happens with probability `|S|/|F|` because the key is independent of both.
+    /// So a failed check tells the adversary that the key is outside `S` (and the
+    /// ceremony's keys are then discarded), and a passed check that it is inside:
+    /// guessing `c` key bits succeeds with probability `2^-c` and leaves a later forgery
+    /// probability of `2^c/|F|`, the product staying at `1/|F|` per key. The check
+    /// passes for every key although two encodings differ only if they collide under
+    /// `r`: at most `C(64,2)/|F|`, `2^-53`, in one instance (MASCOT Theorem 2), and the
+    /// same pair must collide in both. The module documentation carries this over all
+    /// batches.
+    /// Nothing about any shared value is revealed either way: `y` is masked, and whether
+    /// the check passes depends on key bits only. A holder cannot choose its key per
+    /// value (its pads are fixed), and a wrong MAC share of the holder changes the sum
+    /// of the `sigma` by a nonzero amount it cannot cancel without the owner's pads.
     fn authenticate(&mut self, inputs: &[SecretVec<F>]) -> Result<OwnerShares, PrepError> {
         let parties = self.parties;
         let count = inputs[0].len();
@@ -822,6 +1018,7 @@ impl<'a> Ceremony<'a> {
                 }
                 // The owner broadcasts the combination.
                 self.transcript.element(opened);
+                self.sends(owner, 8, parties - 1);
                 for p in 0..parties {
                     let keyed = Secret(mac_scale(*self.key_for(Some(owner), p), opened));
                     let share = Secret(mac_words(mac_sub(sigma[p], *keyed)));
@@ -883,6 +1080,7 @@ impl<'a> Ceremony<'a> {
                 share: &mut share[0],
             });
             self.transcript.element(share[0]);
+            self.sends(party, 8, self.parties - 1);
             value += share[0];
             queue.macs[party].push(mac_of(share));
         }
@@ -969,10 +1167,8 @@ impl<'a> Ceremony<'a> {
                 .map(|value| value.to_canonical_u64())
                 .collect();
             for sender in (0..parties).filter(|&s| s != receiver) {
-                let (send, receive) = self
-                    .mesh
-                    .run_correlated_ot_words(sender, receiver, &choices, self.rngs)
-                    .map_err(|_| Check::Ot)?;
+                let (send, receive) = self.random_ots(sender, receiver, &choices)?;
+                self.sends(sender, 8 * 64 * count * TAU, 1);
                 self.transcript.label(b"multiply");
                 for e in 0..count * TAU {
                     let (mut sender_sum, mut receiver_sum) = (F::ZERO, F::ZERO);
@@ -1182,6 +1378,7 @@ impl<'a> Ceremony<'a> {
                 self.transcript.element(*share);
                 opened += *share;
             }
+            self.all_send(8);
             for p in 0..parties {
                 let keyed = Secret(mac_scale(self.keys[p], opened));
                 let mut sigma = Secret(mac_sub(mac_of(joint[p][k]), *keyed));
@@ -1223,7 +1420,12 @@ impl<'a> Ceremony<'a> {
     }
 
     /// The whole demand, in batches of at most `batch` triples (or `7 batch` values).
-    fn run(mut self, demand: &PrepDemand, batch: usize) -> Result<Vec<Preprocessing>, PrepError> {
+    /// Returns the stores and the payload bytes each party sent.
+    fn run(
+        mut self,
+        demand: &PrepDemand,
+        batch: usize,
+    ) -> Result<(Vec<Preprocessing>, Vec<u64>), PrepError> {
         let parties = self.parties;
         self.sample_keys();
         self.establish_pairs()?;
@@ -1251,7 +1453,7 @@ impl<'a> Ceremony<'a> {
             triples -= t;
             randoms -= r;
         }
-        Ok(stores)
+        Ok((stores, core::mem::take(&mut self.sent)))
     }
 }
 
@@ -1263,7 +1465,7 @@ fn ceremony(
     rngs: &mut [PartyPrivateRng],
     fault: &mut dyn FnMut(Fault<'_>),
     batch: usize,
-) -> Result<Vec<Preprocessing>, PrepError> {
+) -> Result<(Vec<Preprocessing>, Vec<u64>), PrepError> {
     if rngs.len() != parties || batch == 0 {
         return Err(PrepError::InvalidConfiguration);
     }
@@ -1306,7 +1508,7 @@ pub fn run_preprocessing_with_fault(
     rngs: &mut [PartyPrivateRng],
     fault: &mut dyn FnMut(Fault<'_>),
 ) -> Result<Vec<Preprocessing>, PrepError> {
-    ceremony(session, parties, demand, mesh, rngs, fault, BATCH_TRIPLES)
+    ceremony(session, parties, demand, mesh, rngs, fault, BATCH_TRIPLES).map(|(stores, _)| stores)
 }
 
 #[cfg(test)]
@@ -1378,7 +1580,7 @@ mod tests {
         rngs: &mut [PartyPrivateRng],
         mut fault: impl FnMut(Fault<'_>) -> bool,
     ) -> Result<(), PrepError> {
-        let out = ceremony(
+        let (out, _) = ceremony(
             [seed; 32],
             3,
             demand,
@@ -1400,7 +1602,7 @@ mod tests {
             BATCH_TRIPLES,
         );
         assert!(fired, "the deviation was never injected");
-        outcome.map(|out| {
+        outcome.map(|(out, _)| {
             verify_material(demand, &out);
         })
     }
@@ -1447,7 +1649,7 @@ mod tests {
             randoms: 40,
         };
         let mut stages = 0;
-        let out = ceremony(
+        let (out, sent) = ceremony(
             [3; 32],
             3,
             &demand,
@@ -1465,6 +1667,9 @@ mod tests {
         // Batches: (2, 0), (2, 0), (1, 7), (0, 14), (0, 14), (0, 5); two items each.
         assert_eq!(stages, 6 * KEYS);
         verify_material(&demand, &out);
+        // Every member plays every role towards every other member equally often.
+        assert_ne!(sent[0], 0);
+        assert_eq!(sent, [sent[0]; 3]);
     }
 
     #[test]
@@ -1615,6 +1820,71 @@ mod tests {
                 "{bump:?}"
             );
         }
+    }
+
+    /// The selective failure of the input check, in a later batch than the first: an
+    /// owner that encodes another value under one bit of one key share of an honest
+    /// holder, and does nothing else, passes exactly when that bit is zero, and then the
+    /// material is intact. So a pass tells the owner one predicate of the key and a
+    /// failure discards the key (module documentation, selective failure, item 1).
+    #[test]
+    fn a_wrong_encoding_under_one_key_bit_passes_exactly_when_the_bit_is_zero() {
+        let (mut mesh, mut rngs) = setup(16, 3);
+        // Batches of two triples' worth of values: (0, 14), (0, 14), (0, 2).
+        let demand = PrepDemand {
+            triples: 0,
+            randoms: 30,
+        };
+        let (mut passed, mut failed) = (0, 0);
+        for target in 0..KEYS {
+            for bit_at in [0usize, 1, 2, 3, 31, 32, 62, 63] {
+                let (mut share, mut calls) = (0u64, 0);
+                let outcome = ceremony(
+                    [(8 * target + bit_at) as u8; 32],
+                    3,
+                    &demand,
+                    &mut mesh,
+                    &mut rngs,
+                    &mut |point| match point {
+                        Fault::FieldKey {
+                            owner: 1,
+                            holder: 2,
+                            key,
+                        } => share = key[target].to_canonical_u64(),
+                        Fault::CopeInput {
+                            owner: 1,
+                            holder: 2,
+                            key,
+                            bit,
+                            values,
+                        } if key == target && bit == bit_at => {
+                            calls += 1;
+                            // The second batch only.
+                            if calls == 2 {
+                                values[3] += F::ONE;
+                            }
+                        }
+                        _ => {}
+                    },
+                    2,
+                );
+                if (share >> bit_at) & 1 == 0 {
+                    assert_eq!(calls, 3, "one authentication per batch");
+                    verify_material(&demand, &outcome.unwrap().0);
+                    passed += 1;
+                } else {
+                    assert_eq!(calls, 2, "the second batch aborts");
+                    assert_eq!(
+                        outcome.err(),
+                        Some(PrepError::Check(Check::InputConsistency)),
+                        "key {target} bit {bit_at}"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        println!("wrong encodings under one key bit: {passed} passed, {failed} caught");
+        assert!(passed != 0 && failed != 0);
     }
 
     /// A holder that used another key towards one owner knows the difference `eps`, and
@@ -2014,77 +2284,197 @@ mod tests {
         }
     }
 
-    /// Triples one custodian's proof of the Bitcoin HASH160 ownership statement consumes
-    /// (`prover_demand` of that shape; the shape is not built here).
-    const HASH160_TRIPLES: usize = 2_228_208;
+    /// Reconstructs every triple and uniform value of `stores` and checks its MACs under
+    /// the reconstructed keys and, for triples, the product. Linear in the demand.
+    fn check_all_material(demand: &PrepDemand, stores: &[Preprocessing]) {
+        let key = stores.iter().fold([F::ZERO; 2], |k, s| mac_add(k, s.key));
+        assert_ne!(key[0], F::ZERO);
+        assert_ne!(key[1], F::ZERO);
+        let element = |part: &dyn Fn(&Preprocessing) -> Sb| {
+            let total = stores.iter().fold(Sb::ZERO, |sum, s| sum + part(s));
+            assert_eq!(total.m, mac_scale(key, total.v), "MAC");
+            total.v
+        };
+        let mut zeros = 0;
+        for store in stores {
+            assert_eq!(store.triples.len(), demand.triples);
+            assert_eq!(store.randoms.len(), demand.randoms);
+        }
+        for item in 0..demand.triples {
+            let [a, b, c] = [0, 1, 2].map(|part| element(&|s| s.triples[item][part]));
+            assert_eq!(c, a * b, "triple {item}");
+            zeros += usize::from(a == F::ZERO) + usize::from(b == F::ZERO);
+        }
+        for item in 0..demand.randoms {
+            zeros += usize::from(element(&|s| s.randoms[item]) == F::ZERO);
+        }
+        assert_eq!(zeros, 0, "uniform 64-bit values are not zero");
+    }
 
-    /// Ceremony rates for three members on the real mesh:
+    /// A field of `/proc/self/status` in kB (Linux; `None` elsewhere).
+    fn status_kb(field: &str) -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with(field))?;
+        line.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    /// User plus system CPU seconds of this process, all threads (Linux, 100 ticks per
+    /// second; `None` elsewhere).
+    fn cpu_seconds() -> Option<f64> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+        let user: u64 = fields.nth(11)?.parse().ok()?;
+        let system: u64 = fields.next()?.parse().ok()?;
+        Some((user + system) as f64 / 100.0)
+    }
+
+    /// The real ceremony for one demand on the real mesh, with the cost figures:
     /// `cargo test --release -p dregg-sig-migrate --features std --lib --
-    /// hem::collab::prep::tests::measure_ceremony_rates --ignored --nocapture`.
-    /// `PREP_MEASURE_TRIPLES` and `PREP_MEASURE_RANDOMS` override the batch sizes.
+    /// hem::collab::prep::tests::measure_ceremony --ignored --nocapture`.
+    ///
+    /// `COLLAB_PREP_TRIPLES`, `COLLAB_PREP_RANDOMS` and `COLLAB_PREP_PARTIES` set the
+    /// demand per member and the quorum size (default 4096, 16384, 3); one custodian's
+    /// proof of the Bitcoin HASH160 ownership statement consumes 2228208 triples and
+    /// 9156 uniform values. A progress line is printed every `COLLAB_PREP_PROGRESS`
+    /// batches (default 64). All of the output is reconstructed and checked.
+    ///
+    /// The ceremony's own steps run on one thread; with `--features std` the mesh
+    /// expands each OT batch on up to 16 worker threads.
     #[test]
     #[ignore = "measurement"]
-    fn measure_ceremony_rates() {
+    fn measure_ceremony() {
         let count = |name: &str, default: usize| {
             std::env::var(name)
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(default)
         };
-        let triples = count("PREP_MEASURE_TRIPLES", 4096);
-        let randoms = count("PREP_MEASURE_RANDOMS", 16384);
-        let started = Instant::now();
-        let (mut mesh, mut rngs) = setup(9, 3);
+        let demand = PrepDemand {
+            triples: count("COLLAB_PREP_TRIPLES", 4096),
+            randoms: count("COLLAB_PREP_RANDOMS", 16384),
+        };
+        let parties = count("COLLAB_PREP_PARTIES", 3);
+        let every = count("COLLAB_PREP_PROGRESS", 64).max(1);
+        // The batches `Ceremony::run` forms, as (triples, randoms).
+        let mut batches = Vec::new();
+        let (mut triples, mut randoms) = (demand.triples, demand.randoms);
+        while triples != 0 || randoms != 0 {
+            let t = triples.min(BATCH_TRIPLES);
+            let r = randoms.min((BATCH_TRIPLES - t) * TRIPLE_INPUTS);
+            batches.push((t, r));
+            triples -= t;
+            randoms -= r;
+        }
         println!(
-            "OT mesh, 3 members: {:.2} s",
+            "demand per member: {} triples, {} randoms; {parties} members; {} batches of at \
+             most {BATCH_TRIPLES} triples; available parallelism {}",
+            demand.triples,
+            demand.randoms,
+            batches.len(),
+            std::thread::available_parallelism().map_or(1, usize::from)
+        );
+
+        let started = Instant::now();
+        let (mut mesh, mut rngs) = setup(9, parties);
+        let mesh_s = started.elapsed().as_secs_f64();
+        println!("OT mesh: {mesh_s:.2} s");
+
+        // The key-consistency check runs once per batch, after the batch's
+        // multiplication and authentication and before its sacrifice.
+        let started = Instant::now();
+        let cpu_before = cpu_seconds();
+        let (mut calls, mut marks) = (0, Vec::with_capacity(batches.len()));
+        let (stores, sent) = ceremony(
+            [1; 32],
+            parties,
+            &demand,
+            &mut mesh,
+            &mut rngs,
+            &mut |point| {
+                if let Fault::KeyConsistencySigma { party: 0, .. } = point {
+                    calls += 1;
+                    if calls % KEYS != 0 {
+                        return;
+                    }
+                    let elapsed = started.elapsed().as_secs_f64();
+                    marks.push(elapsed);
+                    let done = marks.len();
+                    if done % every == 0 || done == batches.len() {
+                        let triples: usize = batches[..done].iter().map(|b| b.0).sum();
+                        println!(
+                            "batch {done}/{}: {elapsed:.1} s, {triples} triples, RSS {} MB",
+                            batches.len(),
+                            status_kb("VmRSS:").map_or(0, |kb| kb / 1024)
+                        );
+                    }
+                }
+            },
+            BATCH_TRIPLES,
+        )
+        .unwrap();
+        let wall = started.elapsed().as_secs_f64();
+        let cpu = cpu_seconds()
+            .zip(cpu_before)
+            .map(|(after, before)| after - before);
+        assert_eq!(marks.len(), batches.len());
+
+        let started = Instant::now();
+        check_all_material(&demand, &stores);
+        println!(
+            "checked: all {} triples (product and both MACs) and {} randoms (both MACs), \
+             reconstructed over {parties} members, {:.2} s",
+            demand.triples,
+            demand.randoms,
             started.elapsed().as_secs_f64()
         );
-        let mut run = |session: u8, demand: PrepDemand| {
-            let started = Instant::now();
-            let out = run_preprocessing([session; 32], 3, &demand, &mut mesh, &mut rngs).unwrap();
-            let elapsed = started.elapsed().as_secs_f64();
-            assert_eq!(out[0].triples.len(), demand.triples);
-            assert_eq!(out[0].randoms.len(), demand.randoms);
-            elapsed
-        };
-        let fixed = run(
-            1,
-            PrepDemand {
-                triples: 0,
-                randoms: 1,
-            },
-        );
-        println!("fixed cost (keys, base OTs, one random): {fixed:.3} s");
-        let t = run(
-            2,
-            PrepDemand {
-                triples,
-                randoms: 0,
-            },
-        );
-        let per_triple = t / triples as f64;
-        println!(
-            "{triples} triples: {t:.2} s, {:.3} ms per triple",
-            1e3 * per_triple
-        );
-        let r = run(
-            3,
-            PrepDemand {
-                triples: 0,
-                randoms,
-            },
-        );
-        let per_random = r / randoms as f64;
-        println!(
-            "{randoms} randoms: {r:.2} s, {:.1} us per random",
-            1e6 * per_random
-        );
-        let full = per_triple * HASH160_TRIPLES as f64;
-        println!(
-            "extrapolation, {HASH160_TRIPLES} triples per custodian (Bitcoin HASH160 statement), \
-             3 members, one thread: {full:.0} s = {:.2} h; each further million randoms {:.0} s",
-            full / 3600.0,
-            1e6 * per_random
-        );
+
+        println!("ceremony wall-clock: {wall:.1} s = {:.3} h", wall / 3600.0);
+        match cpu {
+            Some(cpu) => println!("ceremony CPU time (user + system, all threads): {cpu:.1} s"),
+            None => println!("ceremony CPU time: not available on this system"),
+        }
+        match status_kb("VmHWM:") {
+            Some(kb) => println!("peak RSS (VmHWM): {} MB", kb / 1024),
+            None => println!("peak RSS: not available on this system"),
+        }
+        for (party, bytes) in sent.iter().enumerate() {
+            println!(
+                "member {party} sent {bytes} bytes = {:.3} GiB",
+                *bytes as f64 / (1u64 << 30) as f64
+            );
+        }
+        // Rates from the batches of one kind: a batch's span is from the previous
+        // batch's key-consistency check to its own, so the span of the batch after a
+        // triple batch holds that batch's sacrifice and is left out of the random rate.
+        let span = |i: usize| marks[i] - if i == 0 { 0.0 } else { marks[i - 1] };
+        let full: Vec<usize> = (1..batches.len())
+            .filter(|&i| batches[i] == (BATCH_TRIPLES, 0) && batches[i - 1].1 == 0)
+            .collect();
+        if !full.is_empty() {
+            let seconds: f64 = full.iter().map(|&i| span(i)).sum();
+            println!(
+                "per triple, over {} whole triple batches: {:.4} ms",
+                full.len(),
+                1e3 * seconds / (full.len() * BATCH_TRIPLES) as f64
+            );
+        }
+        let plain: Vec<usize> = (1..batches.len())
+            .filter(|&i| batches[i].0 == 0 && batches[i - 1].0 == 0)
+            .collect();
+        if !plain.is_empty() {
+            let seconds: f64 = plain.iter().map(|&i| span(i)).sum();
+            let randoms: usize = plain.iter().map(|&i| batches[i].1).sum();
+            println!(
+                "per random, over {} random-only batches ({randoms} randoms): {:.2} us",
+                plain.len(),
+                1e6 * seconds / randoms as f64
+            );
+        }
+        if demand.triples != 0 {
+            println!(
+                "whole ceremony per triple demanded: {:.4} ms",
+                1e3 * wall / demand.triples as f64
+            );
+        }
     }
 }
