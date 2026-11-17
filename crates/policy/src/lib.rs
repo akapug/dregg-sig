@@ -26,7 +26,7 @@ pub use macaroon::{
     CapabilityError, CapabilityRequest, Caveat, Discharge, MacaroonVerifier, SpongeMacaroon,
 };
 #[cfg(feature = "std")]
-pub use seal_store::FsSealConsumptionStore;
+pub use seal_store::{AnchoredSnapshot, FsSealConsumptionStore};
 pub use seal_store::{MemorySealConsumptionStore, SealConsumptionStore};
 
 use alloc::vec::Vec;
