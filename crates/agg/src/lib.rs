@@ -46,13 +46,15 @@
 //! for cross-batch concurrency. This bounds active witnesses, not each witness's byte size;
 //! `HemAggConfig::max_shards_per_batch` separately controls joint-batch width.
 //!
-//! # Zero-knowledge relations
+//! # Committed-mask relations
 //!
-//! [`zk_hem::protocol`] is a separate zero-knowledge argument over the same commitment scheme
-//! for relations built from S-box and multiplication rows ([`zk_hem::relation`]). Sumcheck
-//! masks and companion words are committed with the witness, and WHIR opens only their blend.
-//! [`zk_hem::blind_vc`] and [`zk_hem::multisig`] are the two relations defined on it. Aggregate
-//! proofs above are not zero-knowledge and do not use it.
+//! [`zk_hem::protocol`] implements committed masking for S-box and multiplication-row
+//! relations ([`zk_hem::relation`]). It is intended for witness privacy, but its composed
+//! simulator, unopened-leaf hiding bound, batching proximity loss and concrete knowledge-
+//! soundness bound remain unestablished; see [`zk_hem::protocol::prove`]. Sumcheck masks
+//! and companion words are committed with the witness, and WHIR opens their blend.
+//! Full-shard merges and the blind-credential, multisig and capability relations use this
+//! path. The ordinary shard batches and the public hologram recursion paths are non-hiding.
 
 #![no_std]
 #![forbid(unsafe_code)]

@@ -2634,7 +2634,7 @@ pub use crate::zk_hem::full_shard::{
 };
 
 /// Canonical 8-byte wire header for [`SuccinctFullShardAggregate`].
-pub const SUCCINCT_FULL_SHARD_WIRE_MAGIC: &[u8; 8] = b"QSAGFSA1";
+pub const SUCCINCT_FULL_SHARD_WIRE_MAGIC: &[u8; 8] = b"QSAGFSA2";
 
 /// The 32-byte statement a quorum key of `policy` signs in full-shard mode: a digest of
 /// [`hierarchical_hem_message`], so it binds the registry root, the shard's identity,
@@ -2663,7 +2663,9 @@ pub struct FullShardAggregateStatement<'a> {
 
 /// One parent proof that, in every shard of a registry, `signer_counts[i]` distinct quorum
 /// keys signed the shard's [`full_shard_signing_message`]. It carries no child proof, no
-/// signer bitmap and no summary; which keys signed stays hidden.
+/// signer bitmap and no summary. The parent uses committed masking; signer privacy of
+/// the full composition is not proved. See [`crate::zk_hem::protocol::prove`] for the
+/// simulator and concrete security bounds still missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuccinctFullShardAggregate {
     pub signer_counts: Vec<u32>,
@@ -2671,7 +2673,7 @@ pub struct SuccinctFullShardAggregate {
 }
 
 impl SuccinctFullShardAggregate {
-    /// Serialize to canonical self-delimiting wire bytes (`QSAGFSA1` header).
+    /// Serialize to canonical self-delimiting wire bytes (`QSAGFSA2` header).
     pub fn to_bytes(&self) -> Vec<u8> {
         let proof_bytes = self.proof.to_bytes();
         let mut out = Vec::with_capacity(12 + 4 * self.signer_counts.len() + proof_bytes.len());
@@ -2756,7 +2758,8 @@ type Digest4Limbs = [Goldilocks; 4];
 /// Prove a full-shard aggregate. `witnesses[i]` holds shard `i`'s signer bitmap over its
 /// policy's quorum keys and the signatures of those signers, in ascending index order, over
 /// [`full_shard_signing_message`]. Both the children and the parent use the relation's
-/// regime.
+/// regime. `seed` must be uniform and secret, as required by
+/// [`crate::zk_hem::protocol::prove`].
 pub fn prove_succinct_full_shard_aggregate(
     relation: &FullShardMergeRelation,
     statement: &FullShardAggregateStatement<'_>,
