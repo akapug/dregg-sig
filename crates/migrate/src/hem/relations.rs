@@ -6,9 +6,9 @@
 //!
 //! * a [`Lock`]: how the chain derives the credential from a public key (P2PKH/P2WPKH,
 //!   uncompressed P2PKH, P2SH-wrapped P2WPKH, Ethereum address, Taproot output key with or
-//!   without a script tree, Ed25519 key);
+//!   without a script tree, Ed25519 key, BLS12-381 `0x00` withdrawal credential);
 //! * a [`KeySource`]: what the prover knows about that key. Either the signing key itself
-//!   (`Secp256k1Key`), or a hash preimage the key is derived from: an RFC 8032 seed, a
+//!   (`Secp256k1Key`, `Bls12381Key`), or a hash preimage the key is derived from: an RFC 8032 seed, a
 //!   BIP-32 master seed or extended key with a path, a SLIP-0010 seed with a path, a
 //!   BIP32-Ed25519 extended key with a path.
 //!
@@ -72,6 +72,7 @@
 //! | `Bip32`, seed root | 2 | first 32 bytes of `SHA512((key ^ ipad) || seed)`, the inner digest of the master HMAC |
 //! | `Ed25519Seed`, `Slip10` | 3 | the RFC 8032 seed of the leaf |
 //! | `Bip32Ed25519` | 5 | the leaf's `k_R` |
+//! | `Bls12381Key` | 6 | the key, big-endian |
 //! | `Bip32`, extended-key root | 7 | the root chain code |
 //!
 //! For every revealed-key source the secret is not a function of public keys, chain codes
@@ -91,6 +92,26 @@
 //! ([`PathSpec::Hidden`]: indices, hardened flags and the actual depth are witness; every
 //! step then costs a hardened step plus a public-key multiplication). BIP32-Ed25519 paths
 //! are public only. Public keys, chain codes and all intermediate keys are never public.
+//!
+//! # Sizes, and what does not fit
+//!
+//! A statement costs about 44,000 rows per SHA-512 compression (one row per bit of every
+//! three-input Boolean function and of every sum; the constraint system has no lookup
+//! argument), four compressions per derivation step, about 32,500 rows per secp256k1
+//! multiplication, and 17,200 for the nullifier. `m/44'/0'/0'/0/0` from the seed is 22
+//! compressions and three multiplications, 1.106 million rows, 5 % over `2^20`. The
+//! compressions are within 3 % of the one-row-per-bit floor, so the seed-rooted statement
+//! cannot get under `2^20` on the hash side; it would take a multiplication of about
+//! 14,000 rows. The same path from the master extended key is 1.019 million rows and fits.
+//! When the first step is hardened, that statement differs from the seed-rooted one only
+//! if the master extended public key has been exported, which wallets do not do.
+//!
+//! EIP-2333 seed provenance for BLS keys is not offered: one `derive_child_SK` is two
+//! 255-block HKDF-SHA256 expansions, 510 chunk hashes and a 16,320-byte hash, measured
+//! at 30.8 million rows, and the EIP-2334 withdrawal path has four of them (123 million
+//! rows, `2^27`), which exceeds the largest table the commitment scheme supports once the
+//! masks are added. A BLS withdrawal key is migrated in hidden-key mode, which is sound
+//! while its public key is behind the `0x00` credential's hash.
 //!
 //! # BIP-39 is outside the relation
 //!
@@ -117,12 +138,13 @@ use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
 
 use super::curve::{
-    AffinePoint, Element, Lazy, Modulus, ed25519_clamp, ed25519_fixed_base_mul,
-    secp256k1_enforce_scalar_range, secp256k1_fixed_base_mul, secp256k1_point_add,
+    Element, Lazy, Modulus, bls12_381_enforce_scalar_range, bls12_381_g1_fixed_base_mul,
+    ed25519_clamp, ed25519_fixed_base_mul, secp256k1_enforce_scalar_range,
+    secp256k1_fixed_base_mul, secp256k1_taproot_tweak_x_only,
 };
 use super::hash::{
     HmacKey, Word, add_wide, alloc_bits, be_bits, be_words, const_bits, hash160, keccak256,
-    pack_bits, select, sha256_from_midstate, sha256_midstate, sha512, sha512_compress,
+    pack_bits, select, sha256, sha256_from_midstate, sha256_midstate, sha512, sha512_compress,
 };
 use crate::ed25519_ct::public_key_from_clamped_scalar;
 use crate::secp256k1_ct::{
@@ -173,6 +195,8 @@ pub enum Credential {
     Ed25519Key([u8; 32]),
     /// The 20-byte script hash of a P2SH output.
     BitcoinScriptHash([u8; 20]),
+    /// A 32-byte Ethereum consensus-layer `0x00` (BLS) withdrawal credential.
+    BlsWithdrawal([u8; 32]),
 }
 
 /// Registry-wide identifier of a credential of type `tag` with on-chain bytes `value`.
@@ -189,6 +213,7 @@ impl Credential {
             Self::EthereumAddress(_) => 3,
             Self::Ed25519Key(_) => 4,
             Self::BitcoinScriptHash(_) => 5,
+            Self::BlsWithdrawal(_) => 6,
         }
     }
 
@@ -196,7 +221,7 @@ impl Credential {
     pub fn value(&self) -> &[u8] {
         match self {
             Self::BitcoinKeyHash(v) | Self::EthereumAddress(v) | Self::BitcoinScriptHash(v) => v,
-            Self::BitcoinTaproot(v) | Self::Ed25519Key(v) => v,
+            Self::BitcoinTaproot(v) | Self::Ed25519Key(v) | Self::BlsWithdrawal(v) => v,
         }
     }
 
@@ -226,12 +251,16 @@ pub enum Lock {
     TaprootScriptTree = 6,
     /// The Ed25519 public key itself.
     Ed25519 = 7,
+    /// `00 || SHA256(compressed G1 key)[1..]`: the `0x00` withdrawal credential of a
+    /// BLS12-381 key.
+    BlsWithdrawal = 8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Curve {
     Secp256k1,
     Ed25519,
+    Bls12381,
 }
 
 impl Lock {
@@ -244,6 +273,7 @@ impl Lock {
             Self::TaprootKeyPath,
             Self::TaprootScriptTree,
             Self::Ed25519,
+            Self::BlsWithdrawal,
         ]
         .into_iter()
         .find(|l| *l as u8 == tag)
@@ -252,13 +282,17 @@ impl Lock {
     fn curve(self) -> Curve {
         match self {
             Self::Ed25519 => Curve::Ed25519,
+            Self::BlsWithdrawal => Curve::Bls12381,
             _ => Curve::Secp256k1,
         }
     }
 
     fn credential_bytes(self) -> usize {
         match self {
-            Self::TaprootKeyPath | Self::TaprootScriptTree | Self::Ed25519 => 32,
+            Self::TaprootKeyPath
+            | Self::TaprootScriptTree
+            | Self::Ed25519
+            | Self::BlsWithdrawal => 32,
             _ => 20,
         }
     }
@@ -275,6 +309,7 @@ impl Lock {
                 Credential::BitcoinTaproot(value.try_into().ok()?)
             }
             Self::Ed25519 => Credential::Ed25519Key(value.try_into().ok()?),
+            Self::BlsWithdrawal => Credential::BlsWithdrawal(value.try_into().ok()?),
         })
     }
 }
@@ -356,8 +391,22 @@ pub fn secp256k1_credential(
         Lock::TaprootScriptTree => {
             Credential::BitcoinTaproot(taproot_output_key(key_be, Some(merkle_root?))?)
         }
-        Lock::Ed25519 => return None,
+        Lock::Ed25519 | Lock::BlsWithdrawal => return None,
     })
+}
+
+/// Compressed G1 public key of a big-endian BLS12-381 secret key; `None` unless
+/// `1 <= k < r`.
+pub fn bls12_381_public_key(key_be: &[u8; 32]) -> Option<[u8; 48]> {
+    let scalar = crate::bls12_381::FrBls381::from_nonzero_be_bytes(key_be)?;
+    Some(crate::bls12_381::BlsG1Point::generator_mul_ct(&scalar).to_compressed_48())
+}
+
+/// The `0x00` withdrawal credential of a BLS12-381 secret key.
+pub fn bls_withdrawal_credential(key_be: &[u8; 32]) -> Option<Credential> {
+    let mut digest = sha2_native::sha256(&bls12_381_public_key(key_be)?);
+    digest[0] = 0;
+    Some(Credential::BlsWithdrawal(digest))
 }
 
 /// RFC 8032 secret scalar of a seed: the clamped first half of `SHA512(seed)`,
@@ -628,6 +677,8 @@ pub enum KeySource {
     Slip10 { path: PathSpec },
     /// A BIP32-Ed25519 extended private key and a public path to the Ed25519 key.
     Bip32Ed25519 { path: Vec<u32> },
+    /// The BLS12-381 secret key (hidden-key mode).
+    Bls12381Key,
 }
 
 impl KeySource {
@@ -638,12 +689,14 @@ impl KeySource {
             Self::Ed25519Seed => 3,
             Self::Slip10 { .. } => 4,
             Self::Bip32Ed25519 { .. } => 5,
+            Self::Bls12381Key => 6,
         }
     }
 
     fn curve(&self) -> Curve {
         match self {
             Self::Secp256k1Key | Self::Bip32 { .. } => Curve::Secp256k1,
+            Self::Bls12381Key => Curve::Bls12381,
             _ => Curve::Ed25519,
         }
     }
@@ -658,6 +711,7 @@ impl KeySource {
             } => 2,
             Self::Ed25519Seed | Self::Slip10 { .. } => 3,
             Self::Bip32Ed25519 { .. } => 5,
+            Self::Bls12381Key => 6,
             Self::Bip32 {
                 root: Bip32Root::ExtendedKey,
                 ..
@@ -667,7 +721,7 @@ impl KeySource {
 
     /// Whether the statement stays sound once the public key is public.
     pub fn proves_seed_provenance(&self) -> bool {
-        !matches!(self, Self::Secp256k1Key)
+        !matches!(self, Self::Secp256k1Key | Self::Bls12381Key)
     }
 
     fn is_well_formed(&self) -> bool {
@@ -678,7 +732,7 @@ impl KeySource {
             PathSpec::Hidden { max_depth } => (1..=MAX_PATH_DEPTH).contains(&usize::from(*max_depth)),
         };
         match self {
-            Self::Secp256k1Key | Self::Ed25519Seed => true,
+            Self::Secp256k1Key | Self::Ed25519Seed | Self::Bls12381Key => true,
             Self::Bip32 { path, .. } => spec_ok(path, false),
             Self::Slip10 { path } => spec_ok(path, true),
             Self::Bip32Ed25519 { path } => path.len() <= MAX_PATH_DEPTH,
@@ -698,7 +752,7 @@ impl KeySource {
         };
         out.push(self.tag());
         match self {
-            Self::Secp256k1Key | Self::Ed25519Seed => {}
+            Self::Secp256k1Key | Self::Ed25519Seed | Self::Bls12381Key => {}
             Self::Bip32 { root, path } => {
                 out.push(*root as u8);
                 spec(out, path);
@@ -741,6 +795,7 @@ impl KeySource {
                 PathSpec::Public(path) => Self::Bip32Ed25519 { path },
                 PathSpec::Hidden { .. } => return None,
             },
+            6 => Self::Bls12381Key,
             _ => return None,
         })
     }
@@ -775,6 +830,11 @@ impl OwnershipWitness {
 
     /// A big-endian secp256k1 secret key, for [`KeySource::Secp256k1Key`].
     pub fn secp256k1_key(key_be: &[u8; 32]) -> Self {
+        Self::new(key_be)
+    }
+
+    /// A big-endian BLS12-381 secret key, for [`KeySource::Bls12381Key`].
+    pub fn bls12_381_key(key_be: &[u8; 32]) -> Self {
         Self::new(key_be)
     }
 
@@ -882,6 +942,13 @@ fn evaluate(lock: Lock, source: &KeySource, witness: &OwnershipWitness) -> Optio
             Some(Evaluated {
                 credential: secp256k1_credential(lock, &node.private_key, root)?,
                 nullifier_secret: bip32_nullifier_secret(*start, secret),
+            })
+        }
+        KeySource::Bls12381Key => {
+            let key: [u8; 32] = secret.try_into().ok()?;
+            Some(Evaluated {
+                credential: bls_withdrawal_credential(&key)?,
+                nullifier_secret: key,
             })
         }
         KeySource::Ed25519Seed => {
@@ -1382,32 +1449,16 @@ fn secp_lock(cs: &mut ConstraintSystem, lock: Lock, key: &[Lc], merkle_root: &[u
                 message.extend(alloc_bits(cs, merkle_root));
             }
             let tag = sha2_native::sha256(b"TapTweak");
-            let midstate = sha256_midstate(&[tag, tag].concat()).map(|w| Word::constant(u64::from(w), 32));
+            let midstate =
+                sha256_midstate(&[tag, tag].concat()).map(|w| Word::constant(u64::from(w), 32));
             let tweak = reverse_bytes(&sha256_from_midstate(cs, &midstate, 64, &message));
             // BIP-341 fails for a tweak that is not below the group order; a zero tweak or
             // an output at infinity has no rows that hold.
             enforce_below_order(cs, &Modulus::secp256k1_order(), &tweak);
-            let tweak_point = secp256k1_fixed_base_mul(cs, &tweak);
-            // `lift_x`: the internal point with even `y`, that is `(1 - 2 odd) y`.
-            let field = Modulus::secp256k1_base();
-            let sign = Lazy::constant(&[1]).sub(&Lazy::from_bits(&[public_key.y_is_odd()]).scale(2));
-            let even_y = field.mul(cs, &sign, &Lazy::from_bits(&public_key.y.bits_le));
-            let output = secp256k1_point_add(
-                cs,
-                &AffinePoint {
-                    x: Lazy::from_bits(&public_key.x.bits_le),
-                    y: even_y.lazy(),
-                },
-                &AffinePoint {
-                    x: Lazy::from_bits(&tweak_point.x.bits_le),
-                    y: Lazy::from_bits(&tweak_point.y.bits_le),
-                },
-            );
-            let x = field.reduce(cs, &output.x);
-            field.enforce_canonical(cs, &x);
-            reverse_bytes(&x.bits_le)
+            let output = secp256k1_taproot_tweak_x_only(cs, &public_key, &tweak);
+            reverse_bytes(&output.bits_le)
         }
-        Lock::Ed25519 => unreachable!("an Ed25519 lock has an Ed25519 source"),
+        Lock::Ed25519 | Lock::BlsWithdrawal => unreachable!("a secp256k1 lock"),
     }
 }
 
@@ -1448,6 +1499,17 @@ fn credential_gadget(
                 secp_lock(cs, lock, &leaf.key, &witness.merkle_root),
                 nullifier_secret,
             )
+        }
+        KeySource::Bls12381Key => {
+            let secret = alloc_bits(cs, witness.secret);
+            let key = reverse_bytes(&secret);
+            // The group order has 255 bits.
+            cs.enforce_zero(key[255].clone());
+            bls12_381_enforce_scalar_range(cs, &key[..255]);
+            let public_key = bls12_381_g1_fixed_base_mul(cs, &key[..255]);
+            let mut credential = sha256(cs, &flat(public_key.compressed_bits()));
+            credential[..8].fill(Lc::zero());
+            (credential, secret)
         }
         KeySource::Ed25519Seed => {
             let seed = alloc_bits(cs, witness.secret);
@@ -1553,7 +1615,7 @@ fn build(
 /// A valid secret for building a shape without a witness.
 fn placeholder_secret(source: &KeySource) -> Vec<u8> {
     match source {
-        KeySource::Secp256k1Key => {
+        KeySource::Secp256k1Key | KeySource::Bls12381Key => {
             let mut key = vec![0u8; 32];
             key[31] = 1;
             key
@@ -1801,7 +1863,8 @@ impl BatchStatement {
     /// Whether the lock is a secp256k1 lock without a witness of its own, the batch holds
     /// 1 to [`MAX_BATCH_ENTRIES`] entries and no path exceeds [`MAX_PATH_DEPTH`].
     pub fn is_well_formed(&self) -> bool {
-        !matches!(self.lock, Lock::Ed25519 | Lock::TaprootScriptTree)
+        self.lock.curve() == Curve::Secp256k1
+            && self.lock != Lock::TaprootScriptTree
             && (1..=MAX_BATCH_ENTRIES).contains(&self.entries.len())
             && self.entries.iter().all(|e| {
                 self.prefix.len() + e.tail.len() <= MAX_PATH_DEPTH
@@ -2290,6 +2353,12 @@ mod tests {
                 bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 2 }),
                 OwnershipWitness::seed(&seed(64)).with_path(&[H + 44, 7]),
             ),
+            (
+                "bls-withdrawal/key",
+                Lock::BlsWithdrawal,
+                KeySource::Bls12381Key,
+                OwnershipWitness::bls12_381_key(&KEY),
+            ),
         ]
     }
 
@@ -2492,6 +2561,40 @@ mod tests {
     }
 
     #[test]
+    fn bls_withdrawal_credential_matches_the_generator_encoding() {
+        // Secret key 1: the standard compressed encoding of the G1 generator.
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        let generator = arr::<48>(
+            "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac58
+             6c55e83ff97a1aeffb3af00adb22c6bb",
+        );
+        assert_eq!(bls12_381_public_key(&one), Some(generator));
+        let mut want = sha2_native::sha256(&generator);
+        assert_ne!(want[0], 0);
+        want[0] = 0;
+        assert_eq!(bls_withdrawal_credential(&one), Some(Credential::BlsWithdrawal(want)));
+        // Zero and the group order are not keys.
+        let order = arr::<32>("73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001");
+        assert_eq!(bls12_381_public_key(&[0; 32]), None);
+        assert_eq!(bls12_381_public_key(&order), None);
+        // In the relation, a key with bit 255 set is not a witness even though the
+        // multiplication only reads 255 bits.
+        let st = derive(Lock::BlsWithdrawal, KeySource::Bls12381Key, &OwnershipWitness::bls12_381_key(&one));
+        let mut high = one;
+        high[0] |= 0x80;
+        let forged = OwnershipWitness::bls12_381_key(&high);
+        let mut bits = st.public_bits();
+        let (shape, z, _) = build(Lock::BlsWithdrawal, &KeySource::Bls12381Key, &bits, &relation_witness(&forged));
+        assert!(!shape.is_satisfied(&z));
+        // And the credential's first byte is pinned to zero.
+        bits[0] = true;
+        let honest = OwnershipWitness::bls12_381_key(&one);
+        let (shape, z, _) = build(Lock::BlsWithdrawal, &KeySource::Bls12381Key, &bits, &relation_witness(&honest));
+        assert!(!shape.is_satisfied(&z));
+    }
+
+    #[test]
     fn taproot_matches_bip341_wallet_vectors() {
         // BIP-341 `wallet-test-vectors.json`, `keyPathSpending`, inputs 0, 1 and 3:
         // (internal private key, merkle root, tweak, tweaked private key, output key).
@@ -2658,6 +2761,33 @@ mod tests {
         assert_ne!(ethereum.credential.identifier(), seeded.credential.identifier());
     }
 
+    /// Row budget of the parts every statement shares.
+    #[test]
+    fn shared_parts_have_the_expected_row_counts() {
+        let mut cs = ConstraintSystem::new();
+        let public = alloc_public(&mut cs, &[false; 160 + 512]);
+        let credential = alloc_bits(&mut cs, &[0; 20]);
+        let secret = alloc_bits(&mut cs, &KEY);
+        let before = cs.num_rows();
+        bind_credential(&mut cs, &public, &credential, &secret);
+        let binding = cs.num_rows() - before;
+        std::println!("bind_credential rows: {binding}");
+        // One SHA-256 compression with a variable chaining value, and the pins.
+        assert!((12_000..18_000).contains(&binding), "{binding}");
+
+        let mut cs = ConstraintSystem::new();
+        let key = reverse_bytes(&alloc_bits(&mut cs, &KEY));
+        let before = cs.num_rows();
+        secp256k1_enforce_scalar_range(&mut cs, &key);
+        let range = cs.num_rows() - before;
+        let _ = secp256k1_fixed_base_mul(&mut cs, &key);
+        let mul = cs.num_rows() - before - range;
+        let _ = secp_lock(&mut cs, Lock::P2pkh, &key, &[0; 32]);
+        let lock = cs.num_rows() - before - range - mul;
+        std::println!("range {range}, mul {mul}, p2pkh lock with its own mul {lock}");
+        assert!(mul > 30_000 && lock > mul + 30_000);
+    }
+
     #[test]
     fn derive_rejects_unusable_witnesses() {
         let try_derive = |lock, source, w: &OwnershipWitness| {
@@ -2701,7 +2831,7 @@ mod tests {
             let bytes = st.to_bytes();
             assert_eq!(OwnershipStatement::from_bytes(&bytes), Some(st.clone()), "{name}");
             assert_eq!(bytes[29], lock as u8);
-            assert_eq!(bytes[30], u8::from(st.source != KeySource::Secp256k1Key));
+            assert_eq!(bytes[30], u8::from(st.source.proves_seed_provenance()));
 
             let mut longer = bytes.clone();
             longer.push(0);
@@ -2980,8 +3110,8 @@ mod tests {
 
     /// One honest proof per case, shared by the tests below.
     fn proven(index: usize) -> &'static (OwnershipStatement, OwnershipProof) {
-        static PROOFS: [OnceLock<(OwnershipStatement, OwnershipProof)>; 14] =
-            [const { OnceLock::new() }; 14];
+        static PROOFS: [OnceLock<(OwnershipStatement, OwnershipProof)>; 15] =
+            [const { OnceLock::new() }; 15];
         PROOFS[index].get_or_init(|| {
             let (_, lock, source, witness) = cases().remove(index);
             let st = derive(lock, source, &witness);
@@ -3039,6 +3169,7 @@ mod tests {
             KeySource::Secp256k1Key => push("source", &|s| {
                 s.source = bip32(Bip32Root::ExtendedKey, public(&[]));
             }),
+            KeySource::Bls12381Key => push("source", &|s| s.source = KeySource::Secp256k1Key),
             KeySource::Ed25519Seed => push("source", &|s| {
                 s.source = KeySource::Slip10 { path: public(&[]) };
             }),
@@ -3157,12 +3288,13 @@ mod tests {
         proof_ethereum_from_bip32_seed = 11;
         proof_taproot_from_bip32_extended_key = 12;
         proof_p2pkh_from_bip32_hidden_path = 13;
+        proof_bls_withdrawal_from_key = 14;
     }
 
     #[test]
     fn no_proof_verifies_as_another_statement_kind() {
         let count = cases().len();
-        assert_eq!(count, 14);
+        assert_eq!(count, 15);
         let (batch, batch_proof) = proven_batch();
         for i in 0..count {
             let (st, _) = proven(i);
@@ -3298,7 +3430,7 @@ mod tests {
     fn bindings_are_what_the_registry_consumes() {
         use super::super::registry::KeyExposure;
         for (name, lock, source, witness) in cases() {
-            let hidden = source == KeySource::Secp256k1Key;
+            let hidden = !source.proves_seed_provenance();
             let st = derive(lock, source, &witness);
             let binding = st.binding();
             assert_eq!(binding.nullifier, st.nullifier, "{name}");
@@ -3405,6 +3537,12 @@ mod tests {
                 Lock::TaprootScriptTree,
                 KeySource::Secp256k1Key,
                 key().with_merkle_root(ROOT),
+            ),
+            (
+                "bls 0x00 withdrawal credential, key",
+                Lock::BlsWithdrawal,
+                KeySource::Bls12381Key,
+                OwnershipWitness::bls12_381_key(&KEY),
             ),
             (
                 "ed25519, rfc8032 seed",
