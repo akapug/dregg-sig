@@ -64,13 +64,50 @@ fn committee_tpm_slots(validators: u32) -> Result<u32, CliError> {
         .ok_or_else(|| CliError::usage("committee TPM2 anchor count overflow"))
 }
 
-/// Refuse a committee whose TPM2 NV range is invalid or not fully readable, before any
-/// write-ahead log or anchor record of the enrollment exists.
+/// Refuse a committee whose TPM2 NV range is invalid, undefined, unsuitable or (when
+/// enrolling) already used, before any write-ahead log or anchor record exists.
 pub fn check_committee_anchor_range(
     cfg: &crate::anchor::AnchorConfig,
     validators: u32,
+    purpose: crate::anchor::TpmUse,
 ) -> Result<(), CliError> {
-    cfg.check_tpm_range(committee_tpm_slots(validators)?)
+    cfg.check_tpm_range(committee_tpm_slots(validators)?, purpose)
+}
+
+/// The committee's anchor domains in TPM slot order: validators, then the ceremony.
+fn committee_tpm_domains(
+    seed: &[u8; 32],
+    validators: u32,
+) -> Vec<crate::anchor::TpmDomain<'static>> {
+    let committee: Vec<ValidatorPublicKey> =
+        (0..validators).map(|i| validator(seed, i).pk).collect();
+    let mut domains: Vec<_> = committee
+        .iter()
+        .enumerate()
+        .map(|(i, pk)| crate::anchor::TpmDomain {
+            slot: i as u32,
+            domain: "agg_wal",
+            key_id: digest4_to_bytes(&pk.pk_root),
+            mac_key: derive_secret(seed, format!("agg validator anchor {i}").as_bytes()).0,
+        })
+        .collect();
+    domains.push(crate::anchor::TpmDomain {
+        slot: validators,
+        domain: "agg_ceremony",
+        key_id: compute_committee_root(&committee),
+        mac_key: derive_secret(seed, b"committee ceremony anchor mac").0,
+    });
+    domains
+}
+
+/// What a committee enrolled on one shared TPM2 NV counter is told.
+fn shared_index_refusal(cfg: &crate::anchor::AnchorConfig, validators: u32) -> CliError {
+    let index = cfg.tpm_nv_index.unwrap_or_default();
+    CliError::state(format!(
+        "this committee was enrolled with one TPM2 NV counter ({index:#010x}) shared by all {} of its anchors. Each anchor seals the exact count, so only the newest seal matches the counter and the committee cannot open. Its state can still be proven current: define {} new counters and run `dregg-sig aggregate --secret <committee.sk> --wal-dir <dir> --anchor-tpm-nv {index:#010x} --reanchor-tpm-nv <new base>`",
+        validators + 1,
+        validators + 1
+    ))
 }
 
 fn committee_anchor_config(
@@ -93,7 +130,7 @@ pub fn enroll_committee_ceremony(
     let ceremony_path = format!("{secret_path}.ceremony");
     let ceremony_mac = derive_secret(seed, b"committee ceremony journal mac");
     let (journal, ceremony_seal) = if let Some(cfg) = anchor_cfg {
-        check_committee_anchor_range(cfg, validators)?;
+        check_committee_anchor_range(cfg, validators, crate::anchor::TpmUse::Enroll)?;
         cfg.validate_isolation(&[secret_path], &[wal_dir], true)?;
         for index in 0..validators {
             let root = digest4_to_bytes(&validator(seed, index).pk.pk_root);
@@ -391,14 +428,63 @@ Third form: committee-vault demo signing + aggregation backed by per-validator F
   --deterministic     derive the proof blinding seed from the inputs instead of OS entropy
   --anchor-dir <dir>  verify and advance external monotone anchors before releasing proof
   --anchor-tpm-nv <base>  use the committee's reserved range: validator i=base+i,
-                         ceremony=base+validators; all counters must be predefined and exclusive
+                         ceremony=base+validators; each a counter of its own
+  --reanchor-tpm-nv <new base>  repair a committee enrolled on ONE shared counter
+                         (--anchor-tpm-nv names it): prove its state is the newest the TPM has
+                         seen, then bind validators+1 never-written counters from <new base>.
+                         No signature is made; --epoch, --signers and the message are not needed
   --vault-dir <dir>   explicit local custody directory verified disjoint from --anchor-dir
   --ephemeral-unanchored  allow disposable committee signing without rollback protection
-  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
+  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode);
+                         it then stops a restore of the custody directory only: a volume or VM
+                         snapshot rewinds the anchor with it
   --policy-id-hex <hex>  32-byte policy identifier committed into CeremonyContext
   --spend-amount <n>  spend amount committed into CeremonyContext (default: 0)
   --json              print the proof file contents to standard output as well
 ";
+
+/// `aggregate --reanchor-tpm-nv`: move a committee that was enrolled on one shared TPM2
+/// NV counter onto its own counters. No signature is made.
+fn reanchor_committee(
+    args: &Args,
+    anchor_cfg: Option<&crate::anchor::AnchorConfig>,
+    new_base: &str,
+) -> Result<(), CliError> {
+    let new_base = crate::anchor::parse_tpm_nv_index(new_base)?;
+    let cfg = anchor_cfg.ok_or_else(|| {
+        CliError::usage("--reanchor-tpm-nv requires --anchor-tpm-nv (the shared index)")
+    })?;
+    let secret_path = args.require("secret")?;
+    let wal_dir = args.require("wal-dir")?;
+    // The committee vault lock is held until every anchor has been moved and verified.
+    let mut vault = crate::vault::Vault::acquire(secret_path, false)?;
+    let secret = load_json(secret_path, SECRET_FORMAT)?;
+    let passphrase = crate::envelope::passphrase(args)?;
+    let opened = crate::envelope::open(&secret, passphrase.as_deref().map(Vec::as_slice))?;
+    vault.set_key_material(&opened);
+    vault.authenticate(&secret)?;
+    if scheme_of(&secret)? != Scheme::AggCommittee {
+        return Err(CliError::usage("--secret must be a committee key file"));
+    }
+    crate::anchor::enforce_anchor_requirement(&secret, Some(cfg))?;
+    let seed = opened.seed()?;
+    let size = u32::try_from(secret.field_u64("validators")?)
+        .map_err(|_| CliError::input("validators out of range"))?;
+    crate::cli::private_dir(wal_dir, false)?;
+    let slots = committee_tpm_slots(size)?;
+    cfg.reanchor_shared_tpm_index(
+        new_base,
+        slots,
+        &[secret_path],
+        &[wal_dir],
+        &committee_tpm_domains(&seed, size),
+    )?;
+    println!(
+        "re-anchored committee {secret_path}: {slots} anchors now on TPM2 NV counters {new_base:#010x}..={:#010x}; aggregate with --anchor-tpm-nv {new_base:#010x}",
+        new_base + slots - 1
+    );
+    Ok(())
+}
 
 pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(
@@ -422,6 +508,7 @@ pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
             "anchor-tpm-nv",
             "anchor-tpm-device",
             "anchor-tpm-auth-env",
+            "reanchor-tpm-nv",
             "policy-id-hex",
             "spend-amount",
         ],
@@ -441,6 +528,9 @@ pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
     }
     args.no_positionals()?;
     let anchor_cfg = crate::anchor::AnchorConfig::from_args(&args)?;
+    if let Some(new_base) = args.get("reanchor-tpm-nv") {
+        return reanchor_committee(&args, anchor_cfg.as_ref(), new_base);
+    }
     let base_context = crate::anchor::parse_ceremony_context(&args, 0)?;
     if args.get("in").is_some() && args.get("message").is_some() {
         return Err(CliError::usage("pass either --message or --in, not both"));
@@ -603,6 +693,16 @@ pub fn aggregate(raw: &[String]) -> Result<(), CliError> {
         crate::cli::private_dir(wal_dir, false)?;
         if let Some(cfg) = &anchor_cfg {
             cfg.validate_isolation(&[secret_path], &[wal_dir], false)?;
+            if cfg.tpm_nv_index.is_some() {
+                if cfg.shared_tpm_index_enrollment(
+                    &[secret_path],
+                    &[wal_dir],
+                    &committee_tpm_domains(&seed, size),
+                )? {
+                    return Err(shared_index_refusal(cfg, size));
+                }
+                check_committee_anchor_range(cfg, size, crate::anchor::TpmUse::Reopen)?;
+            }
         }
         let mut signers = Vec::new();
         for part in args.require("signers")?.split(',') {
@@ -1175,9 +1275,9 @@ mod tpm_anchor_tests {
         reopened.verify_floor_at_least(b"agg_wal", 0).unwrap();
         drop(reopened);
         assert!(
-            tpm.counters().values().all(|n| *n > 41),
+            tpm.counts().values().all(|n| n.is_some_and(|n| n > 41)),
             "every reserved counter backs one domain: {:?}",
-            tpm.counters()
+            tpm.counts()
         );
 
         for i in 0..VALIDATORS {
@@ -1201,15 +1301,92 @@ mod tpm_anchor_tests {
             derive_secret(&seed, b"committee ceremony anchor mac").0,
         );
 
+        // The same committee as a release before per-domain counters enrolled it: every
+        // anchor on one counter. It is recognised, and re-anchoring restores it.
+        const SHARED: u32 = 0x0180_0140;
+        const NEW_BASE: u32 = 0x0180_0150;
+        tpm.define_counter(SHARED, b"");
+        for slot in 0..=VALIDATORS {
+            tpm.define_counter(NEW_BASE + slot, b"");
+        }
+        let domains = || committee_tpm_domains(&seed, VALIDATORS);
+        assert!(
+            !cfg.shared_tpm_index_enrollment(&[secret_path], &[&wal_dir], &domains())
+                .unwrap()
+        );
+        tpm_model::make_shared_index_enrollment(
+            tpm,
+            &cfg,
+            SHARED,
+            VALIDATORS + 1,
+            &[secret_path],
+            &[&wal_dir],
+            &domains(),
+        );
+        let shared_cfg = AnchorConfig {
+            tpm_nv_index: Some(SHARED),
+            ..Default::default()
+        };
+        assert!(
+            shared_cfg
+                .shared_tpm_index_enrollment(&[secret_path], &[&wal_dir], &domains())
+                .unwrap()
+        );
+        assert!(
+            shared_index_refusal(&shared_cfg, VALIDATORS)
+                .message
+                .contains("--reanchor-tpm-nv")
+        );
+        // Validator 0 under the shared index: the lagging seal the old release left.
+        let err = FsExternalMountAnchor::open_existing(
+            &shared_cfg,
+            &[secret_path],
+            &[&wal_dir],
+            "agg_wal",
+            validator_root(0),
+            validator_mac(0),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.message.contains("lags TPM2 NV monotonic counter"),
+            "{err:?}"
+        );
+        shared_cfg
+            .reanchor_shared_tpm_index(
+                NEW_BASE,
+                VALIDATORS + 1,
+                &[secret_path],
+                &[&wal_dir],
+                &domains(),
+            )
+            .unwrap();
+        let new_cfg = AnchorConfig {
+            tpm_nv_index: Some(NEW_BASE),
+            ..Default::default()
+        };
+        for domain in domains() {
+            tpm_model::assert_domain_reopens_and_refuses_rollback(
+                tpm,
+                &new_cfg,
+                &wal_dir,
+                NEW_BASE + domain.slot,
+                domain.domain,
+                domain.key_id,
+                domain.mac_key,
+            );
+        }
+
         // A committee one counter short is refused before anything is written.
         drop(installed);
         let short = tpm_model::install(BASE, VALIDATORS, 41);
-        let err = check_committee_anchor_range(&cfg, VALIDATORS).unwrap_err();
+        let err = check_committee_anchor_range(&cfg, VALIDATORS, crate::anchor::TpmUse::Enroll)
+            .unwrap_err();
         assert!(
             format!("{err:?}").contains("TPM2 NV counter 0x01800104"),
             "{err:?}"
         );
-        assert!(short.0.counters().values().all(|n| *n == 41));
+        assert!(short.0.counts().values().all(Option::is_none));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

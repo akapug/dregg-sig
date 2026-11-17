@@ -58,7 +58,11 @@ fn qsag(args: &[&str]) -> Output {
             )
             | (Some(&"hd"), Some(&"keygen" | &"recover" | &"export-rss"), _)
             | (Some(&"policy"), Some(&"init"), _)
-            | (Some(&"policy"), Some(&"biscuit"), Some(&"keygen" | &"mint"))
+            | (
+                Some(&"policy"),
+                Some(&"biscuit"),
+                Some(&"keygen" | &"mint" | &"verify")
+            )
     );
     let has_anchor = args.iter().any(|a| {
         matches!(
@@ -3323,6 +3327,39 @@ fn e2e_policy_macaroon_attenuation_third_party_discharge_and_refusal() {
         ],
         0,
     );
+    // A macaroon is a reusable bearer grant: verification keeps no state, so the same
+    // token and discharge verify again, and the output says so instead of implying
+    // that the grant was spent.
+    let again = expect(
+        &[
+            "policy",
+            "macaroon",
+            "verify",
+            "--key",
+            &root_key,
+            "--in",
+            &tok1,
+            "--audience-hex",
+            audience,
+            "--resource-hex",
+            resource,
+            "--actions",
+            "3",
+            "--amount",
+            huge_amount,
+            "--now",
+            "1700000000",
+            "--discharge",
+            &dis_bound,
+            "--discharge-key",
+            &tp_key,
+            "--json",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&again, "valid"), "true");
+    assert_eq!(json_member(&again, "consumed"), "false");
+    assert_eq!(json_member(&again, "reusable"), "true");
     // Spending 1 unit over the u128 max-amount cap is denied (exit 3).
     expect(
         &[
@@ -3915,6 +3952,192 @@ fn passphrase_biscuit_authority_survives_multiple_anchored_mints() {
             0,
         );
     }
+}
+
+// A seal consumed after a backup of the verifier's seal store must stay consumed when
+// the backup is put back. Without an anchor the restored store accepts it again.
+#[cfg(unix)]
+#[test]
+fn biscuit_seal_store_anchor_refuses_a_restored_store() {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = Workdir::new("seal-store-rollback");
+    let private = |name: &str| {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path(name))
+            .unwrap();
+        dir.path(name)
+    };
+    let sk = dir.path("authority.sk");
+    let pk = dir.path("authority.pk");
+    let audience = "12".repeat(32);
+    let resource = "34".repeat(32);
+    expect(
+        &[
+            "policy",
+            "biscuit",
+            "keygen",
+            "--secret-out",
+            &sk,
+            "--public-out",
+            &pk,
+            "--tree-height",
+            "2",
+        ],
+        0,
+    );
+    let seal = |n: usize| {
+        let token = dir.path(&format!("token-{n}"));
+        let step = dir.path(&format!("step-{n}"));
+        let sealed = dir.path(&format!("sealed-{n}"));
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "mint",
+                "--secret",
+                &sk,
+                "--audience-hex",
+                &audience,
+                "--resource-hex",
+                &resource,
+                "--token-out",
+                &token,
+                "--step-key-out",
+                &step,
+            ],
+            0,
+        );
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "seal",
+                "--in",
+                &token,
+                "--step-key",
+                &step,
+                "--out",
+                &sealed,
+            ],
+            0,
+        );
+        sealed
+    };
+    let verify = |sealed: &str, store: &str, extra: &[&str]| {
+        let mut args = vec![
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            sealed,
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            store,
+        ];
+        args.extend_from_slice(extra);
+        qsag(&args)
+    };
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    for anchored in [false, true] {
+        let store_dir = private(if anchored {
+            "anchored-store"
+        } else {
+            "bare-store"
+        });
+        let store = format!("{store_dir}/seals");
+        let anchor_dir = private(if anchored {
+            "anchor-a"
+        } else {
+            "anchor-unused"
+        });
+        let anchor: Vec<&str> = if anchored {
+            vec!["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"]
+        } else {
+            vec!["--ephemeral-unanchored"]
+        };
+        let with = |extra: &[&'static str]| -> Vec<&str> {
+            anchor
+                .iter()
+                .copied()
+                .chain(extra.iter().copied())
+                .collect()
+        };
+        let (first, second) = (
+            seal(usize::from(anchored) * 2),
+            seal(usize::from(anchored) * 2 + 1),
+        );
+
+        let created = verify(&first, &store, &with(&["--create-seal-store"]));
+        assert_eq!(code(&created), 0, "{}", stderr(&created));
+        let backup = snapshot_dir_files(Path::new(&store_dir));
+        let accepted = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&accepted), 0, "{}", stderr(&accepted));
+        let replayed = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&replayed), 3, "{}", stderr(&replayed));
+        let current = snapshot_dir_files(Path::new(&store_dir));
+
+        // The store directory goes back to the backup, every inode kept.
+        restore_dir_files_in_place(&backup);
+        let after_restore = verify(&second, &store, &with(&[]));
+        if anchored {
+            assert_eq!(code(&after_restore), 4, "{}", stderr(&after_restore));
+            assert!(
+                stderr(&after_restore).contains("rollback"),
+                "{}",
+                stderr(&after_restore)
+            );
+            // The anchor requirement cannot be dropped to get around it.
+            let waived = verify(&second, &store, &["--ephemeral-unanchored"]);
+            assert_eq!(code(&waived), 4, "{}", stderr(&waived));
+            assert!(stderr(&waived).contains("must be opened with it"));
+            // The current store still opens and still refuses the consumed seals.
+            restore_dir_files_in_place(&current);
+            for sealed in [&first, &second] {
+                let refused = verify(sealed, &store, &with(&[]));
+                assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+            }
+        } else {
+            // No anchor: the consumed seal is accepted a second time.
+            assert_eq!(code(&after_restore), 0, "{}", stderr(&after_restore));
+            // And an unanchored store cannot be claimed to be anchored afterwards.
+            let claimed = verify(
+                &first,
+                &store,
+                &["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"],
+            );
+            assert_eq!(code(&claimed), 4, "{}", stderr(&claimed));
+            assert!(stderr(&claimed).contains("without an external anchor"));
+        }
+    }
+    // Neither an anchor nor the waiver: the command refuses to pick for the operator.
+    let output = Command::new(env!("CARGO_BIN_EXE_dregg-sig"))
+        .args([
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            &dir.path("sealed-3"),
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            &dir.path("undecided"),
+            "--create-seal-store",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(!Path::new(&dir.path("undecided")).exists());
 }
 
 /// secp256k1 secret key 1: public key `G`.

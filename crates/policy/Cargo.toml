@@ -10,7 +10,14 @@ description = "Authenticated transaction-predicate guard evaluating recipient al
 default = ["alloc"]
 alloc = ["dregg-sig-accel/alloc", "dregg-sig-addr/alloc"]
 test-dealer = []
-std = ["dregg-sig-asm/std", "alloc", "dregg-sig-accel/std", "dregg-sig-addr/std"]
+std = [
+    "dregg-sig-asm/std",
+    "alloc",
+    "dregg-sig-accel/std",
+    "dregg-sig-addr/std",
+    "dep:dregg-sig-core",
+    "dregg-sig-core/std",
+]
 
 [dependencies]
 dregg-sig-verified = { path = "../verified", default-features = false }
@@ -18,3 +25,5 @@ dregg-sig-fts = { path = "../fts", default-features = false }
 dregg-sig-asm = { path = "../asm", default-features = false, features = ["alloc"] }
 dregg-sig-accel = { path = "../accel", default-features = false }
 dregg-sig-addr = { path = "../addr", default-features = false }
+# The external rollback anchor contract (`ExternalMonotoneAnchor`) of the durable stores.
+dregg-sig-core = { path = "../core", default-features = false, optional = true }
