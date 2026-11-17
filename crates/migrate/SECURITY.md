@@ -224,22 +224,20 @@ root file to drop the anchor requirement leaves a log that does not authenticate
 
 ## Proving from shares
 
-There is no threshold ownership prover in this tree. `hem::collab` contains the design
-and the parts built so far for running the zk-Hem prover on an additively shared
-witness: share handling, the row and column sumchecks on shares with Beaver triples,
-and the front end that drives them, tested against honest-but-curious parties. Not
-built there: the per-custodian Stage-0 commitments and query answers, the companion
-claims, generation of the shared witness from shares of a seed or key, and security
-against a custodian that deviates. Its module documentation states the intended
-thresholds and what remains.
+`hem::collab` is a threshold prover for the zk-Hem relations: a quorum of custodians
+holding MAC-authenticated additive shares of an assignment produces a proof
+(`ZkHemSplitProof`, one Stage-0 commitment per custodian) that
+`hem::collab::verify_threshold_ownership` checks with the ordinary verifier steps. Its
+module documentation states the protocol, the corruption bound (all but one member of
+the proving quorum, with abort), the argument that a deviating custodian learns only
+the abort, which parts of that argument are from the literature and which are claims of
+the module, and measured costs. `hem::collab::prep` is its dealerless preprocessing
+ceremony; the soundness arguments there are written out, not machine-checked and not
+independently reviewed.
 
-`threshold_mpc` and `threshold_prep` are an authenticated additive-sharing engine
-(MAC-checked openings, security with abort against all quorum members but one) and its
-dealerless preprocessing ceremony. They were the general-quorum engine of the removed
-distributed prover and `hem::collab` names them as the engine for witness generation.
-Nothing in the crate calls the online engine today. The ceremony's soundness arguments
-are written in its module documentation; they are not machine-checked and have not
-been independently reviewed.
-
-A legacy secret held as shares therefore has to be reconstructed in one place to be
-migrated with this crate as it stands.
+Not in this tree: computing the shared assignment from shares of the legacy secret.
+`hem::collab::custody` turns `(k, n)` Shamir or XOR custody shares into authenticated
+shares of the secret's bits; the remaining variables of a relation (hash and curve
+intermediates and their hint variables) have no secure computation here. Until that
+exists, a legacy secret held as shares has to be reconstructed in one place to
+produce the assignment.

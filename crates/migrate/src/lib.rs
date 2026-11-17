@@ -7,11 +7,10 @@
 //!
 //! * [`hem::relations`]: the ownership statements and their zk-Hem proofs.
 //! * [`hem::registry`] (`std`): the durable one-way nullifier registry.
-//! * [`hem::collab`]: proving over a secret-shared witness.
+//! * [`hem::collab`]: the threshold prover: a quorum of custodians proves a statement on
+//!   a secret-shared assignment, with its authenticated engine and preprocessing.
 //! * [`secp256k1_ct`], [`ed25519_ct`]: constant-time native references the relations are
 //!   tested against.
-//! * [`threshold_mpc`], [`threshold_prep`]: an authenticated general-quorum arithmetic
-//!   engine and its preprocessing. No prover in this crate runs on it.
 //!
 //! A proof shows authorisation by whoever holds the secret. It does not disable the legacy
 //! key and does not prevent a second migration; the chain or the registry must. See
@@ -26,31 +25,12 @@ pub mod legacy;
 pub mod secp256k1_ct;
 pub mod zk_engine;
 
-// The general-quorum engine below lost its only caller when the old distributed prover
-// was removed. Its public surface is the preprocessing ceremony and the share types; the
-// online engine and the field layer under it are reachable only from tests.
 #[allow(dead_code)]
 mod bls12_381;
 #[allow(dead_code)]
-mod circuit;
-#[cfg(test)]
-mod custody_share;
-#[allow(dead_code)]
 mod limbs;
-#[allow(dead_code)]
-mod outer_mpc;
 #[allow(dead_code)]
 mod pallas;
 mod scalar;
-mod secret;
-#[allow(dead_code)]
-pub mod threshold_mpc;
-pub mod threshold_prep;
 
-#[cfg(test)]
-pub(crate) use custody_share::CoZkCustodianShare;
 pub use legacy::LegacyCommitmentKind;
-pub use threshold_mpc::{
-    poly0x11b_to_t3_byte_ct, poly0x11b_to_t3_bytes32_ct, t3_to_poly0x11b_byte_ct,
-    t3_to_poly0x11b_bytes32_ct,
-};

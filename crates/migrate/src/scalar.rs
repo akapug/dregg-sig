@@ -1,5 +1,6 @@
 //! The Ed25519 base field prime, little-endian limbs.
 
+#[cfg(test)]
 pub(crate) const ED_PRIME: [u64; 4] = [
     0xffff_ffff_ffff_ffed,
     u64::MAX,
