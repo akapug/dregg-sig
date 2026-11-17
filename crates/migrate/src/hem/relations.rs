@@ -3716,6 +3716,7 @@ mod tests {
         assert!(!verify_ownership(&entry, REGIME, batch_proof));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn shape_cache_returns_the_same_shape_and_stays_within_its_budget() {
         let relation = Relation::Single(Lock::P2pkh, KeySource::Secp256k1Key);
