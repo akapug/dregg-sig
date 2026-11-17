@@ -32,9 +32,10 @@ use dregg_sig_migrate::hem::registry::{
     BindingStatus, NullifierRegistry, Receipt, RegisteredBinding, RegistryError, pq_commitment,
 };
 use dregg_sig_migrate::hem::relations::{
-    Bip32Root, HARDENED as BIP32_HARDENED, KeySource, Lock, MAX_PATH_DEPTH as MAX_BIP32_DEPTH,
-    OwnershipError, OwnershipProof, OwnershipStatement, OwnershipWitness, PathSpec,
-    SEED_BYTES as BIP32_SEED_BYTES, ownership_shape, prove_ownership, verify_ownership,
+    Bip32Root, Ed25519ExtendedKey, HARDENED as BIP32_HARDENED, HdNode, KeySource, Lock,
+    MAX_PATH_DEPTH as MAX_BIP32_DEPTH, OwnershipError, OwnershipProof, OwnershipStatement,
+    OwnershipWitness, PathSpec, SEED_BYTES as BIP32_SEED_BYTES, ownership_shape, prove_ownership,
+    verify_ownership,
 };
 
 use crate::anchor::{AnchorConfig, AnchorRequirementError, FsExternalMountAnchor};
@@ -82,6 +83,12 @@ enum SecretForm {
     /// A BIP-32 master seed of 16 to 64 bytes, as hex or as the `seed` of a JSON file.
     /// Raw bytes are not accepted: a 64-byte file would be ambiguous with 32 bytes of hex.
     HexSeed,
+    /// A BIP-32 extended private key: an `xprv`/`tprv` string (BIP-32 serialization,
+    /// Base58Check), or 64 bytes `private key || chain code` as hex or JSON `seed`.
+    ExtendedKey,
+    /// A BIP32-Ed25519 extended private key `k_L || k_R || chain code`: 96 bytes as hex or
+    /// JSON `seed`.
+    Ed25519ExtendedKey,
 }
 
 /// One statement kind of the command line: a lock (how the chain holds the credential)
@@ -107,48 +114,140 @@ enum Source {
     Ed25519Seed,
     /// A BIP-32 master seed and a public `--path`.
     Bip32,
-    /// A SLIP-0010 master seed and a public, all-hardened `--path`.
+    /// A SLIP-0010 master seed and an all-hardened `--path`.
     Slip10,
+    /// A BIP32-Ed25519 (Khovratovich-Law, Cardano) extended private key and a `--path`.
+    Bip32Ed25519,
+}
+
+/// The options that shape the key source of a statement beyond its kind.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SourceOptions {
+    /// `--root extended-key`: the secret is an extended private key, not a master seed.
+    extended_root: bool,
+    /// `--hidden-path-depth <n>`: the path is a witness of at most `n` levels.
+    hidden_depth: Option<u8>,
+}
+
+impl SourceOptions {
+    fn of(source: &KeySource) -> Self {
+        let hidden = |spec: &PathSpec| match spec {
+            PathSpec::Hidden { max_depth } => Some(*max_depth),
+            PathSpec::Public(_) => None,
+        };
+        match source {
+            KeySource::Bip32 { root, path } => Self {
+                extended_root: *root == Bip32Root::ExtendedKey,
+                hidden_depth: hidden(path),
+            },
+            KeySource::Slip10 { path } => Self {
+                extended_root: false,
+                hidden_depth: hidden(path),
+            },
+            _ => Self::default(),
+        }
+    }
 }
 
 impl KindSpec {
     /// Whether the kind takes `--path`.
     fn derivation_path(&self) -> bool {
-        matches!(self.source, Source::Bip32 | Source::Slip10)
+        matches!(
+            self.source,
+            Source::Bip32 | Source::Slip10 | Source::Bip32Ed25519
+        )
     }
 
-    fn key_source(&self, path: Vec<u32>) -> KeySource {
+    /// Whether the kind takes `--merkle-root`.
+    fn script_tree(&self) -> bool {
+        self.lock == Lock::TaprootScriptTree
+    }
+
+    /// Whether `options` apply to this kind.
+    fn admits(&self, options: SourceOptions) -> bool {
+        (!options.extended_root || self.source == Source::Bip32)
+            && (options.hidden_depth.is_none()
+                || matches!(self.source, Source::Bip32 | Source::Slip10))
+    }
+
+    /// What the secret file holds under `options`.
+    fn secret_form(&self, options: SourceOptions) -> SecretForm {
+        if options.extended_root {
+            SecretForm::ExtendedKey
+        } else {
+            self.secret
+        }
+    }
+
+    fn key_source(&self, path: Vec<u32>, options: SourceOptions) -> KeySource {
+        let spec = match options.hidden_depth {
+            Some(max_depth) => PathSpec::Hidden { max_depth },
+            None => PathSpec::Public(path.clone()),
+        };
         match (self.source, self.lock) {
             (Source::Key, Lock::BlsWithdrawal) => KeySource::Bls12381Key,
             (Source::Key, _) => KeySource::Secp256k1Key,
             (Source::Ed25519Seed, _) => KeySource::Ed25519Seed,
             (Source::Bip32, _) => KeySource::Bip32 {
-                root: Bip32Root::Seed,
-                path: PathSpec::Public(path),
+                root: if options.extended_root {
+                    Bip32Root::ExtendedKey
+                } else {
+                    Bip32Root::Seed
+                },
+                path: spec,
             },
-            (Source::Slip10, _) => KeySource::Slip10 {
-                path: PathSpec::Public(path),
-            },
+            (Source::Slip10, _) => KeySource::Slip10 { path: spec },
+            (Source::Bip32Ed25519, _) => KeySource::Bip32Ed25519 { path },
         }
     }
 
-    /// The witness for secret bytes of the length `secret` admits.
-    fn witness(&self, bytes: &[u8]) -> Option<OwnershipWitness> {
+    /// Whether `source` is this kind's key source under some options and path.
+    fn offers(&self, source: &KeySource) -> bool {
+        matches!(
+            (self.source, self.lock, source),
+            (Source::Key, Lock::BlsWithdrawal, KeySource::Bls12381Key)
+                | (Source::Key, _, KeySource::Secp256k1Key)
+                | (Source::Ed25519Seed, _, KeySource::Ed25519Seed)
+                | (Source::Bip32, _, KeySource::Bip32 { .. })
+                | (Source::Slip10, _, KeySource::Slip10 { .. })
+                | (Source::Bip32Ed25519, _, KeySource::Bip32Ed25519 { .. })
+        ) && (self.source != Source::Key
+            || (self.lock == Lock::BlsWithdrawal) == (*source == KeySource::Bls12381Key))
+    }
+
+    /// The witness for secret bytes of the length [`Self::secret_form`] admits.
+    fn witness(&self, bytes: &[u8], options: SourceOptions) -> Option<OwnershipWitness> {
         Some(match (self.source, self.lock) {
             (Source::Key, Lock::BlsWithdrawal) => {
                 OwnershipWitness::bls12_381_key(bytes.try_into().ok()?)
             }
             (Source::Key, _) => OwnershipWitness::secp256k1_key(bytes.try_into().ok()?),
             (Source::Ed25519Seed, _) => OwnershipWitness::ed25519_seed(bytes.try_into().ok()?),
+            (Source::Bip32, _) if options.extended_root => {
+                OwnershipWitness::extended_key(&HdNode {
+                    private_key: bytes.get(..32)?.try_into().ok()?,
+                    chain_code: bytes.get(32..)?.try_into().ok()?,
+                })
+            }
             (Source::Bip32 | Source::Slip10, _) => OwnershipWitness::seed(bytes),
+            (Source::Bip32Ed25519, _) => {
+                OwnershipWitness::ed25519_extended_key(&Ed25519ExtendedKey(bytes.try_into().ok()?))
+            }
         })
     }
 
     /// The public members a statement of this kind renders to.
     fn render(&self, statement: &OwnershipStatement) -> Vec<(&'static str, Json)> {
         let mut out = vec![(self.member, Json::hex(statement.credential.value()))];
+        let options = SourceOptions::of(&statement.source);
+        if options.extended_root {
+            out.push(("bip32_root", Json::str("extended-key")));
+        }
         if let Some(path) = public_path(&statement.source) {
             out.push(("derivation_path", Json::str(format_path(path))));
+        }
+        if let Some(depth) = options.hidden_depth {
+            out.push(("hidden_path_max_depth", Json::num(depth)));
         }
         out
     }
@@ -163,7 +262,8 @@ fn public_path(source: &KeySource) -> Option<&[u32]> {
         }
         | KeySource::Slip10 {
             path: PathSpec::Public(path),
-        } => Some(path),
+        }
+        | KeySource::Bip32Ed25519 { path } => Some(path),
         _ => None,
     }
 }
@@ -183,6 +283,7 @@ const fn kind(
         secret: match source {
             Source::Key | Source::Ed25519Seed => SecretForm::Key32,
             Source::Bip32 | Source::Slip10 => SecretForm::HexSeed,
+            Source::Bip32Ed25519 => SecretForm::Ed25519ExtendedKey,
         },
         lock,
         source,
@@ -190,7 +291,7 @@ const fn kind(
     }
 }
 
-static KIND_TABLE: [KindSpec; 12] = [
+static KIND_TABLE: [KindSpec; KIND_COUNT] = [
     kind(
         "btc-hash160",
         &["btc-p2wpkh", "btc-p2pkh"],
@@ -287,25 +388,52 @@ static KIND_TABLE: [KindSpec; 12] = [
         Source::Bip32,
         "legacy_address",
     ),
+    kind(
+        "btc-taproot-tree",
+        &[],
+        "Bitcoin Taproot output key committing to a script tree; --merkle-root is the tree's root (hidden internal key)",
+        Lock::TaprootScriptTree,
+        Source::Key,
+        "legacy_output_key",
+    ),
+    kind(
+        "bip32-taproot-tree",
+        &[],
+        "Bitcoin Taproot output key with a script tree (--merkle-root) for the key at --path of a BIP-32 master seed",
+        Lock::TaprootScriptTree,
+        Source::Bip32,
+        "legacy_output_key",
+    ),
+    kind(
+        "bip32-ed25519",
+        &["cardano-ed25519"],
+        "Ed25519 public key at --path of a BIP32-Ed25519 (Khovratovich-Law) extended private key (revealed key)",
+        Lock::Ed25519,
+        Source::Bip32Ed25519,
+        "legacy_public_key",
+    ),
 ];
 
+const KIND_COUNT: usize = 15;
+
 const KINDS: &[&KindSpec] = &{
-    let mut out = [&KIND_TABLE[0]; 12];
+    let mut out = [&KIND_TABLE[0]; KIND_COUNT];
     let mut i = 0;
-    while i < 12 {
+    while i < KIND_COUNT {
         out[i] = &KIND_TABLE[i];
         i += 1;
     }
     out
 };
 
-/// The table entry of a statement; `None` for a combination this command does not offer
-/// (hidden paths, extended-key roots, script trees, BIP32-Ed25519).
+/// The table entry of a statement; `None` for a combination this command does not offer.
+/// The root and the path form (`--root`, `--hidden-path-depth`) are options of an entry,
+/// not entries of their own.
 fn kind_of(statement: &OwnershipStatement) -> Option<&'static KindSpec> {
-    KINDS.iter().copied().find(|kind| {
-        let path = public_path(&statement.source).unwrap_or(&[]).to_vec();
-        kind.lock == statement.lock && kind.key_source(path) == statement.source
-    })
+    KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.lock == statement.lock && kind.offers(&statement.source))
 }
 
 fn kind_by_name(name: &str) -> Result<&'static KindSpec, CliError> {
@@ -459,6 +587,54 @@ fn json_legacy_seed(json: &Json) -> Result<ZeroizingBuf, CliError> {
     json.field_hex("seed")
 }
 
+/// `private key || chain code` of a BIP-32 serialized extended private key (`xprv` for
+/// mainnet, `tprv` for testnet): Base58Check of
+/// `version(4) depth(1) fingerprint(4) child(4) chain code(32) 0x00 key(32)`.
+fn parse_extended_private_key(text: &str) -> Result<ZeroizingBuf, CliError> {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let bad = |why: &str| CliError::input(format!("extended private key: {why}"));
+    // Little-endian base-256 accumulator; 111 characters of base 58 fit 82 bytes.
+    let mut number = ZeroizingBuf::new(vec![0u8; 82]);
+    for c in text.bytes() {
+        let digit = ALPHABET
+            .iter()
+            .position(|&a| a == c)
+            .ok_or_else(|| bad("not Base58"))?;
+        let mut carry = digit as u32;
+        for byte in number.0.iter_mut() {
+            carry += u32::from(*byte) * 58;
+            *byte = carry as u8;
+            carry >>= 8;
+        }
+        if carry != 0 {
+            return Err(bad("too long"));
+        }
+    }
+    number.0.reverse();
+    let (payload, checksum) = number.0.split_at(78);
+    let digest = dregg_sig_accel::sha2::sha256(&dregg_sig_accel::sha2::sha256(payload));
+    if digest[..4] != *checksum {
+        return Err(bad("checksum mismatch"));
+    }
+    // Base58Check is canonical: re-encoding must give the text back (no spare leading 1s).
+    if text.len() != 111 {
+        return Err(bad("not a 78-byte BIP-32 serialization"));
+    }
+    if !matches!(
+        payload[..4],
+        [0x04, 0x88, 0xAD, 0xE4] | [0x04, 0x35, 0x83, 0x94]
+    ) {
+        return Err(bad("not an xprv or tprv version"));
+    }
+    if payload[45] != 0 {
+        return Err(bad("the key field does not hold a private key"));
+    }
+    let mut out = ZeroizingBuf::new(vec![0u8; 64]);
+    out.0[..32].copy_from_slice(&payload[46..78]);
+    out.0[32..].copy_from_slice(&payload[13..45]);
+    Ok(out)
+}
+
 /// Read the secret of a statement kind. The bytes stay in a wiping buffer.
 ///
 /// `Key32`: 64 hex characters, a JSON object with a `seed` member, or a raw 32-byte file.
@@ -476,6 +652,13 @@ fn read_legacy_secret(path: &str, form: SecretForm) -> Result<ZeroizingBuf, CliE
         (Some(text), _) if text.starts_with('{') => json_legacy_seed(&Json::parse(text)?)?,
         (_, Some(hex)) => from_hex(hex)?,
         _ if form == SecretForm::Key32 && raw.0.len() == 32 => raw,
+        (Some(text), _)
+            if form == SecretForm::ExtendedKey
+                && text.ends_with(|c: char| c.is_ascii_alphanumeric())
+                && text.get(1..4) == Some("prv") =>
+        {
+            parse_extended_private_key(text)?
+        }
         _ => {
             return Err(CliError::input(format!(
                 "{path} must be hex or a JSON secret file{}",
@@ -490,10 +673,20 @@ fn read_legacy_secret(path: &str, form: SecretForm) -> Result<ZeroizingBuf, CliE
     let accepted = match form {
         SecretForm::Key32 => secret.0.len() == 32,
         SecretForm::HexSeed => BIP32_SEED_BYTES.contains(&secret.0.len()),
+        SecretForm::ExtendedKey => secret.0.len() == 64,
+        SecretForm::Ed25519ExtendedKey => secret.0.len() == 96,
     };
     if !accepted {
         return Err(CliError::input(match form {
             SecretForm::Key32 => format!("legacy secret must be 32 bytes (got {})", secret.0.len()),
+            SecretForm::ExtendedKey => format!(
+                "extended private key must be an xprv/tprv string or 64 bytes, private key then chain code (got {})",
+                secret.0.len()
+            ),
+            SecretForm::Ed25519ExtendedKey => format!(
+                "BIP32-Ed25519 extended private key must be 96 bytes, k_L || k_R || chain code (got {})",
+                secret.0.len()
+            ),
             SecretForm::HexSeed => format!(
                 "BIP-32 seed must be {} to {} bytes (got {})",
                 BIP32_SEED_BYTES.start(),
@@ -634,6 +827,9 @@ const STATEMENT_OPTIONS: &[&str] = &[
     "kind",
     "legacy-secret",
     "path",
+    "root",
+    "hidden-path-depth",
+    "merkle-root",
     "target",
     "epoch",
     "domain-hex",
@@ -659,16 +855,76 @@ fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBu
         }
         (false, None) => Vec::new(),
     };
+    let options = SourceOptions {
+        extended_root: match args.get("root") {
+            None | Some("seed") => false,
+            Some("extended-key") => true,
+            Some(other) => {
+                return Err(CliError::usage(format!(
+                    "--root '{other}' is not 'seed' or 'extended-key'"
+                )));
+            }
+        },
+        hidden_depth: match args.get("hidden-path-depth") {
+            None => None,
+            Some(text) => Some(
+                text.parse::<u8>()
+                    .ok()
+                    .filter(|d| (1..=MAX_BIP32_DEPTH).contains(&usize::from(*d)))
+                    .ok_or_else(|| {
+                        CliError::usage(format!(
+                            "--hidden-path-depth must be 1 to {MAX_BIP32_DEPTH}"
+                        ))
+                    })?,
+            ),
+        },
+    };
+    if !kind.admits(options) {
+        return Err(CliError::usage(format!(
+            "--root extended-key applies to BIP-32 secp256k1 kinds and --hidden-path-depth to BIP-32 and SLIP-0010 kinds, not to --kind {}",
+            kind.name
+        )));
+    }
+    if options
+        .hidden_depth
+        .is_some_and(|d| path.len() > usize::from(d))
+    {
+        return Err(CliError::usage(
+            "--path is longer than --hidden-path-depth allows",
+        ));
+    }
+    let merkle_root = match (kind.script_tree(), args.get("merkle-root")) {
+        (true, Some(hex)) => Some(from_hex_exact::<32>(hex, "--merkle-root")?),
+        (true, None) => {
+            return Err(CliError::usage(format!(
+                "--kind {} requires --merkle-root (the script tree's root, 64 hex characters)",
+                kind.name
+            )));
+        }
+        (false, Some(_)) => {
+            return Err(CliError::usage(format!(
+                "--merkle-root does not apply to --kind {}",
+                kind.name
+            )));
+        }
+        (false, None) => None,
+    };
     let (target, target_text) = parse_target(args.require("target")?)?;
     let epoch = required_epoch(args)?;
     let domain = parse_domain(args)?;
-    let secret = read_legacy_secret(args.require("legacy-secret")?, kind.secret)?;
-    let witness = kind
-        .witness(&secret.0)
+    let secret = read_legacy_secret(args.require("legacy-secret")?, kind.secret_form(options))?;
+    let mut witness = kind
+        .witness(&secret.0, options)
         .ok_or_else(|| CliError::input("legacy secret has the wrong length for this kind"))?;
+    if options.hidden_depth.is_some() {
+        witness = witness.with_path(&path);
+    }
+    if let Some(root) = merkle_root {
+        witness = witness.with_merkle_root(root);
+    }
     let statement = OwnershipStatement::derive(
         kind.lock,
-        kind.key_source(path),
+        kind.key_source(path, options),
         &witness,
         pq_commitment(&target),
         domain,
@@ -709,9 +965,13 @@ fn claim(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, STATEMENT_OPTIONS, &["json", "help"])?;
     if args.flag("help") {
         println!(
-            "dregg-sig migrate claim --kind <{}> --legacy-secret <path> [--path <m/..>] --target <address> --epoch <n> [--domain-hex <64-hex>] [--out <path>] [--json]\n\n\
+            "dregg-sig migrate claim --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] --target <address> --epoch <n> [--domain-hex <64-hex>] [--out <path>] [--json]\n\n\
 Derive the statement a proof will be about: the legacy value, the nullifier of the legacy key\n\
-in the migration domain, and the commitment to the target address. Nothing secret is written.\n\n{}",
+in the migration domain, and the commitment to the target address. Nothing secret is written.\n\
+--root extended-key reads an extended private key (xprv/tprv, or 64 bytes of hex: private key\n\
+then chain code) instead of a master seed; sound only while no extended public key at or above\n\
+it has been exported. --hidden-path-depth <n> keeps --path out of the statement: only the bound\n\
+n is public. --merkle-root is the secret-side script tree root of a Taproot script-tree kind.\n\n{}",
             kind_names(),
             kinds_help()
         );
@@ -838,9 +1098,13 @@ fn prove(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, STATEMENT_OPTIONS, &["deterministic", "json", "help"])?;
     if args.flag("help") {
         println!(
-            "dregg-sig migrate prove --kind <{}> --legacy-secret <path> [--path <m/..>] --target <address> --epoch <n> [--domain-hex <64-hex>] --out <path> [--deterministic] [--json]\n\n\
+            "dregg-sig migrate prove --kind <{}> --legacy-secret <path> [--path <m/..>] [--root <seed|extended-key>] [--hidden-path-depth <n>] [--merkle-root <64-hex>] --target <address> --epoch <n> [--domain-hex <64-hex>] --out <path> [--deterministic] [--json]\n\n\
 Prove ownership of a legacy credential and bind it to --target, --epoch and the migration\n\
-domain. --deterministic derives the proof randomness from the secret and the statement.\n\n{}",
+domain. --deterministic derives the proof randomness from the secret and the statement.\n\
+--root extended-key reads an extended private key (xprv/tprv, or 64 bytes of hex: private key\n\
+then chain code) instead of a master seed; sound only while no extended public key at or above\n\
+it has been exported. --hidden-path-depth <n> keeps --path out of the statement: only the bound\n\
+n is public. --merkle-root is the secret-side script tree root of a Taproot script-tree kind.\n\n{}",
             kind_names(),
             kinds_help()
         );
@@ -1594,6 +1858,14 @@ mod tests {
                 let secret: Vec<u8> = match kind.secret {
                     SecretForm::Key32 => (1..=32).collect(),
                     SecretForm::HexSeed => (1..=16).collect(),
+                    SecretForm::ExtendedKey => (1..=64).collect(),
+                    SecretForm::Ed25519ExtendedKey => {
+                        // k_L clamped as the scheme requires of a root key.
+                        let mut key: Vec<u8> = (1..=96).collect();
+                        key[0] &= 0xf8;
+                        key[31] = (key[31] & 0x1f) | 0x40;
+                        key
+                    }
                 };
                 let path = if kind.source == Source::Slip10 {
                     parse_path("m/44'/501'").unwrap()
@@ -1602,10 +1874,13 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                let witness = kind.witness(&secret).unwrap();
+                let mut witness = kind.witness(&secret, SourceOptions::default()).unwrap();
+                if kind.script_tree() {
+                    witness = witness.with_merkle_root([0x5a; 32]);
+                }
                 let statement = OwnershipStatement::derive(
                     kind.lock,
-                    kind.key_source(path),
+                    kind.key_source(path, SourceOptions::default()),
                     &witness,
                     pq_commitment(&target()),
                     [9; 32],
@@ -1627,7 +1902,10 @@ mod tests {
                 kind.name
             );
             assert_eq!(kind.render(&statement)[0].0, kind.member, "{}", kind.name);
-            assert_eq!(kind.render(&statement).len(), 1 + usize::from(kind.derivation_path()));
+            assert_eq!(
+                kind.render(&statement).len(),
+                1 + usize::from(kind.derivation_path())
+            );
             assert!(std::ptr::eq(kind_by_name(kind.name).unwrap(), kind));
             names.push(kind.name);
             for alias in kind.aliases {
@@ -1637,11 +1915,7 @@ mod tests {
             // No other entry claims this statement.
             let claimed = KINDS
                 .iter()
-                .filter(|other| {
-                    other.lock == statement.lock
-                        && other.key_source(public_path(&statement.source).unwrap_or(&[]).to_vec())
-                            == statement.source
-                })
+                .filter(|other| other.lock == statement.lock && other.offers(&statement.source))
                 .count();
             assert_eq!(claimed, 1, "{}", kind.name);
         }
@@ -1654,6 +1928,107 @@ mod tests {
             "kind names and aliases must be distinct"
         );
         assert!(kind_by_name("btc-p2wsh").is_err());
+    }
+
+    #[test]
+    fn roots_and_hidden_paths_are_options_of_a_kind_and_render() {
+        let kind = kind_by_name("bip32-secp256k1").unwrap();
+        let path = parse_path("m/44'/0'/0'/0/0").unwrap();
+        let node: Vec<u8> = (1..=64).collect();
+        let seed: Vec<u8> = (1..=16).collect();
+        let derive = |options: SourceOptions, secret: &[u8]| {
+            let mut witness = kind.witness(secret, options).unwrap();
+            if options.hidden_depth.is_some() {
+                witness = witness.with_path(&path);
+            }
+            OwnershipStatement::derive(
+                kind.lock,
+                kind.key_source(path.clone(), options),
+                &witness,
+                pq_commitment(&target()),
+                [9; 32],
+                3,
+            )
+            .unwrap()
+        };
+        let names = |statement: &OwnershipStatement| -> Vec<&'static str> {
+            kind.render(statement)
+                .iter()
+                .map(|(name, _)| *name)
+                .collect()
+        };
+        let public = derive(SourceOptions::default(), &seed);
+        let hidden = derive(
+            SourceOptions {
+                extended_root: false,
+                hidden_depth: Some(6),
+            },
+            &seed,
+        );
+        let extended = derive(
+            SourceOptions {
+                extended_root: true,
+                hidden_depth: None,
+            },
+            &node,
+        );
+        assert_eq!(names(&public), ["legacy_hash160", "derivation_path"]);
+        assert_eq!(names(&hidden), ["legacy_hash160", "hidden_path_max_depth"]);
+        assert_eq!(
+            names(&extended),
+            ["legacy_hash160", "bip32_root", "derivation_path"]
+        );
+        // Same seed and path: the same credential, whether or not the path is public.
+        assert_eq!(public.credential, hidden.credential);
+        assert_ne!(public.to_bytes(), hidden.to_bytes());
+        assert_ne!(public.credential, extended.credential);
+        for statement in [&public, &hidden, &extended] {
+            assert!(std::ptr::eq(kind_of(statement).unwrap(), kind));
+            let text = target().encode().unwrap();
+            let doc = document(CLAIM_FORMAT, statement_members(statement, &text));
+            assert_eq!(
+                load_statement(&doc, CLAIM_FORMAT, &[]).unwrap().statement,
+                *statement
+            );
+        }
+        // Options a kind does not take.
+        let key = kind_by_name("eth-eoa").unwrap();
+        assert!(!key.admits(SourceOptions {
+            extended_root: true,
+            hidden_depth: None
+        }));
+        assert!(
+            !kind_by_name("bip32-ed25519")
+                .unwrap()
+                .admits(SourceOptions {
+                    extended_root: false,
+                    hidden_depth: Some(3)
+                })
+        );
+    }
+
+    #[test]
+    fn extended_private_keys_parse_bip32_test_vector_1_and_reject_damage() {
+        // BIP-32 test vector 1, chain m.
+        let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+        let node = parse_extended_private_key(xprv).unwrap();
+        assert_eq!(
+            to_hex(&node.0[..32]),
+            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35"
+        );
+        assert_eq!(
+            to_hex(&node.0[32..]),
+            "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508"
+        );
+        // The matching extended public key is not a private key.
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        assert!(parse_extended_private_key(xpub).is_err());
+        let mut damaged = xprv.to_owned();
+        damaged.replace_range(40..41, if &xprv[40..41] == "2" { "3" } else { "2" });
+        assert!(parse_extended_private_key(&damaged).is_err());
+        assert!(parse_extended_private_key(&xprv[..110]).is_err());
+        assert!(parse_extended_private_key(&format!("1{xprv}")).is_err());
+        assert!(parse_extended_private_key("xprv0OIl").is_err());
     }
 
     #[test]

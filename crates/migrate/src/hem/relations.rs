@@ -200,7 +200,7 @@ pub enum Credential {
 }
 
 /// Registry-wide identifier of a credential of type `tag` with on-chain bytes `value`.
-/// Tags 1 to 4 are those of `LegacyCommitmentKind`.
+/// The tags are [`Credential::tag`]; they are part of the registry's on-disk format.
 pub fn credential_identifier(tag: u8, value: &[u8]) -> [u8; 32] {
     cshake256_framed_32(b"QSAG.MIGRATE.REGISTRY.LEGACY.V1", &[&[tag], value])
 }

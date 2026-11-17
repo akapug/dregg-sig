@@ -22,9 +22,7 @@ extern crate std;
 
 pub mod ed25519_ct;
 pub mod hem;
-pub mod legacy;
 pub mod secp256k1_ct;
-pub mod zk_engine;
 
 // The general-quorum engine below lost its only caller when the old distributed prover
 // was removed. Its public surface is the preprocessing ceremony and the share types; the
@@ -49,7 +47,6 @@ pub mod threshold_prep;
 
 #[cfg(test)]
 pub(crate) use custody_share::CoZkCustodianShare;
-pub use legacy::LegacyCommitmentKind;
 pub use threshold_mpc::{
     poly0x11b_to_t3_byte_ct, poly0x11b_to_t3_bytes32_ct, t3_to_poly0x11b_byte_ct,
     t3_to_poly0x11b_bytes32_ct,

@@ -26,6 +26,7 @@ dregg-sig-quorum = { path = "../crates/quorum", features = ["std"] }
 dregg-sig-cred = { path = "../crates/cred", features = ["std"] }
 dregg-sig-policy = { path = "../crates/policy", features = ["std"] }
 dregg-sig-addr = { path = "../crates/addr", features = ["std"] }
+dregg-sig-migrate = { path = "../crates/migrate", features = ["std"] }
 
 # Independent reference implementations for differential fuzzing.
 sha3 = "0.10"
@@ -87,6 +88,13 @@ bench = false
 [[bin]]
 name = "fuzz_policy_tokens"
 path = "fuzz_targets/fuzz_policy_tokens.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_migrate_ownership"
+path = "fuzz_targets/fuzz_migrate_ownership.rs"
 test = false
 doc = false
 bench = false
