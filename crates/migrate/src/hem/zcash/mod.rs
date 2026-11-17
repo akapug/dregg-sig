@@ -3,7 +3,7 @@
 //!
 //! # What is implemented, against which protocol
 //!
-//! * Zcash protocol specification **v2026.9.0 [NU7]** (NU6.3 active on mainnet from
+//! * Zcash protocol specification **v2026.9.0 \[NU7\]** (NU6.3 active on mainnet from
 //!   height 3,428,143, 28 July 2026; NU7 from 3,543,405, 6 November 2026).
 //! * **ZIP 2005 "Ironwood Quantum Recoverability"** (status Final; activation with
 //!   NU6.3 by ZIP 258; the Ironwood pool and its note commitment tree and nullifier set
@@ -178,24 +178,27 @@
 //!
 //! # Size and time
 //!
-//! hbox (i9-12900, 22 threads used), regime 4 (`BciksJohnsonQrom128`), release build:
+//! hbox (i9-12900, 22 hardware threads), regime 4 (`BciksJohnsonQrom128`), release build,
+//! one run:
 //!
 //! ```text
-//! HEM_ZCASH statement="orchard-address SpendingKey" regime=4 rows=1045419 padded_rows=2^20 vars=1028162 public_inputs=766 cells=2^21 synth_s=4.23 prove_s=8.43 verify_cold_s=4.52 verify_warm_ms=186.4 proof_bytes=881525 proof_kib=860.9 peak_rss_mib=2712
-//! HEM_ZCASH statement="orchard-address Zip32Seed { seed_len: 32, coin_type: 133, account: 0 }" regime=4 rows=1244645 padded_rows=2^21 vars=1224334 public_inputs=766 cells=2^22 synth_s=5.45 prove_s=12.98 verify_cold_s=5.93 verify_warm_ms=480.0 proof_bytes=924541 proof_kib=902.9 peak_rss_mib=5287
-//! HEM_ZCASH statement="orchard-address QuantumSpendingKey" regime=4 rows=921722 padded_rows=2^20 vars=906229 public_inputs=766 cells=2^21 synth_s=3.20 prove_s=6.57 verify_cold_s=2.97 verify_warm_ms=159.2 proof_bytes=882101 proof_kib=861.4 peak_rss_mib=5287
-//! HEM_ZCASH statement="ironwood-note SpendingKey" regime=4 rows=2593512 padded_rows=2^22 vars=2551000 public_inputs=831 cells=2^23 synth_s=12.52 prove_s=28.35 verify_cold_s=11.24 verify_warm_ms=1285.4 proof_bytes=950750 proof_kib=928.5 peak_rss_mib=11183
-//! HEM_ZCASH statement="ironwood-note Zip32Seed { seed_len: 32, coin_type: 133, account: 0 }" regime=4 rows=2792738 padded_rows=2^22 vars=2747172 public_inputs=831 cells=2^23 synth_s=12.15 prove_s=30.55 verify_cold_s=13.33 verify_warm_ms=884.7 proof_bytes=951646 proof_kib=929.3 peak_rss_mib=13238
-//! HEM_ZCASH statement="ironwood-note QuantumSpendingKey" regime=4 rows=2469801 padded_rows=2^22 vars=2429053 public_inputs=831 cells=2^23 synth_s=10.00 prove_s=27.98 verify_cold_s=12.47 verify_warm_ms=1685.4 proof_bytes=950334 proof_kib=928.1 peak_rss_mib=14084
-//! HEM_ZCASH statement="transparent-p2pkh seed m/44'/133'/0'/0/3" regime=4 padded_rows=2^21 vars=1094009 prove_s=6.54 verify_warm_ms=1386.6 proof_bytes=923581
+//! HEM_ZCASH statement="orchard-address SpendingKey" regime=4 rows=1045419 padded_rows=2^20 vars=1028162 public_inputs=766 cells=2^21 synth_s=5.26 prove_s=9.16 verify_cold_s=4.52 verify_warm_ms=376.3 proof_bytes=881077 proof_kib=860.4 peak_rss_mib=2755
+//! HEM_ZCASH statement="orchard-address Zip32Seed { seed_len: 32, coin_type: 133, account: 0 }" regime=4 rows=1244645 padded_rows=2^21 vars=1224334 public_inputs=766 cells=2^22 synth_s=7.26 prove_s=15.63 verify_cold_s=6.46 verify_warm_ms=624.8 proof_bytes=924093 proof_kib=902.4 peak_rss_mib=5347
+//! HEM_ZCASH statement="orchard-address QuantumSpendingKey" regime=4 rows=921722 padded_rows=2^20 vars=906229 public_inputs=766 cells=2^21 synth_s=3.16 prove_s=8.10 verify_cold_s=3.56 verify_warm_ms=382.0 proof_bytes=882677 proof_kib=862.0 peak_rss_mib=5347
+//! HEM_ZCASH statement="ironwood-note SpendingKey" regime=4 rows=2593512 padded_rows=2^22 vars=2551000 public_inputs=831 cells=2^23 synth_s=15.22 prove_s=31.89 verify_cold_s=14.23 verify_warm_ms=916.7 proof_bytes=949854 proof_kib=927.6 peak_rss_mib=11235
+//! HEM_ZCASH statement="ironwood-note Zip32Seed { seed_len: 32, coin_type: 133, account: 0 }" regime=4 rows=2792738 padded_rows=2^22 vars=2747172 public_inputs=831 cells=2^23 synth_s=16.01 prove_s=28.68 verify_cold_s=12.99 verify_warm_ms=808.2 proof_bytes=951166 proof_kib=928.9 peak_rss_mib=13245
+//! HEM_ZCASH statement="ironwood-note QuantumSpendingKey" regime=4 rows=2469801 padded_rows=2^22 vars=2429053 public_inputs=831 cells=2^23 synth_s=9.40 prove_s=23.87 verify_cold_s=9.68 verify_warm_ms=715.0 proof_bytes=950110 proof_kib=927.8 peak_rss_mib=14089
+//! HEM_ZCASH statement="transparent-p2pkh seed m/44'/133'/0'/0/3" regime=4 padded_rows=2^21 vars=1091619 prove_s=7.66 verify_warm_ms=187.1 proof_bytes=924252
 //! ```
 //!
 //! `verify_cold_s` includes building the relation, which a verifier does once per key
 //! source; `peak_rss_mib` is the process high-water mark and accumulates over the run.
-//! Rows of the note relation by part (spending-key source): seven BLAKE2b compressions
-//! 357,000; the 33 BLAKE2s compressions of the leaf and path 700,000; `[ivk] g_d`
-//! 611,000; the two Sinsemilla commitments (160 chunks) 470,000; Poseidon 236,000; five
-//! fixed-base multiplications 214,000.
+//! Rows of the note relation by part (spending-key source), approximately: seven
+//! BLAKE2b compressions 357,000; the 33 BLAKE2s compressions of the leaf and path
+//! 700,000; `[ivk] g_d` 611,000; the two Sinsemilla commitments (160 chunks) 470,000;
+//! Poseidon 236,000; five fixed-base multiplications 214,000. The address relation with
+//! a spending key is 1,045,419 rows, 0.3 % under `2^20`: a gadget that grows by a few
+//! thousand rows doubles its table.
 //!
 //! # Modules
 //!

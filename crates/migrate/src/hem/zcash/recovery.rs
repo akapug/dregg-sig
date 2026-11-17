@@ -683,7 +683,8 @@ pub struct RecoveryWitness {
     pub key: KeyWitness,
     /// Whether the note was sent to the internal (change) incoming viewing key.
     pub internal: bool,
-    /// The spend authorization randomizer, a canonical scalar. Uniform and secret.
+    /// The spend authorization randomizer, a canonical nonzero scalar. Uniform and
+    /// secret.
     pub alpha: [u8; 32],
     /// The note. Its version must be [`NoteVersion::V3`].
     pub note: Note,
@@ -732,7 +733,8 @@ fn evaluate_note(source: &KeySource, w: &RecoveryWitness) -> Option<NoteEvaluati
     let leaf = rehash::leaf_hash(&cmx.to_bytes(), &w.note.rho.to_bytes());
     let anchor = rehash::root_from_path(&leaf, w.position, &w.path);
     let nullifier = orchard::derive_nullifier(&keys.fvk.nk, &w.note.rho, &w.note.psi(), &cm);
-    let alpha = Fq::from_bytes(&w.alpha)?;
+    // The relation computes `[alpha] G` and `ak^P + [alpha] G` in affine coordinates.
+    let alpha = Fq::from_bytes(&w.alpha).filter(|a| !a.is_zero())?;
     let rk = keys.ak_point.add(&orchard::spend_auth_base().mul(&alpha));
     if rk.is_identity() {
         return None;
@@ -1499,9 +1501,11 @@ mod tests {
         let mut w = good.clone();
         w.note.version = NoteVersion::V2;
         assert!(derive(&w).is_none());
-        // A randomizer that is not a canonical scalar.
+        // A randomizer that is not a canonical scalar, and the zero randomizer.
         let mut w = good.clone();
         w.alpha = [0xff; 32];
+        assert!(derive(&w).is_none());
+        w.alpha = [0; 32];
         assert!(derive(&w).is_none());
         // A witness of the wrong kind, a seed of the wrong length.
         assert!(

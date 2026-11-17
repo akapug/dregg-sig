@@ -547,7 +547,7 @@ fn var_base_offset() -> Fq {
 /// Boolean bits of a scalar `k` (any 255-bit representative of its residue modulo `q`).
 ///
 /// The prover supplies `s = k - c (mod q)` with `c` the constant of
-/// [`var_base_offset`], and the gadget computes `[2 * 8^85 + sum_j (s_j + 1) 8^j] g` with
+/// `var_base_offset`, and the gadget computes `[2 * 8^85 + sum_j (s_j + 1) 8^j] g` with
 /// `s_j` the base-8 digits of `s`: a Horner chain from `2 g` over a table of
 /// `g, 2 g, .., 8 g`, with no zero digit. The integer in brackets is `s + c`, congruent to
 /// `k`. Every addition of the chain enforces distinct `x`.

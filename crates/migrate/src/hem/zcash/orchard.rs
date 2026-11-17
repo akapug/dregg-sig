@@ -1,7 +1,7 @@
 //! The Orchard protocol natively: key components, addresses, notes, note commitments,
 //! nullifiers, the note commitment tree, ZIP 32 derivation and RedPallas signatures.
 //!
-//! Section numbers refer to the Zcash protocol specification v2026.9.0 [NU7]
+//! Section numbers refer to the Zcash protocol specification v2026.9.0 \[NU7\]
 //! (`paperbin/zcash-protocol-spec-v2026.9.0-nu7`); "ZIP 2005" is "Ironwood Quantum
 //! Recoverability" (status Final, activated with NU6.3;
 //! `paperbin/zcash-zip-2005-ironwood-quantum-recoverability`).
