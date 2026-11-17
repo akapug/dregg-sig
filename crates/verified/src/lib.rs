@@ -6,11 +6,13 @@
 #![forbid(unsafe_code)]
 // Charon + Aeneas `0-FunsExternal` MIR extraction intentionally uses explicit `match`/branch/scalar
 // forms instead of `Try::branch` (`?`), closure `Option::map`, or `core::num::is_multiple_of`.
+// Permit and grant types carry a private unit field so that only this crate can construct them.
 #![allow(
     clippy::collapsible_if,
     clippy::if_same_then_else,
     clippy::manual_is_multiple_of,
     clippy::manual_map,
+    clippy::manual_non_exhaustive,
     clippy::needless_bool,
     clippy::question_mark,
     clippy::too_many_arguments
