@@ -30,7 +30,7 @@
 
 use alloc::vec::Vec;
 
-use super::protocol::{COL_DEGREE, ROW_DEGREE};
+use super::protocol::{COL_DEGREE, COL_MASK_BITS, COMPANIONS, ROW_DEGREE, ROW_MASK_BITS};
 use crate::pcs::{MAX_PCS_NUM_VARS, WhirSecurityRegime};
 
 /// A lower bound on `-log2` of a probability, in thousandths of a bit.
@@ -45,11 +45,8 @@ pub const CHALLENGE_SET_MILLIBITS: MilliBits = 255_998;
 /// `pcs/affine_schedule.rs` certify.
 pub const STAGE_LIST_CAP: u128 = 2000;
 
-/// Cell-layout constants of [`super::protocol::Layout`] (`ROW_MASK_BITS`, `COL_MASK_BITS`,
-/// companions). `layout_matches_the_protocol` pins them against the protocol.
-const ROW_MASK_BITS: usize = 4;
-const COL_MASK_BITS: usize = 2;
-const TABLES: usize = 5;
+/// Committed tables: the assignment table and its companions.
+const TABLES: usize = 1 + COMPANIONS;
 
 /// `log2(320)` rounded up: the constant `4 * 80` of `[CDHZ25]` Theorems A.1 and 6.9.
 const QROM_RBR_CONST: MilliBits = 8_322;

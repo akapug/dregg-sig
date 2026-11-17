@@ -136,7 +136,7 @@ pub fn legacy_identifier(commitment: &LegacyCommitmentKind) -> [u8; 32] {
         LegacyCommitmentKind::EthereumKeccak20(e) => (3, e),
         LegacyCommitmentKind::Slip0010Ed25519(s) => (4, s),
     };
-    cshake256_framed_32(b"QSAG.MIGRATE.REGISTRY.LEGACY.V1", &[&[tag], bytes])
+    super::relations::credential_identifier(tag, bytes)
 }
 
 /// Commitment to every field of the target address (prefix, version, suite, key kind
@@ -1085,6 +1085,79 @@ mod tests {
             NullifierRegistry::create(&dir.0, KEY),
             Err(RegistryError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists
         ));
+    }
+
+    /// One on-chain credential has one identifier whichever statement migrates it, and
+    /// the second statement kind to arrive is refused by that identifier.
+    #[test]
+    fn a_credential_migrates_once_across_statement_kinds() {
+        use crate::hem::relations::{
+            Bip32Root, Credential, KeySource, Lock, OwnershipStatement, OwnershipWitness, PathSpec,
+            bip32_derive,
+        };
+        let seed = [0x42u8; 32];
+        let path = vec![0x8000_002c, 3];
+        let leaf = bip32_derive(&seed, &path).unwrap();
+        let derive = |lock, source, witness: &OwnershipWitness| {
+            OwnershipStatement::derive(lock, source, witness, [9; 32], [0xd0; 32], 7).unwrap()
+        };
+        let bip32 = || KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Public(path.clone()),
+        };
+        let key = OwnershipWitness::secp256k1_key(&leaf.private_key);
+        let hidden = derive(Lock::Ethereum, KeySource::Secp256k1Key, &key);
+        let seeded = derive(Lock::Ethereum, bip32(), &OwnershipWitness::seed(&seed));
+        let other_lock = derive(Lock::P2pkh, bip32(), &OwnershipWitness::seed(&seed));
+
+        // Same address, same identifier; the nullifiers differ by design.
+        assert_eq!(hidden.credential, seeded.credential);
+        assert_eq!(hidden.binding().legacy_id, seeded.binding().legacy_id);
+        assert_ne!(hidden.nullifier, seeded.nullifier);
+        assert_eq!(hidden.binding().exposure, KeyExposure::Hidden);
+        assert_eq!(seeded.binding().exposure, KeyExposure::Revealed);
+        // Another credential of the same key is another identifier.
+        assert_ne!(other_lock.binding().legacy_id, seeded.binding().legacy_id);
+
+        // The identifiers of the four older kinds are unchanged, the new one is its own.
+        let Credential::EthereumAddress(address) = seeded.credential else {
+            panic!("an Ethereum lock yields an address");
+        };
+        assert_eq!(
+            legacy_identifier(&LegacyCommitmentKind::EthereumKeccak20(address)),
+            seeded.credential.identifier()
+        );
+        assert_eq!(
+            legacy_identifier(&LegacyCommitmentKind::BitcoinHash160(address)),
+            Credential::BitcoinKeyHash(address).identifier()
+        );
+        assert_eq!(
+            legacy_identifier(&LegacyCommitmentKind::BitcoinTaprootXOnly([5; 32])),
+            Credential::BitcoinTaproot([5; 32]).identifier()
+        );
+        assert_eq!(
+            legacy_identifier(&LegacyCommitmentKind::Slip0010Ed25519([5; 32])),
+            Credential::Ed25519Key([5; 32]).identifier()
+        );
+        let ids = [
+            Credential::BitcoinKeyHash(address).identifier(),
+            Credential::EthereumAddress(address).identifier(),
+            Credential::BitcoinScriptHash(address).identifier(),
+        ];
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+
+        for (first, second) in [(&seeded, &hidden), (&hidden, &seeded)] {
+            let dir = TempDir::new("kinds");
+            let mut registry = NullifierRegistry::create(&dir.0, KEY).unwrap();
+            registry.register(&first.binding()).unwrap();
+            assert!(matches!(
+                registry.register(&second.binding()),
+                Err(RegistryError::LegacyConflict)
+            ));
+            // The key's other credential is free to migrate.
+            registry.register(&other_lock.binding()).unwrap();
+            assert_eq!(registry.bindings(), 2);
+        }
     }
 
     #[test]

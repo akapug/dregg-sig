@@ -16,12 +16,15 @@ Papers are named by their file in `/Users/ember/paperbin` on first use.
 ## 0. Verdicts
 
 **FAILED as shipped, fixed on this branch: one seed used under two regimes leaked
-the witness.** `prove` derived its coins from the seed, the relation, the statement and
-the witness, but not from the regime. The regime's schedule is bound into the transcript,
-so the two proofs have different challenges and the same masks. The twelve masking
-variables then cover `(Az, Bz, Cz)` at two different row points: twenty-four base-field
-equations in twelve unknowns, which determine twelve base-field linear functionals of
-the witness. The same holds for every other mask. `prove` now absorbs the schedule into
+linear functionals of the witness.** `prove` derived its coins from the seed, the
+relation, the statement and the witness, but not from the regime. The regime's schedule
+is bound into the transcript, so the two proofs have different challenges and the same
+masks. The twelve masking variables then cover `(Az, Bz, Cz)` at two different row
+points: twenty-four base-field equations in twelve unknowns, which reveal at least
+twelve base-field linear functionals of the witness, enough to confirm a guessed
+witness. The sumcheck masks and the companions repeat as well. The attack needs the
+caller to reuse a seed, which the documentation forbade only across "different proofs"
+while promising that a repeated seed was harmless. `prove` now absorbs the schedule into
 the coin derivation; `zk_hem::bounds::tests::coins_do_not_repeat_across_regimes` fails
 on the previous code (equal `row_mask_sum` in both proofs).
 
@@ -63,14 +66,14 @@ What holds:
 
 `p = 2^64 - 2^32 + 1`, `E = F_{p^4}`. A relation has `2^n` rows (`log_rows = n`) and a
 variable subcube of `2^k` cells (`var_bits = k`). The prover commits five base-field
-tables of `N = 2^l` cells (`Layout::new`, protocol.rs:106): the assignment table `Z`
-(variables, twelve masking variables, the sumcheck masks `g1`, `g2`, and `blind_cells`
-uniform cells at the top) and four uniform companions `C_0..C_3`. Their Reed-Solomon
+tables of `N = 2^l` cells (`Layout::new`, protocol.rs:108 at this commit): the
+assignment table `Z` (variables, twelve masking variables, the sumcheck masks `g1`,
+`g2`, and `blind_cells` uniform cells at the top) and four uniform companions `C_0..C_3`. Their Reed-Solomon
 codewords on a coset `D_0` of size `4N` share one Merkle tree whose leaf `g` holds fiber
 `g` (`2^{s_0}` points) of all five codewords and a 16-byte salt.
 
-Verifier rounds, in the order `verify` (protocol.rs:1381) and
-`whir_verify_core_claims` (pcs.rs:5776) replay them. Every challenge is drawn after the
+Verifier rounds, in the order `verify` (protocol.rs:1678) and
+`whir_verify_core_claims` (pcs.rs:6254) replay them. Every challenge is drawn after the
 listed prover messages were absorbed.
 
 | # | Prover message | Challenge | Grinding |
@@ -203,12 +206,16 @@ quadratic loss and the cubic Merkle term are tight.
 
 Where this protocol departs from the theorem's construction:
 
-- **D1 [model].** Construction 11.7 derives each challenge from the whole prefix. This
-  code chains a 256-bit state (`FiatShamirTranscript::absorb`, sponge.rs:2047). Without
-  a collision in the chain the two coincide; the bound adds `300 t^3 / 2^256` for a
-  collision (`2020-cfhl-compressed-oracle-technique-pq-proofs-sequential-work-2010.11658`
-  Theorem 5.29). That a collision-free chain can replace the full-prefix oracle inside
-  the quantum reduction is assumed, not proven here.
+- **D1 [model].** Construction 11.7 derives round `i`'s randomness from a separate
+  oracle applied to the instance and all commitments so far, and commits every prover
+  message. This code chains one 256-bit state through labelled absorptions
+  (`FiatShamirTranscript::absorb`, sponge.rs:2047) and absorbs short messages (round
+  polynomials, claims, out-of-domain values) in full instead of committing them, which
+  is the identity commitment with every position read. Without a collision in the chain
+  the challenge is a function of the whole prefix; the bound adds `300 t^3 / 2^256` for
+  a collision (`2020-cfhl-compressed-oracle-technique-pq-proofs-sequential-work-2010.11658`
+  Theorem 5.29). That a collision-free chain can stand for the per-round full-prefix
+  oracles inside the quantum reduction is assumed, not proven here.
 - **D2 [open].** No theorem on disk covers grinding against quantum queries. The proven
   bound gives it no credit. `SecurityReport::qrom_work_bits_crediting_grinding` reports
   the heuristic figure and is labelled as such.
@@ -379,8 +386,8 @@ What the leaves are, per regime:
 
 | Regimes | Stage-0 leaf | Later-stage leaf |
 | --- | --- | --- |
-| 4, 5, 6 (cSHAKE256) and 9, 10 (TurboSHAKE256) | 256-bit hash of tag, arity, table count, leaf index, **16-byte salt**, `5 * 2^{s_0}` field elements (pcs.rs:1632) | 256-bit hash of tag, stage, leaf index, `2^{s_i}` elements of `E`; no salt |
-| 7, 8 (Poseidon2) | four limbs; capacity `[leaf index, arity, table count, 0]`, rate: the same **16-byte salt** in three limbs, then the symbols (pcs.rs:2134) | four limbs; no salt |
+| 4, 5, 6 (cSHAKE256) and 9, 10 (TurboSHAKE256) | 256-bit hash of tag, arity, table count, leaf index, **16-byte salt**, `5 * 2^{s_0}` field elements (`hash_round0_leaf_mode`, pcs.rs:1633) | 256-bit hash of tag, stage, leaf index, `2^{s_i}` elements of `E`; no salt |
+| 7, 8 (Poseidon2) | four limbs; capacity `[leaf index, arity, table count, 0]`, rate: the same **16-byte salt** in three limbs, then the symbols (`poseidon2_round0_leaf`, pcs.rs:2135) | four limbs; no salt |
 
 Salts are `H(tag, salt_seed, leaf index)` truncated to 128 bits, with a 256-bit
 `salt_seed` from the coin stream.
@@ -407,6 +414,30 @@ linear functionals of `U` the proof reveals; the count leaves ample room (`N >= 
 unknowns) but no lemma here proves it. **No confirmation attack on a guessed witness is
 known**: a guess of the witness does not determine a leaf without `U` on that fiber and
 the salt.
+
+### 4.5 Split commitments (`ZkHemSplitProof`)
+
+Lane COLLAB's split proof replaces the Stage-0 root by one root per committer over
+additive shares of the five tables; every other message is that of the single-root
+proof for the summed tables (`verify_split`, `whir_verify_blend_split`), under a
+different relation tag. For the verifier's side:
+
+- *Soundness* [ours]. The extractor decodes each committer's word and sums them; the
+  list, the round-by-round errors and Theorems 2 and 3 are those of the summed word.
+  [CDHZ25] Theorem 8.3 is stated for a family of Merkle commitments, so more roots do
+  not change the form of the bound.
+- *Zero knowledge* [ours]. The verifier additionally sees each committer's share of the
+  opened symbols. If the shares of every table are uniform additive shares, all but one
+  committer's opened symbols are uniform (any `|Q| <= N` symbols of the codeword of a
+  uniform table are) and the last is fixed by the sum, to which Theorem 4 applies. One
+  committer with uniform blinding cells makes the summed blinders uniform, as Lemma 4.1
+  needs. Each committer's unopened leaves are salted with its own seed; the hiding bound
+  of section 4.4 holds with `P` counting committers times proofs.
+- The size model of `bounds.rs` covers single-root proofs. A split proof adds, per extra
+  committer, the Stage-0 part: `q_0 (16 + 40 * 2^{s_0})` bytes and one multiproof.
+
+Privacy of the committers against each other is the collaborative protocol's own
+property (`crates/migrate/SECURITY.md`) and is not analysed here.
 
 ## 5. Numbers
 
@@ -484,11 +515,11 @@ Costs are for tag 4 at `2^20` rows (896,644 bytes, 4,199 digests, 258 Stage-0 qu
 `bounds::tests::required_changes_are_costed`.
 
 **R1. Coins bind the schedule. Done on this branch** (protocol.rs, one line in
-`prove_with_claimed_publics`; the mirrored derivation in the migrate test
-`front_end_reproduces_the_messages_of_the_zk_hem_prover` gained the same line). Lane
-COLLAB's diff does not touch these lines. Any other prover that derives zk-Hem coins,
-including the collaborative front end, must absorb `layout.schedule.to_bytes()` after
-the relation digest. Cost: none. Proofs for a given seed change.
+`prove_with_claimed_publics`, on lines lane COLLAB did not change). Cost: none. Proofs
+for a given seed change; no test pinned them. The collaborative prover
+(`crates/migrate/src/hem/collab/engine.rs`, `Engine::new`) draws each party's masks from
+a per-run `local_seed` documented as never reused, and derives nothing from a reusable
+seed, so it needs no change.
 
 **R2. Stage-0 salts: 16 to 32 bytes.** `derive_round0_salt*` output length,
 `HemWhirOpeningProof::round0_salts: Vec<[u8; 32]>`, the leaf framings
