@@ -97,6 +97,65 @@
 //! products. Bit decompositions cannot be avoided in this row format: a range check is
 //! one row per bit and the bits are its witnesses.
 //!
+//! # Wanted from the constraint system: a range row type
+//!
+//! Within `a * b = c` rows a range check is one row per bit, and those rows are 59 % of a
+//! scalar multiplication (18,669 of 31,785 for secp256k1). Limb width, carry grouping,
+//! window width (10, 11 and 12 bits with last windows of 3 to 8 were measured; 11 and 6 is
+//! the minimum) and the table layout are at their optimum for this row format; what is left
+//! is the row format. The interface below is what this module would call. Nothing here
+//! depends on how the argument is realised (LogUp over the committed assignment is the
+//! obvious candidate); the counts are exact, from [`HintCount::range_lookups`].
+//!
+//! ```text
+//! impl ConstraintSystem {
+//!     /// Enforce `0 <= value < 256` as an integer, for the canonical representative of
+//!     /// the linear form. One lookup into the fixed table `{0, .., 255}`; no row.
+//!     pub fn enforce_byte(&mut self, value: &Lc);
+//!     /// How many lookups the relation holds (the cost metric beside `num_rows`).
+//!     pub fn num_lookups(&self) -> usize;
+//! }
+//! ```
+//!
+//! That single primitive is enough. A limb of `w < 8` bits is `enforce_byte(v)` and
+//! `enforce_byte(2^(8 - w) v)`; a carry in `[lo, lo + 2^n)` is the same on `carry - lo`,
+//! limb by limb. The soundness requirement is the one bit rows meet today: the looked-up
+//! value is a single field element, so `value < 256` must hold for the field element
+//! itself, with no reduction modulo anything smaller than the Goldilocks prime.
+//!
+//! Where the lookups go, per gadget (`alloc_bits` is the only caller that changes; bits
+//! stay as rows only where a consumer needs them: the scalar, and the two output
+//! coordinates that are hashed):
+//!
+//! | gadget | rows now | rows then | byte lookups |
+//! |---|---|---|---|
+//! | non-native multiplication | 440 | 64 | 121 |
+//! | secp256k1 fixed-base multiplication | 31,785 | about 13,650 | about 2,760 |
+//! | Ed25519 fixed-base multiplication | 32,066 | about 13,750 | about 2,780 |
+//! | BLS12-381 G1 fixed-base multiplication | 52,346 | about 18,050 | about 5,120 |
+//! | secp256k1 Taproot tweak (after the internal key) | 33,136 | about 14,050 | about 3,010 |
+//!
+//! "Rows then" keeps the 512 output bits (768 for BLS12-381) as rows. A secp256k1
+//! multiplication spends its lookups on 47 elements of 32 limbs (1,504), 48 quotients of
+//! 15 bits (144) and 312 carries of two to three limbs (1,178), less the 64 of the
+//! outputs that stay bits.
+//!
+//! A second primitive would remove most of what is left:
+//!
+//! ```text
+//!     /// Register a public table of `width`-tuples; returns its handle.
+//!     pub fn table(&mut self, width: usize, rows: Vec<F>) -> TableId;
+//!     /// Enforce that `tuple` is a row of the table. One lookup; no row.
+//!     pub fn enforce_in_table(&mut self, table: TableId, tuple: &[Lc]);
+//! ```
+//!
+//! A window lookup is then one tuple `(index, x limbs.., y chunks..)` of width 39 (55 for
+//! BLS12-381) into a table of 1,024 rows instead of 378 rows, and the same call with the
+//! table `{0, .., 255}` is `enforce_byte`. That brings a secp256k1 multiplication to about
+//! 5,300 rows, 23 tuple lookups and 2,760 byte lookups. The window tables hold 22,720
+//! points per curve; they are public and fixed, so they belong in the relation's digest
+//! like every other constant.
+//!
 //! # Witness handling
 //!
 //! Native arithmetic on witness values is branch-free with fixed iteration counts. Its
@@ -164,6 +223,15 @@ pub struct HintCount {
     pub carry_bits: usize,
     /// `inverse-or-zero` hints of constant comparisons and non-zero checks.
     pub zero_tests: usize,
+    /// 8-bit range lookups that would replace every bit row counted above, were a range
+    /// row type available (see "Wanted" in the module documentation): one per full limb,
+    /// and for a partial limb of `w` bits the cheaper of `w` bit rows and two lookups.
+    pub range_lookups: usize,
+}
+
+/// See [`HintCount::range_lookups`].
+fn range_lookups(bits: usize) -> usize {
+    bits / 8 + (bits % 8).min(2)
 }
 
 impl HintCount {
@@ -176,6 +244,7 @@ impl HintCount {
         self.carries += rhs.carries;
         self.carry_bits += rhs.carry_bits;
         self.zero_tests += rhs.zero_tests;
+        self.range_lookups += rhs.range_lookups;
     }
 
     /// All hint variables (bits and zero-test inverses).
@@ -965,6 +1034,7 @@ impl Element {
 fn alloc_int(cs: &mut Ctx, value_le: &[u8], nbits: usize) -> Element {
     cs.hints.elements += 1;
     cs.hints.element_bits += nbits;
+    cs.hints.range_lookups += range_lookups(nbits);
     alloc_bits(cs, value_le, nbits)
 }
 
@@ -1180,6 +1250,7 @@ fn enforce_zero_mod(cs: &mut Ctx, m: &Modulus, d: &Poly) -> Element {
     let q_bytes = wide_to_bytes(&wide_mul_lo(&numer, &m.pinv));
     cs.hints.quotients += 1;
     cs.hints.quotient_bits += qbits;
+    cs.hints.range_lookups += range_lookups(qbits);
     let q = alloc_bits(cs, &q_bytes, qbits);
     let qp = q.poly();
 
@@ -1269,6 +1340,7 @@ fn enforce_integer_zero(cs: &mut Ctx, e: &[Coef]) {
             let mut top = next.plus_const(f_int(-clo));
             cs.hints.carries += 1;
             cs.hints.carry_bits += nbits as usize;
+            cs.hints.range_lookups += range_lookups(nbits as usize);
             for k in 0..nbits - 1 {
                 let bit = cs.alloc(F::from_u64_reduced(((shifted >> k) & 1) as u64));
                 cs.enforce_boolean(&bit.into());
@@ -3634,7 +3706,14 @@ mod tests {
             let mut cs = ConstraintSystem::new();
             let mut metered = Metered::new(&mut cs, Options::default());
             build(&mut metered);
-            println!("hints {name}: {:?}", metered.hints);
+            let hints = metered.hints;
+            let rows = cs.num_rows();
+            let bit_rows = hints.element_bits + hints.quotient_bits + hints.carry_bits;
+            println!(
+                "hints {name}: {hints:?}; with a range row type: {} rows + {} lookups (now {rows} rows)",
+                rows - bit_rows,
+                hints.range_lookups,
+            );
         };
         hints("non-native mul", &|m| {
             let (ea, eb) = (

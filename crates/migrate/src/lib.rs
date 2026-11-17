@@ -21,9 +21,7 @@ extern crate std;
 
 pub mod ed25519_ct;
 pub mod hem;
-pub mod legacy;
 pub mod secp256k1_ct;
-pub mod zk_engine;
 
 #[allow(dead_code)]
 mod bls12_381;
@@ -32,5 +30,3 @@ mod limbs;
 #[allow(dead_code)]
 mod pallas;
 mod scalar;
-
-pub use legacy::LegacyCommitmentKind;

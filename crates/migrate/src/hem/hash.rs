@@ -19,6 +19,7 @@
 //! fold away, so padding and initial values add no rows. The row structure depends only on
 //! which inputs are constants, never on assigned values.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
@@ -347,7 +348,9 @@ impl Word {
         self.bits
             .iter()
             .enumerate()
-            .try_fold(0u64, |acc, (i, bit)| Some(acc | ((const_of(bit)? & 1) << i)))
+            .try_fold(0u64, |acc, (i, bit)| {
+                Some(acc | ((const_of(bit)? & 1) << i))
+            })
     }
 
     pub fn rotr(&self, n: usize) -> Self {
@@ -725,16 +728,24 @@ impl Sha2 {
             state.iter().chain(block).all(|x| x.width() == self.width),
             "word width"
         );
+        // The last two schedule words feed no later word, only their own round, so they
+        // are never decomposed: their four addends go into that round's sums.
         let mut w: Vec<Word> = block.to_vec();
+        let mut schedule: Vec<Vec<Word>> = block.iter().map(|x| vec![x.clone()]).collect();
         for t in 16..self.rounds {
             let s0 = self.sigma(cs, &w[t - 15], self.small0, true);
             let s1 = self.sigma(cs, &w[t - 2], self.small1, true);
-            let next = add_mod(cs, &[&s1, &w[t - 7], &s0, &w[t - 16]], &[]);
-            w.push(next);
+            if t + 2 < self.rounds {
+                let next = add_mod(cs, &[&s1, &w[t - 7], &s0, &w[t - 16]], &[]);
+                schedule.push(vec![next.clone()]);
+                w.push(next);
+            } else {
+                schedule.push(vec![s1, w[t - 7].clone(), s0, w[t - 16].clone()]);
+            }
         }
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state.clone();
-        for (t, wt) in w.iter().enumerate() {
+        for (t, wt) in schedule.iter().enumerate() {
             let s1 = self.sigma(cs, &e, self.big1, false);
             let choose = bitwise3(cs, &e, &f, &g, ch);
             let s0 = self.sigma(cs, &a, self.big0, false);
@@ -743,12 +754,12 @@ impl Sha2 {
             if t + 1 == self.rounds {
                 // The last round's `a` and `e` are used only by the feed-forward sum, so
                 // they are never decomposed on their own.
-                let out_a = add_mod(
-                    cs,
-                    &[&state[0], &h, &s1, &choose, &k, wt, &s0, &major],
-                    &[],
-                );
-                let out_e = add_mod(cs, &[&state[4], &d, &h, &s1, &choose, &k, wt], &[]);
+                let mut terms_a = vec![&state[0], &h, &s1, &choose, &k, &s0, &major];
+                terms_a.extend(wt);
+                let out_a = add_mod(cs, &terms_a, &[]);
+                let mut terms_e = vec![&state[4], &d, &h, &s1, &choose, &k];
+                terms_e.extend(wt);
+                let out_e = add_mod(cs, &terms_e, &[]);
                 return [
                     out_a,
                     add_mod(cs, &[&state[1], &a], &[]),
@@ -760,7 +771,9 @@ impl Sha2 {
                     add_mod(cs, &[&state[7], &g], &[]),
                 ];
             }
-            let new_e = add_mod(cs, &[&d, &h, &s1, &choose, &k, wt], &[]);
+            let mut terms_e = vec![&d, &h, &s1, &choose, &k];
+            terms_e.extend(wt);
+            let new_e = add_mod(cs, &terms_e, &[]);
             // `T1 + T2 = new_e - d + T2`: four addends instead of seven.
             let new_a = add_mod(cs, &[&new_e, &s0, &major], &[&d]);
             h = g;
@@ -1309,7 +1322,8 @@ mod tests {
         ] {
             for v in 0..8u64 {
                 let (x, y, z) = (v & 1, (v >> 1) & 1, (v >> 2) & 1);
-                let at = |co: &[i64; 4]| co[0] + co[1] * x as i64 + co[2] * y as i64 + co[3] * z as i64;
+                let at =
+                    |co: &[i64; 4]| co[0] + co[1] * x as i64 + co[2] * y as i64 + co[3] * z as i64;
                 let f = (g.f)(x, y, z) as i64;
                 assert!(f == 0 || f == 1);
                 // Nonzero small integers stay nonzero in the field, so `p` is unique.
@@ -1332,7 +1346,12 @@ mod tests {
                 assert!(shape.is_satisfied(&w));
                 // Variables 1..=3 are the inputs, 4 is the output.
                 assert_eq!(w[4], fu(f as u64));
-                for wrong in [fu(1 - f as u64), fu(2), F::ZERO - F::ONE, fu(1) - fu(2).inv()] {
+                for wrong in [
+                    fu(1 - f as u64),
+                    fu(2),
+                    F::ZERO - F::ONE,
+                    fu(1) - fu(2).inv(),
+                ] {
                     let mut bad = w.clone();
                     bad[4] = wrong;
                     assert!(!shape.is_satisfied(&bad), "{name} at {v}");
@@ -1504,25 +1523,26 @@ mod tests {
                             (0..n_plus).map(|i| pick(&mut cs, i, false)).collect();
                         let minus: Vec<(Word, u64)> =
                             (0..n_minus).map(|i| pick(&mut cs, i + 1, true)).collect();
-                        let want = plus
-                            .iter()
-                            .fold(0u64, |acc, (_, v)| acc.wrapping_add(*v));
-                        let want = minus
-                            .iter()
-                            .fold(want, |acc, (_, v)| acc.wrapping_sub(*v))
-                            & mask;
+                        let want = plus.iter().fold(0u64, |acc, (_, v)| acc.wrapping_add(*v));
+                        let want =
+                            minus.iter().fold(want, |acc, (_, v)| acc.wrapping_sub(*v)) & mask;
                         let before = cs.num_rows();
                         let p: Vec<&Word> = plus.iter().map(|(w, _)| w).collect();
                         let m: Vec<&Word> = minus.iter().map(|(w, _)| w).collect();
                         let sum = add_mod(&mut cs, &p, &m);
                         let added_rows = cs.num_rows() - before;
                         assert_eq!(sum.width(), width);
-                        assert_eq!(sum.value(&cs), want, "w{width} +{n_plus} -{n_minus} m{mode}");
+                        assert_eq!(
+                            sum.value(&cs),
+                            want,
+                            "w{width} +{n_plus} -{n_minus} m{mode}"
+                        );
                         let (shape, z) = cs.finish();
                         assert!(shape.is_satisfied(&z));
                         if added_rows > 0 {
                             // Every result and carry bit is pinned by the limb equation.
-                            let first = shape.mask_var_base - added_rows.min(shape.mask_var_base - 1);
+                            let first =
+                                shape.mask_var_base - added_rows.min(shape.mask_var_base - 1);
                             for i in first..shape.mask_var_base {
                                 let mut bad = z.clone();
                                 bad[i] = F::ONE - bad[i];
@@ -1666,9 +1686,16 @@ mod tests {
                 .collect();
             let out = select(&mut cs, &bits[0], &bits[1], &bits[2]);
             assert_eq!(cs.num_rows(), 4);
-            let want = if v & 1 == 1 { (v >> 1) & 1 } else { (v >> 2) & 1 };
+            let want = if v & 1 == 1 {
+                (v >> 1) & 1
+            } else {
+                (v >> 2) & 1
+            };
             assert_eq!(cs.eval(&out), fu(want));
-            assert_eq!(select(&mut cs, &Lc::constant(F::ONE), &bits[1], &bits[2]), bits[1]);
+            assert_eq!(
+                select(&mut cs, &Lc::constant(F::ONE), &bits[1], &bits[2]),
+                bits[1]
+            );
             assert_eq!(select(&mut cs, &Lc::zero(), &bits[1], &bits[2]), bits[2]);
             assert_eq!(cs.num_rows(), 4);
         }
@@ -1717,8 +1744,10 @@ mod tests {
         let reference = |m: &[u8]| native::sha512(m).to_vec();
         assert_eq!(
             reference(b"abc"),
-            hex("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
-                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+            hex(
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a
+                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+            )
         );
         check(&[b"abc"], &reference(b"abc"), |cs, i| sha512(cs, &i[0]));
         check_hash(sha512, reference, &[0, 1, 111, 112, 127, 128, 129]);
@@ -1825,9 +1854,11 @@ mod tests {
         }
         for (key_len, msg_len) in [(0, 0), (32, 55), (64, 56), (65, 1)] {
             let (key, msg) = (bytes(key_len, 11), bytes(msg_len, 12));
-            check(&[&key, &msg], &hmac_sha256_reference(&key, &msg), |cs, i| {
-                hmac_sha256(cs, &i[0], &i[1])
-            });
+            check(
+                &[&key, &msg],
+                &hmac_sha256_reference(&key, &msg),
+                |cs, i| hmac_sha256(cs, &i[0], &i[1]),
+            );
         }
     }
 

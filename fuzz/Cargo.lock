@@ -161,6 +161,7 @@ dependencies = [
  "dregg-sig-core",
  "dregg-sig-cred",
  "dregg-sig-fts",
+ "dregg-sig-migrate",
  "dregg-sig-policy",
  "dregg-sig-quorum",
  "ghash",
@@ -173,12 +174,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dregg-sig-migrate"
+version = "0.1.0"
+dependencies = [
+ "dregg-sig-accel",
+ "dregg-sig-addr",
+ "dregg-sig-agg",
+ "dregg-sig-asm",
+ "dregg-sig-core",
+]
+
+[[package]]
 name = "dregg-sig-policy"
 version = "0.1.0"
 dependencies = [
  "dregg-sig-accel",
  "dregg-sig-addr",
  "dregg-sig-asm",
+ "dregg-sig-core",
  "dregg-sig-fts",
  "dregg-sig-verified",
 ]
