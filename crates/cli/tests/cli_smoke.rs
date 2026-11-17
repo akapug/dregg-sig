@@ -258,6 +258,11 @@ fn help_info_and_usage_errors() {
         "GoldilocksExt4",
         "WHIR",
         "CanopyMultiProof",
+        "qsag-migration-proof-v2",
+        "\"kind\": \"btc-hash160\"",
+        "\"kind\": \"eth-eoa\"",
+        "\"kind\": \"ed25519\"",
+        "\"kind\": \"bip32-secp256k1\"",
     ] {
         assert!(info.contains(needle), "info lacks {needle}");
     }
@@ -269,6 +274,31 @@ fn help_info_and_usage_errors() {
 
     expect(&[], 1);
     expect(&["frobnicate"], 1);
+    let migrate_help = expect(&["migrate", "--help"], 0);
+    for needle in ["claim", "prove", "verify", "registry", "btc-hash160", "bip32-secp256k1"] {
+        assert!(migrate_help.contains(needle), "migrate --help lacks {needle}");
+    }
+    for sub in [
+        &["claim"][..],
+        &["commit"],
+        &["prove"],
+        &["verify"],
+        &["registry"],
+        &["registry", "init"],
+        &["registry", "register"],
+        &["registry", "enroll"],
+        &["registry", "finalize"],
+        &["registry", "lookup"],
+    ] {
+        let mut args = vec!["migrate"];
+        args.extend_from_slice(sub);
+        args.push("--help");
+        assert!(!expect(&args, 0).is_empty(), "{args:?}");
+    }
+    expect(&["migrate"], 1);
+    expect(&["migrate", "frobnicate"], 1);
+    expect(&["migrate", "registry"], 1);
+    expect(&["migrate", "registry", "frobnicate"], 1);
     expect(
         &[
             "keygen",
@@ -4652,6 +4682,26 @@ fn migrate_registry_records_each_credential_once() {
         json_member(&lookup("--statement", &unknown), "status"),
         "absent"
     );
+
+    // A proof file above a megabyte (BIP-32, five levels) registers and is found again.
+    let seed = key("seed.hex", "000102030405060708090a0b0c0d0e0f");
+    let deep = migrate_prove(
+        &dir,
+        "deep.json",
+        "bip32",
+        &seed,
+        &target,
+        "7",
+        &["--path", "m/44'/0'/0'/0/0"],
+    );
+    assert!(std::fs::metadata(&deep).unwrap().len() > 1 << 20);
+    run(
+        &["migrate", "registry", "register", "--proof", &deep, "--epoch", "7"],
+        0,
+    );
+    let found = lookup("--statement", &deep);
+    assert_eq!(json_member(&found, "status"), "finalized");
+    assert_eq!(json_member(&found, "key_exposure"), "revealed");
 
     // A sealed registry key needs its passphrase.
     let sealed = dir.path("sealed-registry");

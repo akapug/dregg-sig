@@ -211,6 +211,49 @@ fn kinds_help() -> String {
     out
 }
 
+/// The `migration` entry of `dregg-sig info --json`.
+pub fn info() -> Json {
+    Json::object(vec![
+        (
+            "proof_system",
+            Json::str(
+                "zk-Hem ownership relations over the Hem WHIR commitment; composed zero-knowledge and knowledge-soundness bounds are not established (crates/migrate/SECURITY.md)",
+            ),
+        ),
+        ("regime", Json::str(REGIME_NAME)),
+        ("claim_format", Json::str(CLAIM_FORMAT)),
+        ("proof_format", Json::str(PROOF_FORMAT)),
+        ("registry_format", Json::str(REGISTRY_FORMAT)),
+        (
+            "statement_kinds",
+            Json::Array(
+                KINDS
+                    .iter()
+                    .map(|kind| {
+                        Json::object(vec![
+                            ("kind", Json::str(kind.name)),
+                            (
+                                "aliases",
+                                Json::Array(kind.aliases.iter().map(|a| Json::str(*a)).collect()),
+                            ),
+                            ("statement", Json::str(kind.summary)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// The migration line of `dregg-sig info`.
+pub fn info_text() -> String {
+    let names: Vec<_> = KINDS.iter().map(|kind| kind.name).collect();
+    format!(
+        "migration: zk-Hem ownership proofs ({REGIME_NAME}) for {}; one-way registry\n",
+        names.join(", ")
+    )
+}
+
 fn kind_names() -> String {
     let names: Vec<_> = KINDS.iter().map(|kind| kind.name).collect();
     names.join("|")
@@ -741,13 +784,18 @@ impl Expectation {
     }
 }
 
+/// Parse a claim or proof file. A file that cannot be opened is an I/O error; anything
+/// wrong with its content is returned as text for the caller to classify.
+fn read_document(path: &str) -> Result<Result<Json, String>, CliError> {
+    let raw = read_bounded_file(path, MAX_SIG_PROOF_BYTES)?;
+    Ok(std::str::from_utf8(&raw.0)
+        .map_err(|_| format!("{path} is not UTF-8"))
+        .and_then(|text| Json::parse(text).map_err(|e| format!("{path}: {e}"))))
+}
+
 /// Read a proof file and verify it. Every failure is exit code 2.
 fn load_verified(path: &str, expected: &Expectation) -> Result<LoadedStatement, CliError> {
-    let raw = read_bounded_file(path, MAX_SIG_PROOF_BYTES)?;
-    let text = std::str::from_utf8(&raw.0)
-        .map_err(|_| CliError::verify("migration proof file is not UTF-8"))?;
-    let json = Json::parse(text)
-        .map_err(|e| CliError::verify(format!("malformed migration proof file: {e}")))?;
+    let json = read_document(path)?.map_err(CliError::verify)?;
     let loaded = load_statement(&json, PROOF_FORMAT, &["regime", "proof_bytes", "proof"])
         .map_err(|e| CliError::verify(format!("{path}: {e}")))?;
     let statement = &loaded.statement;
@@ -1269,7 +1317,7 @@ binding is recorded; the output says `absent` when none is.\n\n{REGISTRY_HELP}"
         [Some(hex), _, _] => (Some(from_hex_exact::<32>(hex, "--nullifier")?), None),
         [_, Some(hex), _] => (None, Some(from_hex_exact::<32>(hex, "--legacy-id")?)),
         [_, _, Some(path)] => {
-            let json = Json::parse(&read_text(path)?)?;
+            let json = read_document(path)?.map_err(CliError::input)?;
             let loaded = load_statement(&json, CLAIM_FORMAT, &[])
                 .or_else(|_| {
                     load_statement(&json, PROOF_FORMAT, &["regime", "proof_bytes", "proof"])
@@ -1559,6 +1607,24 @@ mod tests {
             assert!(parse_path(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse_path("m/0/1/2/3/4/5/6/7/8/9").unwrap().len(), 10);
+    }
+
+    #[test]
+    fn registry_keys_are_separated_by_purpose_and_by_anchoring() {
+        let seed = Secret32::new([3; 32]);
+        let keys = [
+            log_key(&seed, true).0,
+            log_key(&seed, false).0,
+            registry_secret(&seed, b"anchor mac").0,
+            registry_secret(&seed, b"identifier").0,
+            log_key(&Secret32::new([4; 32]), true).0,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_ne!(registry_id(&seed, &[1; 16]), registry_id(&seed, &[2; 16]));
     }
 
     /// The bound must hold for every kind, and must be a bound on this statement's
