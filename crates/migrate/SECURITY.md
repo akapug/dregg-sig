@@ -162,20 +162,36 @@ shape cached):
 
 | Statement | Rows | Proof bytes | Prove | Verify |
 | --- | ---: | ---: | ---: | ---: |
-| P2PKH / P2WPKH, key | 82,107 | 514,348 | 0.5 s | 15 ms |
-| P2SH-P2WPKH, key | 114,798 | 514,380 | 0.5 s | 16 ms |
-| Ethereum address, key | 141,040 | 532,492 | 0.9 s | 24 ms |
-| Taproot key path, key | 99,116 | 513,324 | 0.6 s | 19 ms |
-| BLS `0x00` withdrawal credential, key | 87,043 | 512,204 | 0.7 s | 18 ms |
-| Ed25519, RFC 8032 seed | 92,598 | 515,340 | 0.5 s | 15 ms |
-| Ed25519, SLIP-0010 `m/44'/501'/0'/0'` | 874,274 | 881,076 | 3.3 s | 85 ms |
-| Ed25519, BIP32-Ed25519 `m/1852'/1815'/0'/0/0` | 1,423,383 | 925,052 | 6.8 s | 133 ms |
-| P2PKH, BIP-32 seed `m/44'/0'/0'/0/0` | 1,103,291 | 923,548 | 6.5 s | 132 ms |
-| P2PKH, BIP-32 master extended key, same path | 1,016,363 | 881,236 | 3.8 s | 118 ms |
-| P2PKH, BIP-32 seed, hidden path of at most 5 steps | 1,202,820 | 922,652 | 7.2 s | 179 ms |
-| Batch of 10, P2PKH, `m/44'/0'/0'/0/i` | 2,628,926 | 949,949 | 14.6 s | 389 ms |
+| P2PKH / P2WPKH, key | 81,977 | 514,444 | 0.6 s | 22 ms |
+| P2SH-P2WPKH, key | 114,603 | 514,412 | 0.6 s | 21 ms |
+| Ethereum address, key | 140,975 | 530,188 | 1.0 s | 27 ms |
+| Taproot key path, key | 98,986 | 512,332 | 0.7 s | 23 ms |
+| Taproot script tree, key | 112,375 | 513,772 | 0.7 s | 24 ms |
+| BLS `0x00` withdrawal credential, key | 86,913 | 514,092 | 0.8 s | 22 ms |
+| Ed25519, RFC 8032 seed | 92,403 | 513,996 | 0.7 s | 19 ms |
+| Ed25519, SLIP-0010 `m/44'/501'/0'/0'` | 871,739 | 881,588 | 3.7 s | 98 ms |
+| Ed25519, BIP32-Ed25519 `m/1852'/1815'/0'/0/0` | 1,419,418 | 923,676 | 8.0 s | 171 ms |
+| P2PKH, BIP-32 seed `m/44'/0'/0'/0/0` | 1,100,301 | 924,732 | 7.8 s | 170 ms |
+| P2PKH, BIP-32 master extended key, same path | 1,013,633 | 880,692 | 4.0 s | 115 ms |
+| P2PKH, BIP-32 seed, hidden path of at most 5 steps | 1,199,830 | 924,508 | 8.2 s | 172 ms |
+| Taproot key path, BIP-32 seed `m/86'/0'/0'/0/0` | 1,117,310 | 924,188 | 7.9 s | 160 ms |
+| Batch of 10, P2PKH, `m/44'/0'/0'/0/i` | 2,622,426 | 950,813 | 15.9 s | 336 ms |
+| Batch of 100, same | 17,885,276 | 1,080,973 | 155 s | 3.5 s |
 
-A batch of 100 such addresses is 17,885,276 rows; proving it needs more than 32 GB.
+The host was shared with other jobs during this run; times are within about 20 % of an
+idle host.
+
+The seed-rooted five-step path is above 2^20 rows (the commitment pads to 2^21); rooted
+at the master extended key it is below. Of its rows, 22 SHA-512 compressions are about
+960,000 and three scalar multiplications about 96,000; `hem::curve` documents the range
+row type that would bring the multiplications to about 14,000 rows each and the
+statement under 2^20.
+
+Proving memory follows the padded row count: about 5 GB peak for the batch of 10,
+about 11 GB for 30 and 35.2 GB for 100 (one statement per process). A batch too large for the
+prover's memory is cut with `BatchStatement::chunks` into independent proofs of the
+same claims: up to 43 P2PKH entries below a seed-rooted `m/44'/0'/0'/0` pad to 2^23
+rows, so 100 addresses are three proofs of about 950 KiB at about 11 GB each.
 
 Proof length varies by a few hundred bytes with the Fiat-Shamir queries.
 

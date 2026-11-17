@@ -1,9 +1,9 @@
 //! `BlindVC` selective-disclosure presentation as a zk-Hem relation.
 //!
-//! Presentations use committed masks intended to protect undisclosed witness values.
-//! The composed simulator, unopened-leaf hiding bound, batching proximity loss and concrete
-//! knowledge-soundness bound remain unresolved; see [`protocol::prove`]. Selective disclosure
-//! here describes which attributes are public inputs, not an established privacy guarantee.
+//! Presentations use the committed-mask protocol, whose zero-knowledge and knowledge-
+//! soundness statements are summarised on [`protocol::prove`] and given in
+//! `crates/agg/SECURITY.md`. Selective disclosure describes which attributes are public
+//! inputs; the proof reveals nothing else about the witness within those bounds.
 //!
 //! The statement is the one of `dregg-sig-cred::blind_vc::eval_sd_plaintext_circuit`: the holder
 //! knows attributes, a holder blind, a presentation blind and an accumulator path such that

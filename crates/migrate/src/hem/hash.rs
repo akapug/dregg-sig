@@ -19,6 +19,7 @@
 //! fold away, so padding and initial values add no rows. The row structure depends only on
 //! which inputs are constants, never on assigned values.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
@@ -774,16 +775,24 @@ impl Sha2 {
             state.iter().chain(block).all(|x| x.width() == self.width),
             "word width"
         );
+        // The last two schedule words feed no later word, only their own round, so they
+        // are never decomposed: their four addends go into that round's sums.
         let mut w: Vec<Word> = block.to_vec();
+        let mut schedule: Vec<Vec<Word>> = block.iter().map(|x| vec![x.clone()]).collect();
         for t in 16..self.rounds {
             let s0 = self.sigma(cs, &w[t - 15], self.small0, true);
             let s1 = self.sigma(cs, &w[t - 2], self.small1, true);
-            let next = add_mod(cs, &[&s1, &w[t - 7], &s0, &w[t - 16]], &[]);
-            w.push(next);
+            if t + 2 < self.rounds {
+                let next = add_mod(cs, &[&s1, &w[t - 7], &s0, &w[t - 16]], &[]);
+                schedule.push(vec![next.clone()]);
+                w.push(next);
+            } else {
+                schedule.push(vec![s1, w[t - 7].clone(), s0, w[t - 16].clone()]);
+            }
         }
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state.clone();
-        for (t, wt) in w.iter().enumerate() {
+        for (t, wt) in schedule.iter().enumerate() {
             let s1 = self.sigma(cs, &e, self.big1, false);
             let choose = bitwise3(cs, &e, &f, &g, ch);
             let s0 = self.sigma(cs, &a, self.big0, false);
@@ -792,8 +801,12 @@ impl Sha2 {
             if t + 1 == self.rounds {
                 // The last round's `a` and `e` are used only by the feed-forward sum, so
                 // they are never decomposed on their own.
-                let out_a = add_mod(cs, &[&state[0], &h, &s1, &choose, &k, wt, &s0, &major], &[]);
-                let out_e = add_mod(cs, &[&state[4], &d, &h, &s1, &choose, &k, wt], &[]);
+                let mut terms_a = vec![&state[0], &h, &s1, &choose, &k, &s0, &major];
+                terms_a.extend(wt);
+                let out_a = add_mod(cs, &terms_a, &[]);
+                let mut terms_e = vec![&state[4], &d, &h, &s1, &choose, &k];
+                terms_e.extend(wt);
+                let out_e = add_mod(cs, &terms_e, &[]);
                 return [
                     out_a,
                     add_mod(cs, &[&state[1], &a], &[]),
@@ -805,7 +818,9 @@ impl Sha2 {
                     add_mod(cs, &[&state[7], &g], &[]),
                 ];
             }
-            let new_e = add_mod(cs, &[&d, &h, &s1, &choose, &k, wt], &[]);
+            let mut terms_e = vec![&d, &h, &s1, &choose, &k];
+            terms_e.extend(wt);
+            let new_e = add_mod(cs, &terms_e, &[]);
             // `T1 + T2 = new_e - d + T2`: four addends instead of seven.
             let new_a = add_mod(cs, &[&new_e, &s0, &major], &[&d]);
             h = g;

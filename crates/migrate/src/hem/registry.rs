@@ -4,7 +4,8 @@
 //! This registry makes that binding permanent: once a nullifier or a legacy identifier
 //! is recorded, it stays bound to exactly that post-quantum commitment across crashes,
 //! restarts and (with an anchor) rollbacks of the storage. The registry does not verify
-//! proofs; callers submit a binding only after `verify_migration` accepted it.
+//! proofs; callers submit `OwnershipStatement::binding()` only after
+//! `hem::relations::verify_ownership` accepted the statement's proof.
 //!
 //! # State machine
 //!
@@ -80,9 +81,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::vec;
 
-use crate::legacy::LegacyCommitmentKind;
-use crate::zk_engine::MigrationStatement;
-
 const MAGIC: &[u8; 8] = b"QSNULRG1";
 const LOG_NAME: &str = "registry.log";
 const TMP_NAME: &str = "registry.log.new";
@@ -116,27 +114,16 @@ pub enum KeyExposure {
 /// One legacy credential bound to one post-quantum address commitment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MigrationBinding {
-    /// `MigrationStatement::migration_nullifier`, each limb little-endian.
+    /// The statement's nullifier (`hem::relations::OwnershipStatement::nullifier`).
     pub nullifier: [u8; 32],
     pub migration_domain: [u8; 32],
-    /// [`legacy_identifier`] of the legacy commitment.
+    /// `hem::relations::Credential::identifier` of the legacy credential: one value per
+    /// on-chain credential, independent of the replay domain and epoch.
     pub legacy_id: [u8; 32],
     /// [`pq_commitment`] of the target address.
     pub pq_commitment: [u8; 32],
     pub epoch: u64,
     pub exposure: KeyExposure,
-}
-
-/// Registry-wide identifier of a legacy credential: one value per legacy key
-/// commitment, independent of the replay domain and epoch.
-pub fn legacy_identifier(commitment: &LegacyCommitmentKind) -> [u8; 32] {
-    let (tag, bytes): (u8, &[u8]) = match commitment {
-        LegacyCommitmentKind::BitcoinHash160(h) => (1, h),
-        LegacyCommitmentKind::BitcoinTaprootXOnly(x) => (2, x),
-        LegacyCommitmentKind::EthereumKeccak20(e) => (3, e),
-        LegacyCommitmentKind::Slip0010Ed25519(s) => (4, s),
-    };
-    super::relations::credential_identifier(tag, bytes)
 }
 
 /// Commitment to every field of the target address (prefix, version, suite, key kind
@@ -155,25 +142,6 @@ pub fn pq_commitment(address: &QsagAddress) -> [u8; 32] {
 }
 
 impl MigrationBinding {
-    /// The binding a verified statement asks the registry to record.
-    pub fn from_statement(statement: &MigrationStatement, exposure: KeyExposure) -> Self {
-        let mut nullifier = [0; 32];
-        for (out, limb) in nullifier
-            .chunks_exact_mut(8)
-            .zip(&statement.migration_nullifier)
-        {
-            out.copy_from_slice(&limb.to_le_bytes());
-        }
-        Self {
-            nullifier,
-            migration_domain: statement.migration_domain,
-            legacy_id: legacy_identifier(&statement.legacy_commitment),
-            pq_commitment: pq_commitment(&statement.target_pq_address),
-            epoch: statement.epoch_anchor,
-            exposure,
-        }
-    }
-
     /// Registry leaf `H(assetID || H(pk_pq) || suite || epoch)` of ePrint 2026/352
     /// section 7.4, extended by the replay domain and the mode, for callers that also
     /// keep an external Merkle accumulator.
@@ -940,6 +908,7 @@ impl NullifierRegistry {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::hem::relations::{Credential, credential_identifier};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::vec::Vec;
@@ -1124,19 +1093,19 @@ mod tests {
             panic!("an Ethereum lock yields an address");
         };
         assert_eq!(
-            legacy_identifier(&LegacyCommitmentKind::EthereumKeccak20(address)),
+            credential_identifier(3, &address),
             seeded.credential.identifier()
         );
         assert_eq!(
-            legacy_identifier(&LegacyCommitmentKind::BitcoinHash160(address)),
+            credential_identifier(1, &address),
             Credential::BitcoinKeyHash(address).identifier()
         );
         assert_eq!(
-            legacy_identifier(&LegacyCommitmentKind::BitcoinTaprootXOnly([5; 32])),
+            credential_identifier(2, &[5; 32]),
             Credential::BitcoinTaproot([5; 32]).identifier()
         );
         assert_eq!(
-            legacy_identifier(&LegacyCommitmentKind::Slip0010Ed25519([5; 32])),
+            credential_identifier(4, &[5; 32]),
             Credential::Ed25519Key([5; 32]).identifier()
         );
         let ids = [
@@ -1629,29 +1598,17 @@ mod tests {
             )
             .unwrap()
         };
-        let statement = |legacy: LegacyCommitmentKind, seed: u8| MigrationStatement {
-            legacy_commitment: legacy,
-            target_pq_address: address(seed),
-            epoch_anchor: 11,
+        let binding = |credential: Credential, seed: u8| MigrationBinding {
+            nullifier: [7; 32],
             migration_domain: [3; 32],
-            migration_nullifier: [1, 2, 3, u64::MAX],
-            witness_anchor: [0; 4],
+            legacy_id: credential.identifier(),
+            pq_commitment: pq_commitment(&address(seed)),
+            epoch: 11,
+            exposure: KeyExposure::Hidden,
         };
-        let base = MigrationBinding::from_statement(
-            &statement(LegacyCommitmentKind::BitcoinHash160([9; 20]), 1),
-            KeyExposure::Hidden,
-        );
-        assert_eq!(base.nullifier[..8], 1u64.to_le_bytes());
-        assert_eq!(base.nullifier[24..], [0xff; 8]);
-        assert_eq!(base.epoch, 11);
-        let other_chain = MigrationBinding::from_statement(
-            &statement(LegacyCommitmentKind::EthereumKeccak20([9; 20]), 1),
-            KeyExposure::Hidden,
-        );
-        let other_target = MigrationBinding::from_statement(
-            &statement(LegacyCommitmentKind::BitcoinHash160([9; 20]), 2),
-            KeyExposure::Hidden,
-        );
+        let base = binding(Credential::BitcoinKeyHash([9; 20]), 1);
+        let other_chain = binding(Credential::EthereumAddress([9; 20]), 1);
+        let other_target = binding(Credential::BitcoinKeyHash([9; 20]), 2);
         assert_ne!(base.legacy_id, other_chain.legacy_id);
         assert_eq!(base.pq_commitment, other_chain.pq_commitment);
         assert_eq!(base.legacy_id, other_target.legacy_id);

@@ -200,7 +200,7 @@ pub enum Credential {
 }
 
 /// Registry-wide identifier of a credential of type `tag` with on-chain bytes `value`.
-/// Tags 1 to 4 are those of `LegacyCommitmentKind`.
+/// The tags are [`Credential::tag`]; they are part of the registry's on-disk format.
 pub fn credential_identifier(tag: u8, value: &[u8]) -> [u8; 32] {
     cshake256_framed_32(b"QSAG.MIGRATE.REGISTRY.LEGACY.V1", &[&[tag], value])
 }
@@ -1786,7 +1786,18 @@ fn build_shape(relation: &Relation) -> Shape {
     shape
 }
 
-/// Shapes are a pure function of the relation; with `std` the most recent ones are kept.
+/// Matrix entries the shape cache may hold in total: about 1.5 GB. A shape larger than
+/// this (a batch of more than about 30 entries) is built for its caller and not kept.
+#[cfg(feature = "std")]
+const SHAPE_CACHE_ENTRIES: usize = 1 << 27;
+
+#[cfg(feature = "std")]
+fn shape_entries(shape: &Shape) -> usize {
+    shape.a.nnz() + shape.b.nnz() + shape.c.nnz()
+}
+
+/// Shapes are a pure function of the relation; with `std` the most recent ones are kept,
+/// up to 32 of them and [`SHAPE_CACHE_ENTRIES`] matrix entries.
 #[cfg(feature = "std")]
 fn shape_of(relation: &Relation) -> Arc<Shape> {
     use std::sync::{Mutex, PoisonError};
@@ -1802,11 +1813,17 @@ fn shape_of(relation: &Relation) -> Arc<Shape> {
         return hit;
     }
     let shape = Arc::new(build_shape(relation));
+    let size = shape_entries(&shape);
+    if size > SHAPE_CACHE_ENTRIES {
+        return shape;
+    }
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(hit) = find(&cache) {
         return hit;
     }
-    if cache.len() == KEEP {
+    while cache.len() == KEEP
+        || cache.iter().map(|(_, s)| shape_entries(s)).sum::<usize>() + size > SHAPE_CACHE_ENTRIES
+    {
         cache.remove(0);
     }
     cache.push((relation.clone(), shape.clone()));
@@ -1968,6 +1985,33 @@ impl BatchStatement {
                 self.prefix.len() + e.tail.len() <= MAX_PATH_DEPTH
                     && self.lock.credential(e.credential.value()) == Some(e.credential)
             })
+    }
+
+    /// The batch cut into consecutive batches of at most `max_entries` entries each, with
+    /// the same lock, root, prefix, domain and epoch. Every entry keeps its credential,
+    /// target and nullifier, so the pieces make exactly the claims of the whole: their
+    /// [`Self::statement`]s, and with them the registry bindings, are those of the whole in
+    /// order.
+    ///
+    /// Proving memory follows the padded row count of one proof, not the number of
+    /// entries proved in total. With the P2PKH lock below a seed-rooted
+    /// `m/44'/0'/0'/0`, a proof of up to 43 entries pads to 2^23 rows (11 GB measured at
+    /// 30 entries), where one proof of 100 entries pads to 2^25. Each piece repeats the
+    /// root and prefix derivation (about 0.93 million rows) and is its own proof of
+    /// about 950 KiB.
+    pub fn chunks(&self, max_entries: usize) -> Vec<BatchStatement> {
+        assert!(max_entries > 0, "a batch holds at least one entry");
+        self.entries
+            .chunks(max_entries)
+            .map(|entries| BatchStatement {
+                lock: self.lock,
+                root: self.root,
+                prefix: self.prefix.clone(),
+                entries: entries.to_vec(),
+                migration_domain: self.migration_domain,
+                epoch: self.epoch,
+            })
+            .collect()
     }
 
     /// The single statement that makes the same claim as entry `index`.
@@ -3673,6 +3717,74 @@ mod tests {
     }
 
     #[test]
+    fn shape_cache_returns_the_same_shape_and_stays_within_its_budget() {
+        let relation = Relation::Single(Lock::P2pkh, KeySource::Secp256k1Key);
+        let first = shape_of(&relation);
+        // Cached: the same allocation, not an equal rebuild.
+        assert!(Arc::ptr_eq(&first, &shape_of(&relation)));
+        let size = shape_entries(&first);
+        assert!(
+            size > 1 << 20 && size < SHAPE_CACHE_ENTRIES / 16,
+            "{size} entries"
+        );
+        // The budget admits a batch of 10 and not a batch of 100 (47,846,552 and
+        // 350,554,982 entries measured).
+        const { assert!(47_846_552 < SHAPE_CACHE_ENTRIES && SHAPE_CACHE_ENTRIES < 350_554_982) };
+    }
+
+    #[test]
+    fn batch_chunks_make_the_claims_of_the_whole() {
+        let witness = OwnershipWitness::seed(&seed(32));
+        let targets: Vec<(Vec<u32>, [u8; 32])> = (0..5).map(|i| (vec![i], [i as u8; 32])).collect();
+        let batch = BatchStatement::derive(
+            Lock::P2pkh,
+            Bip32Root::Seed,
+            &[H],
+            &targets,
+            &witness,
+            DOMAIN,
+            EPOCH,
+        )
+        .unwrap();
+        let pieces = batch.chunks(2);
+        assert_eq!(
+            pieces.iter().map(|p| p.entries.len()).collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        let mut statements = Vec::new();
+        for (index, piece) in pieces.iter().enumerate() {
+            assert!(piece.is_well_formed());
+            // A piece is the batch its own targets derive: nothing of the whole is needed
+            // to prove it.
+            let derived = BatchStatement::derive(
+                Lock::P2pkh,
+                Bip32Root::Seed,
+                &[H],
+                &targets[2 * index..(2 * index + 2).min(5)],
+                &witness,
+                DOMAIN,
+                EPOCH,
+            );
+            assert_eq!(derived.as_ref(), Some(piece));
+            assert!(synthesize_batch(piece, &witness).is_ok());
+            statements.extend((0..piece.entries.len()).map(|i| piece.statement(i).unwrap()));
+        }
+        let whole: Vec<_> = (0..5).map(|i| batch.statement(i).unwrap()).collect();
+        assert_eq!(statements, whole);
+        // A piece does not stand for the whole, and a credential of another path does not
+        // fit an entry.
+        assert_ne!(pieces[0].to_bytes(), batch.to_bytes());
+        let mut foreign = pieces[0].clone();
+        foreign.entries[1].credential = batch.entries[4].credential;
+        assert_eq!(
+            synthesize_batch(&foreign, &witness).err(),
+            Some(OwnershipError::WitnessMismatch)
+        );
+        assert_eq!(batch.chunks(5).as_slice(), core::slice::from_ref(&batch));
+        assert_eq!(batch.chunks(100).as_slice(), core::slice::from_ref(&batch));
+    }
+
+    #[test]
     fn batch_entries_are_the_single_statements() {
         let (batch, witness) = batch_case();
         assert_eq!(batch.entries.len(), 2);
@@ -3834,15 +3946,17 @@ mod tests {
         Some(kib / 1024)
     }
 
+    /// Takes the shape by value and drops it before proving: the prover builds its own,
+    /// and a second copy would be counted in the peak.
     fn report(
         name: &str,
-        shape: &Shape,
+        shape: Shape,
         rows: usize,
         synth_s: f64,
         prove: &dyn Fn() -> OwnershipProof,
         verify: &dyn Fn(&[u8]) -> bool,
     ) {
-        let layout = protocol::Layout::new(shape, REGIME).unwrap();
+        let layout = protocol::Layout::new(&shape, REGIME).unwrap();
         let stages: Vec<String> = layout
             .schedule
             .stages
@@ -3851,13 +3965,17 @@ mod tests {
             .collect();
         let head = std::format!(
             "HEM_OWNERSHIP statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} vars={} \
-             public_inputs={} cells=2^{} synth_s={synth_s:.2}",
+             public_inputs={} cells=2^{} nnz={} synth_s={synth_s:.2} synth_peak_rss_mib={}",
             REGIME as u8,
             shape.log_rows,
             shape.num_vars,
             shape.num_public,
             layout.log_cells,
+            shape.a.nnz() + shape.b.nnz() + shape.c.nnz(),
+            // Meaningful when one statement is measured per process (`HEM_MEASURE_ONLY`).
+            peak_rss_mib().map_or_else(|| String::from("n/a"), |m| std::format!("{m}")),
         );
+        drop(shape);
         if std::env::var("HEM_MEASURE_ROWS_ONLY").is_ok() {
             println!("{head}");
             return;
@@ -4035,7 +4153,7 @@ mod tests {
             let synth_s = t.elapsed().as_secs_f64();
             report(
                 name,
-                &shape,
+                shape,
                 rows,
                 synth_s,
                 &|| prove_ownership(&st, &witness, REGIME, &[3; 32]).unwrap(),
@@ -4082,7 +4200,7 @@ mod tests {
             let synth_s = t.elapsed().as_secs_f64();
             report(
                 &name,
-                &shape,
+                shape,
                 rows,
                 synth_s,
                 &|| prove_batch(&batch, &witness, REGIME, &[4; 32]).unwrap(),

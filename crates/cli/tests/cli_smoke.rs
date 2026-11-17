@@ -58,7 +58,11 @@ fn qsag(args: &[&str]) -> Output {
             )
             | (Some(&"hd"), Some(&"keygen" | &"recover" | &"export-rss"), _)
             | (Some(&"policy"), Some(&"init"), _)
-            | (Some(&"policy"), Some(&"biscuit"), Some(&"keygen" | &"mint"))
+            | (
+                Some(&"policy"),
+                Some(&"biscuit"),
+                Some(&"keygen" | &"mint" | &"verify")
+            )
     );
     let has_anchor = args.iter().any(|a| {
         matches!(
@@ -275,8 +279,18 @@ fn help_info_and_usage_errors() {
     expect(&[], 1);
     expect(&["frobnicate"], 1);
     let migrate_help = expect(&["migrate", "--help"], 0);
-    for needle in ["claim", "prove", "verify", "registry", "btc-hash160", "bip32-secp256k1"] {
-        assert!(migrate_help.contains(needle), "migrate --help lacks {needle}");
+    for needle in [
+        "claim",
+        "prove",
+        "verify",
+        "registry",
+        "btc-hash160",
+        "bip32-secp256k1",
+    ] {
+        assert!(
+            migrate_help.contains(needle),
+            "migrate --help lacks {needle}"
+        );
     }
     for sub in [
         &["claim"][..],
@@ -3323,6 +3337,39 @@ fn e2e_policy_macaroon_attenuation_third_party_discharge_and_refusal() {
         ],
         0,
     );
+    // A macaroon is a reusable bearer grant: verification keeps no state, so the same
+    // token and discharge verify again, and the output says so instead of implying
+    // that the grant was spent.
+    let again = expect(
+        &[
+            "policy",
+            "macaroon",
+            "verify",
+            "--key",
+            &root_key,
+            "--in",
+            &tok1,
+            "--audience-hex",
+            audience,
+            "--resource-hex",
+            resource,
+            "--actions",
+            "3",
+            "--amount",
+            huge_amount,
+            "--now",
+            "1700000000",
+            "--discharge",
+            &dis_bound,
+            "--discharge-key",
+            &tp_key,
+            "--json",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&again, "valid"), "true");
+    assert_eq!(json_member(&again, "consumed"), "false");
+    assert_eq!(json_member(&again, "reusable"), "true");
     // Spending 1 unit over the u128 max-amount cap is denied (exit 3).
     expect(
         &[
@@ -3917,6 +3964,192 @@ fn passphrase_biscuit_authority_survives_multiple_anchored_mints() {
     }
 }
 
+// A seal consumed after a backup of the verifier's seal store must stay consumed when
+// the backup is put back. Without an anchor the restored store accepts it again.
+#[cfg(unix)]
+#[test]
+fn biscuit_seal_store_anchor_refuses_a_restored_store() {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = Workdir::new("seal-store-rollback");
+    let private = |name: &str| {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path(name))
+            .unwrap();
+        dir.path(name)
+    };
+    let sk = dir.path("authority.sk");
+    let pk = dir.path("authority.pk");
+    let audience = "12".repeat(32);
+    let resource = "34".repeat(32);
+    expect(
+        &[
+            "policy",
+            "biscuit",
+            "keygen",
+            "--secret-out",
+            &sk,
+            "--public-out",
+            &pk,
+            "--tree-height",
+            "2",
+        ],
+        0,
+    );
+    let seal = |n: usize| {
+        let token = dir.path(&format!("token-{n}"));
+        let step = dir.path(&format!("step-{n}"));
+        let sealed = dir.path(&format!("sealed-{n}"));
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "mint",
+                "--secret",
+                &sk,
+                "--audience-hex",
+                &audience,
+                "--resource-hex",
+                &resource,
+                "--token-out",
+                &token,
+                "--step-key-out",
+                &step,
+            ],
+            0,
+        );
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "seal",
+                "--in",
+                &token,
+                "--step-key",
+                &step,
+                "--out",
+                &sealed,
+            ],
+            0,
+        );
+        sealed
+    };
+    let verify = |sealed: &str, store: &str, extra: &[&str]| {
+        let mut args = vec![
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            sealed,
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            store,
+        ];
+        args.extend_from_slice(extra);
+        qsag(&args)
+    };
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    for anchored in [false, true] {
+        let store_dir = private(if anchored {
+            "anchored-store"
+        } else {
+            "bare-store"
+        });
+        let store = format!("{store_dir}/seals");
+        let anchor_dir = private(if anchored {
+            "anchor-a"
+        } else {
+            "anchor-unused"
+        });
+        let anchor: Vec<&str> = if anchored {
+            vec!["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"]
+        } else {
+            vec!["--ephemeral-unanchored"]
+        };
+        let with = |extra: &[&'static str]| -> Vec<&str> {
+            anchor
+                .iter()
+                .copied()
+                .chain(extra.iter().copied())
+                .collect()
+        };
+        let (first, second) = (
+            seal(usize::from(anchored) * 2),
+            seal(usize::from(anchored) * 2 + 1),
+        );
+
+        let created = verify(&first, &store, &with(&["--create-seal-store"]));
+        assert_eq!(code(&created), 0, "{}", stderr(&created));
+        let backup = snapshot_dir_files(Path::new(&store_dir));
+        let accepted = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&accepted), 0, "{}", stderr(&accepted));
+        let replayed = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&replayed), 3, "{}", stderr(&replayed));
+        let current = snapshot_dir_files(Path::new(&store_dir));
+
+        // The store directory goes back to the backup, every inode kept.
+        restore_dir_files_in_place(&backup);
+        let after_restore = verify(&second, &store, &with(&[]));
+        if anchored {
+            assert_eq!(code(&after_restore), 4, "{}", stderr(&after_restore));
+            assert!(
+                stderr(&after_restore).contains("rollback"),
+                "{}",
+                stderr(&after_restore)
+            );
+            // The anchor requirement cannot be dropped to get around it.
+            let waived = verify(&second, &store, &["--ephemeral-unanchored"]);
+            assert_eq!(code(&waived), 4, "{}", stderr(&waived));
+            assert!(stderr(&waived).contains("must be opened with it"));
+            // The current store still opens and still refuses the consumed seals.
+            restore_dir_files_in_place(&current);
+            for sealed in [&first, &second] {
+                let refused = verify(sealed, &store, &with(&[]));
+                assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+            }
+        } else {
+            // No anchor: the consumed seal is accepted a second time.
+            assert_eq!(code(&after_restore), 0, "{}", stderr(&after_restore));
+            // And an unanchored store cannot be claimed to be anchored afterwards.
+            let claimed = verify(
+                &first,
+                &store,
+                &["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"],
+            );
+            assert_eq!(code(&claimed), 4, "{}", stderr(&claimed));
+            assert!(stderr(&claimed).contains("without an external anchor"));
+        }
+    }
+    // Neither an anchor nor the waiver: the command refuses to pick for the operator.
+    let output = Command::new(env!("CARGO_BIN_EXE_dregg-sig"))
+        .args([
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            &dir.path("sealed-3"),
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            &dir.path("undecided"),
+            "--create-seal-store",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(!Path::new(&dir.path("undecided")).exists());
+}
+
 /// secp256k1 secret key 1: public key `G`.
 const SECP_KEY_ONE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
@@ -4247,6 +4480,304 @@ fn migrate_every_statement_kind_claims_proves_and_verifies() {
     );
 }
 
+/// The statement options beyond the kind: an extended-key root, a hidden path, a Taproot
+/// script tree and BIP32-Ed25519. Each is claimed, proved and verified against a published
+/// vector or against the same key reached the plain way.
+#[test]
+fn migrate_roots_hidden_paths_script_trees_and_bip32_ed25519() {
+    let dir = Workdir::new("migrate-options");
+    let target = migration_target(&dir, "target");
+    let write = |name: &str, contents: &str| {
+        let path = dir.path(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    // BIP-32 test vector 1: the seed, and the extended private key of chain m/0'.
+    let seed = write("seed.hex", "000102030405060708090a0b0c0d0e0f");
+    let xprv = write(
+        "account.xprv",
+        "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7\n",
+    );
+    // BIP-341 wallet test vectors, keyPathSpending input 1 (a script tree).
+    let taproot = write(
+        "taproot.hex",
+        "1e4da49f6aaf4e5cd175fe08a32bb5cb4863d963921255f33d3bc31e1343907f",
+    );
+    // `D1` of rust-ed25519-bip32; its hardened child 0 is `D1_H0`.
+    let cardano = write(
+        "cardano.hex",
+        "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15a\
+         dcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a24\
+         7384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d",
+    );
+    // m/0'/1 of test vector 1, as in `migrate_every_statement_kind_claims_proves_and_verifies`.
+    const CHILD_HASH160: &str = "bef5a2f9a56a94aab12459f72ad9cf8cf19c7bbe";
+
+    // (name, kind, secret, extra options, member, value, members present, members absent)
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Vec<&'a str>,
+        &'a str,
+        &'a str,
+        Vec<(&'a str, &'a str)>,
+        Vec<&'a str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "extended",
+            "bip32-secp256k1",
+            &xprv,
+            vec!["--root", "extended-key", "--path", "m/1"],
+            "legacy_hash160",
+            CHILD_HASH160,
+            vec![("bip32_root", "extended-key"), ("derivation_path", "m/1")],
+            vec!["hidden_path_max_depth"],
+        ),
+        (
+            "hidden",
+            "bip32-secp256k1",
+            &seed,
+            vec!["--path", "m/0'/1", "--hidden-path-depth", "2"],
+            "legacy_hash160",
+            CHILD_HASH160,
+            vec![("hidden_path_max_depth", "2")],
+            vec!["derivation_path", "bip32_root"],
+        ),
+        (
+            "tree",
+            "btc-taproot-tree",
+            &taproot,
+            vec![
+                "--merkle-root",
+                "5b75adecf53548f3ec6ad7d78383bf84cc57b55a3127c72b9a2481752dd88b21",
+            ],
+            "legacy_output_key",
+            "147c9c57132f6e7ecddba9800bb0c4449251c92a1e60371ee77557b6620f3ea3",
+            vec![("key_exposure", "hidden")],
+            vec!["derivation_path", "merkle_root"],
+        ),
+        (
+            "cardano",
+            "cardano-ed25519",
+            &cardano,
+            vec!["--path", "m/0'"],
+            "legacy_public_key",
+            "9c99845ae0a60881decf7874b94ad02e7540628b588f8b4305d668cc53986978",
+            vec![("kind", "bip32-ed25519"), ("derivation_path", "m/0'")],
+            vec!["bip32_root"],
+        ),
+    ];
+    for (name, kind, secret, extra, member, value, present, absent) in cases {
+        let claim = dir.path(&format!("{name}-claim.json"));
+        let mut args = vec![
+            "migrate",
+            "claim",
+            "--kind",
+            kind,
+            "--legacy-secret",
+            secret,
+            "--target",
+            target.as_str(),
+            "--epoch",
+            "42",
+            "--out",
+            &claim,
+        ];
+        args.extend_from_slice(&extra);
+        expect(&args, 0);
+        let claim_text = std::fs::read_to_string(&claim).unwrap();
+        assert_eq!(json_member(&claim_text, member), value, "{name}");
+        for (member, value) in present {
+            assert_eq!(json_member(&claim_text, member), value, "{name}");
+        }
+        for member in absent {
+            assert!(
+                !claim_text.contains(&format!("\"{member}\"")),
+                "{name} {member}"
+            );
+        }
+        // The merkle root is a witness: it is not in the claim.
+        assert!(!claim_text.contains("5b75adecf535"), "{name}");
+
+        let proof = migrate_prove(
+            &dir,
+            &format!("{name}-proof.json"),
+            kind,
+            secret,
+            &target,
+            "42",
+            &extra,
+        );
+        let proof_text = std::fs::read_to_string(&proof).unwrap();
+        assert_eq!(
+            json_member(&proof_text, "statement"),
+            json_member(&claim_text, "statement"),
+            "{name}"
+        );
+        let verified = expect(
+            &[
+                "migrate", "verify", "--proof", &proof, "--epoch", "42", "--target", &target,
+                "--json",
+            ],
+            0,
+        );
+        assert_eq!(json_member(&verified, "valid"), "true", "{name}");
+        assert_eq!(json_member(&verified, member), value, "{name}");
+    }
+    // The hidden-path statement does not name the path: another path of the same depth
+    // bound gives a statement of the same shape and a different credential.
+    let statement_of = |name: &str| {
+        json_member(
+            &std::fs::read_to_string(dir.path(&format!("{name}-claim.json"))).unwrap(),
+            "statement",
+        )
+    };
+    let other = dir.path("hidden-other.json");
+    expect(
+        &[
+            "migrate",
+            "claim",
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &seed,
+            "--target",
+            &target,
+            "--epoch",
+            "42",
+            "--path",
+            "m/0'",
+            "--hidden-path-depth",
+            "2",
+            "--out",
+            &other,
+        ],
+        0,
+    );
+    let other_statement = json_member(&std::fs::read_to_string(&other).unwrap(), "statement");
+    assert_eq!(other_statement.len(), statement_of("hidden").len());
+    assert_ne!(other_statement, statement_of("hidden"));
+
+    let out = dir.path("refused.json");
+    let refused = |args: &[&str], needle: &str| {
+        let mut full = vec![
+            "migrate",
+            "claim",
+            "--out",
+            &out,
+            "--epoch",
+            "1",
+            "--target",
+            target.as_str(),
+        ];
+        full.extend_from_slice(args);
+        let output = qsag(&full);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(code(&output), 1, "{args:?}: {stderr}");
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+        assert!(!Path::new(&out).exists(), "{args:?}");
+    };
+    let root = "5b75adecf53548f3ec6ad7d78383bf84cc57b55a3127c72b9a2481752dd88b21";
+    refused(
+        &["--kind", "btc-taproot-tree", "--legacy-secret", &taproot],
+        "requires --merkle-root",
+    );
+    refused(
+        &[
+            "--kind",
+            "btc-taproot",
+            "--legacy-secret",
+            &taproot,
+            "--merkle-root",
+            root,
+        ],
+        "--merkle-root does not apply",
+    );
+    refused(
+        &[
+            "--kind",
+            "eth-eoa",
+            "--legacy-secret",
+            &taproot,
+            "--root",
+            "extended-key",
+        ],
+        "applies to BIP-32",
+    );
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &seed,
+            "--path",
+            "m/1",
+            "--root",
+            "xpub",
+        ],
+        "is not 'seed' or 'extended-key'",
+    );
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &seed,
+            "--path",
+            "m/0'/1",
+            "--hidden-path-depth",
+            "1",
+        ],
+        "longer than --hidden-path-depth",
+    );
+    refused(
+        &[
+            "--kind",
+            "cardano-ed25519",
+            "--legacy-secret",
+            &cardano,
+            "--path",
+            "m/0'",
+            "--hidden-path-depth",
+            "2",
+        ],
+        "applies to BIP-32",
+    );
+    // A seed is not an extended key, and a damaged xprv fails its checksum.
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &seed,
+            "--path",
+            "m/1",
+            "--root",
+            "extended-key",
+        ],
+        "extended private key must be",
+    );
+    let damaged = write(
+        "damaged.xprv",
+        "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ8",
+    );
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &damaged,
+            "--path",
+            "m/1",
+            "--root",
+            "extended-key",
+        ],
+        "checksum mismatch",
+    );
+}
+
 #[test]
 fn migrate_verify_refuses_wrong_target_epoch_domain_and_altered_files() {
     let dir = Workdir::new("migrate-verify");
@@ -4342,7 +4873,10 @@ fn migrate_verify_refuses_wrong_target_epoch_domain_and_altered_files() {
         other_epoch
             .replace(&proof_member(&other_epoch), &proof_member(&original))
             .replace(
-                &format!("\"proof_bytes\": {}", json_member(&other_epoch, "proof_bytes")),
+                &format!(
+                    "\"proof_bytes\": {}",
+                    json_member(&other_epoch, "proof_bytes")
+                ),
                 &format!("\"proof_bytes\": {}", json_member(&original, "proof_bytes")),
             ),
     );
@@ -4699,7 +5233,9 @@ fn migrate_registry_records_each_credential_once() {
     );
     assert!(std::fs::metadata(&deep).unwrap().len() > 1 << 20);
     run(
-        &["migrate", "registry", "register", "--proof", &deep, "--epoch", "7"],
+        &[
+            "migrate", "registry", "register", "--proof", &deep, "--epoch", "7",
+        ],
         0,
     );
     let found = lookup("--statement", &deep);
