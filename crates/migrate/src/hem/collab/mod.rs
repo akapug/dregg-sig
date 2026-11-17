@@ -162,8 +162,8 @@
 //! ([`CustodyInput`]) and enters them as public constants of the engine, and a seed
 //! shorter than 64 bytes is padded with public zeros.
 //!
-//! Not covered: relations with lookups (a multiplicity is a count over the whole witness;
-//! `ConstraintSystem::finish_recorded` refuses them).
+//! Relations with lookups into range tables are covered: the multiplicities are
+//! computed on shares ([`witgen`], "Lookups"). Lookups into other tables are refused.
 //!
 //! # Preprocessing
 //!
@@ -192,26 +192,37 @@
 //!
 //! `tests::measure_threshold_ownership` on hbox (16 cores), default regime, all custodians
 //! as threads of one process over sealed channel links, dealer preprocessing. The secret is
-//! held as `(N, N + 2)` Shamir shares; each custodian runs [`prove_ownership_party`]. Both
-//! relations have `2^17` rows and a committed table of `2^18` cells. Per custodian:
+//! held as `(N, N + 2)` Shamir shares; each custodian runs [`prove_ownership_party`]. Per
+//! custodian (rounds include two per MAC check):
 //!
 //! | statement | N | stage | triples | uniform values | sent | rounds | MAC checks | time |
 //! |---|---|---|---|---|---|---|---|---|
-//! | Bitcoin HASH160 | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.3 s |
-//! | | | witness | 1,227,533 | 613,164 | 49.7 MB | 512,410 | 584 | 17.5 s |
-//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 6.1 s |
-//! | Ed25519 seed | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.3 s |
-//! | | | witness | 1,309,300 | 645,436 | 52.9 MB | 536,671 | 559 | 16.4 s |
-//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 5.6 s |
+//! | Bitcoin HASH160 | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.2 s |
+//! | | | witness | 2,151,917 | 603,115 | 79.1 MB | 15,013 | 482 | 5.8 s |
+//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 4.4 s |
+//! | Ed25519 seed | 3 | input | 1,280 | 768 | 62,080 B | 8 | 2 | 0.2 s |
+//! | | | witness | 2,286,466 | 635,671 | 84.0 MB | 14,763 | 660 | 6.2 s |
+//! | | | proof | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 4.2 s |
 //! | Bitcoin HASH160 | 5 | input | 2,304 | 1,280 | 206,080 B | 10 | 2 | 0.3 s |
-//! | | | witness | 1,227,533 | 613,164 | 99.4 MB | 512,410 | 584 | 31.7 s |
-//! | | | proof | 2,228,208 | 9,156 | 177.8 MB | 138 | 39 | 7.8 s |
+//! | | | witness | 2,151,917 | 603,115 | 158.2 MB | 15,013 | 482 | 8.2 s |
+//! | | | proof | 2,228,208 | 9,156 | 177.8 MB | 138 | 39 | 6.7 s |
+//! | HASH160, BIP-32 seed, `m/44'` | 3 | input | 640 | 384 | 31,360 B | 8 | 2 | 0.6 s |
+//! | | | witness | 3,363,835 | 910,885 | 123.6 MB | 39,294 | 2,612 | 9.3 s |
+//! | | | proof | 8,912,880 | 9,260 | 353.2 MB | 152 | 43 | 17.6 s |
+//! | Taproot script tree, seed, hidden path of depth 2 | 3 | input | 1,320 | 792 | 64,000 B | 8 | 2 | 1.2 s |
+//! | | | witness | 9,828,350 | 2,747,456 | 361.6 MB | 70,380 | 4,177 | 24.5 s |
+//! | | | proof | 17,825,776 | 17,568 | 706.1 MB | 159 | 45 | 28.3 s |
 //!
-//! Proofs: 1,288,007 B, 1,286,823 B and 2,051,169 B; verification 0.18 s. "Sent" counts
-//! every broadcast once per recipient. Witness generation is round-bound, not
-//! compute-bound: its borrow chains are sequential, one product per round, so on a
-//! network its time is about half a million round trips. Batching independent chains
-//! into shared rounds is not done.
+//! Proofs: 1,282,887 B, 1,281,383 B, 2,052,417 B, 1,354,343 B and 2,341,263 B;
+//! verification 0.2 to 0.8 s. "Sent" counts every broadcast once per recipient.
+//!
+//! On a network the witness stage is bound by its rounds: at 50 ms a round, 12.5 min for
+//! the HASH160 statement and 33 min for `m/44'` from a seed. Before witness generation
+//! was scheduled by dependency ([`witgen`], "Rounds") the same two statements took
+//! 515,439 and 817,663 rounds (7.2 h and 11.4 h) with 1,235,043 and 2,064,294 triples.
+//! `m/44'/0'/0'/0/0` from a seed, counted by `witgen::tests::measure_chains` and not run:
+//! 10,359,511 witness triples, 2,813,971 uniform values and 107,370 rounds (91,388 and
+//! two for each of 7,991 MAC checks), 89 min at 50 ms a round.
 
 pub mod custody;
 pub mod engine;

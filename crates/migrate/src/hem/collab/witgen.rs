@@ -54,6 +54,23 @@
 //!   masked inversion in Goldilocks, and the interpolating polynomial through
 //!   `(0, 0), (i, 1 / i)`.
 //!
+//! # Lookups
+//!
+//! A relation with lookups has one variable per table row, the number of lookups whose
+//! tuple is that row (`Def::Multiplicity`). For a range table `0..2^bits` of one column
+//! the quorum computes them on shares: the looked-up value is decomposed into `bits`
+//! bits (a statistically masked decomposition), the products of every subset of the
+//! bits are formed by halves (`2^bits - bits - 1` products in `log2 bits` rounds), the
+//! indicator of the value over the table rows is a signed sum of those, and a
+//! multiplicity is the sum of the indicators of all lookups. A byte lookup costs 302
+//! triples and 48 uniform values, and all lookups run in the rounds their values become
+//! known, about twelve rounds each. A value outside the table gives multiplicities
+//! that do not satisfy the relation, and no proof. Lookups into any other table (rows
+//! that are not `0..2^bits` in order, or more than one column) are refused with
+//! [`WitgenError::Table`]: an indicator over arbitrary rows needs an equality test per
+//! row, which is not built. The rest of a lookup proof (helper table, lookup
+//! sumcheck) is the prover's (`prover`, "Lookups") and takes these shares as they are.
+//!
 //! # What is opened, and why it tells nothing
 //!
 //! Beaver openings; `a^2` of random-bit generation; the top-bits product of an exact
@@ -61,9 +78,12 @@
 //! `den rho + q S + K q` of a division. The first four are functions of fresh
 //! preprocessed values alone or are masked by one. The last two are masked only when the
 //! shared value behind them is the one the protocol defines, so [`Backend::check`] (the
-//! batch MAC check) runs before each of them: a custodian that sent a wrong share in any
-//! earlier opening is caught there, before a value that its error could have steered is
-//! opened. That ordering is this module's own argument; the engine's guarantee it rests on
+//! batch MAC check) runs before the round that carries one of them: a custodian that
+//! sent a wrong share in any earlier round is caught there, before a value that its
+//! error could have steered is opened. The other requests of that same round do no
+//! harm: a shared value is fixed by the rounds before the one that opens it, so a
+//! custodian that sends last in a round can change what is reconstructed in that round
+//! and nothing that is opened in it. That ordering is this module's own argument; the engine's guarantee it rests on
 //! (an opening that differs from the shared value fails the check except with probability
 //! `2^-126`) is SPDZ's.
 //!
@@ -99,12 +119,62 @@
 //! So for every secret that has a valid statement no division aborts.
 //!
 //! The statistical parameter is 40 bits per masked opening.
+//!
+//! # Rounds
+//!
+//! The subprotocols are `async` functions that await the products and openings they
+//! ask for. [`Witgen::run`] is a dataflow scheduler over the relation: a product
+//! variable is asked for as soon as its factors are known, a source or a division
+//! starts as soon as the variables it reads are known, and one round of the engine
+//! (`Engine::mul_open`: the masked openings of all products and all plain openings in
+//! one exchange) serves every subprotocol that is waiting. The order of requests is a
+//! function of the relation alone, so all custodians consume the same preprocessing in
+//! the same order and [`demand`] is exact. The round count is the depth of the
+//! relation in rounds, not its size.
+//!
+//! What sets that depth, and what was traded for it ([`Chains`]; the figures are
+//! `tests::measure_chains` for the Bitcoin HASH160 statement, with a round priced at
+//! 50 ms and a triple at the 2.02 ms the three-party ceremony was measured at):
+//!
+//! | chains | triples | rounds | ceremony + round trips |
+//! |---|---|---|---|
+//! | one product per position ([`Chains::Ripple`]) | 1,533,009 | 97,759 | 52 + 81 min |
+//! | Brent-Kung prefix everywhere ([`Chains::Prefix`]) | 2,287,335 | 13,133 | 77 + 11 min |
+//! | prefix, ripple for the short chains ([`Chains::Mixed`], used) | 2,151,917 | 14,049 | 72 + 12 min |
+//!
+//! * A carry or borrow chain `c_{i+1} = g_i + p_i c_i` against a public operand has
+//!   `g_i`, `p_i` linear in the shared bit, and the result bits are linear in the
+//!   carries, so a chain costs its carries only. Long chains (64 positions of an exact
+//!   decomposition, some hundreds of an integer) use a Brent-Kung prefix network: about
+//!   three products per position in `2 log2 n` rounds. The 22-position chains of the
+//!   statistically masked decompositions stay ripple: there are about 12,000 of them
+//!   and the prefix form saves 13 rounds on some 70 sequential stages.
+//! * [`Witgen::normalize`] decomposes every coefficient on its own, in the same rounds,
+//!   then brings the overlapping bits of neighbouring coefficients down to two per
+//!   position with full adders (two products and two rounds a layer) and adds the two
+//!   rows with one prefix chain. The form before it carried from limb to limb, one
+//!   decomposition after the other: 0.3 million triples fewer and, with the sequential
+//!   scheduling that went with it, 512,410 rounds for this statement.
+//! * The masks (random bits, exact masks) do not depend on the relation's values. A
+//!   counting pass over the relation finds how many there are and all of them are made
+//!   in the first eight rounds.
+//!
+//! What is left is the sequence the relation itself has: 23 point additions of a
+//! fixed-base multiplication, each a division, two reductions and their conditional
+//! subtractions one after the other (about 450 rounds), and the rounds of the hash
+//! compressions (one exact decomposition, about 30 rounds, per addition modulo `2^32`).
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 use core::cmp::Ordering;
+use core::future::{Future, poll_fn};
 use core::ops::{Add, Sub};
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_agg::zk_hem::relation::{Def, Definitions, IntCoef, Lc, Shape, Source};
@@ -135,6 +205,11 @@ pub enum WitgenError {
     ZeroDenominator,
     /// An opened value that the protocol defines as a bit is not one.
     NotABit,
+    /// The relation has a lookup into a table that is not a range table `0..2^bits`
+    /// of one column (the index of the lookup is given).
+    Table {
+        lookup: usize,
+    },
 }
 
 impl From<MpcError> for WitgenError {
@@ -149,8 +224,14 @@ pub trait Backend {
     fn scale(s: Self::S, k: F) -> Self::S;
     fn public(&self, c: F) -> Self::S;
     fn random(&mut self) -> Result<Self::S, MpcError>;
-    fn mul(&mut self, xs: &[Self::S], ys: &[Self::S]) -> Result<Vec<Self::S>, MpcError>;
-    fn open(&mut self, xs: &[Self::S]) -> Result<Vec<F>, MpcError>;
+    /// One round: the products `xs[i] ys[i]` and the values of `opens`.
+    #[allow(clippy::type_complexity)]
+    fn round(
+        &mut self,
+        xs: &[Self::S],
+        ys: &[Self::S],
+        opens: &[Self::S],
+    ) -> Result<(Vec<Self::S>, Vec<F>), MpcError>;
     fn check(&mut self) -> Result<(), MpcError>;
     /// Whether opened values are placeholders (see [`Count`]).
     fn counting(&self) -> bool {
@@ -169,11 +250,8 @@ impl<T: Transport> Backend for Engine<T> {
     fn random(&mut self) -> Result<Sb, MpcError> {
         Engine::random(self)
     }
-    fn mul(&mut self, xs: &[Sb], ys: &[Sb]) -> Result<Vec<Sb>, MpcError> {
-        Engine::mul(self, xs, ys)
-    }
-    fn open(&mut self, xs: &[Sb]) -> Result<Vec<F>, MpcError> {
-        Engine::open(self, xs)
+    fn round(&mut self, xs: &[Sb], ys: &[Sb], opens: &[Sb]) -> Result<(Vec<Sb>, Vec<F>), MpcError> {
+        Engine::mul_open(self, xs, ys, opens)
     }
     fn check(&mut self) -> Result<(), MpcError> {
         Engine::check(self)
@@ -198,10 +276,9 @@ impl Sub for Unit {
     }
 }
 
-/// A backend with no values: it counts what [`generate`] would consume. Every opening
-/// reads as zero, which is the branch of each chain that uses the most products, so the
-/// counts are upper bounds; the retries of random-bit and mask generation (probability
-/// `2^-64` and `2^-32` each) are not counted.
+/// A backend with no values: it counts what [`generate`] consumes. Nothing that is
+/// consumed depends on an opened value, except the retries of random-bit and mask
+/// generation (probability `2^-64` and `2^-32` each), which are not counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Count {
     pub triples: usize,
@@ -223,16 +300,16 @@ impl Backend for Count {
         self.randoms += 1;
         Ok(Unit)
     }
-    fn mul(&mut self, xs: &[Unit], _: &[Unit]) -> Result<Vec<Unit>, MpcError> {
+    fn round(
+        &mut self,
+        xs: &[Unit],
+        _: &[Unit],
+        opens: &[Unit],
+    ) -> Result<(Vec<Unit>, Vec<F>), MpcError> {
         self.triples += xs.len();
-        self.opened += 2 * xs.len();
+        self.opened += 2 * xs.len() + opens.len();
         self.rounds += 1;
-        Ok(vec![Unit; xs.len()])
-    }
-    fn open(&mut self, xs: &[Unit]) -> Result<Vec<F>, MpcError> {
-        self.opened += xs.len();
-        self.rounds += 1;
-        Ok(vec![F::ZERO; xs.len()])
+        Ok((vec![Unit; xs.len()], vec![F::ZERO; opens.len()]))
     }
     fn check(&mut self) -> Result<(), MpcError> {
         self.checks += 1;
@@ -549,44 +626,249 @@ impl Modulus {
     }
 }
 
+/// How the carries of a chain `c_{i+1} = g_i + p_i c_i` are computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chains {
+    /// One product and one round per position.
+    Ripple,
+    /// A Brent-Kung prefix network: about three products per position and
+    /// `2 log2(n)` rounds.
+    Prefix,
+    /// [`Chains::Ripple`] for the borrow chain of a statistically masked decomposition
+    /// (at most 22 positions), [`Chains::Prefix`] everywhere else.
+    Mixed,
+}
+
+/// The chains [`generate`] and [`demand`] use.
+pub const CHAINS: Chains = Chains::Mixed;
+
+/// Requests of the round being collected, and the results of the round before it.
+struct Queue<S> {
+    round: u64,
+    xs: Vec<S>,
+    ys: Vec<S>,
+    opens: Vec<S>,
+    checked: bool,
+    products: Vec<S>,
+    opened: Vec<F>,
+}
+
+/// Ready on its second poll.
+struct NextRound(bool);
+
+impl Future for NextRound {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+type Boxed<'f, T> = Pin<Box<dyn Future<Output = T> + 'f>>;
+
+/// Both results, with the two futures advancing in the same rounds.
+async fn join2<A, C>(a: impl Future<Output = A>, c: impl Future<Output = C>) -> (A, C) {
+    let (mut a, mut c) = (Box::pin(a), Box::pin(c));
+    let (mut ra, mut rc) = (None, None);
+    poll_fn(move |cx| {
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
+        }
+        if rc.is_none()
+            && let Poll::Ready(v) = c.as_mut().poll(cx)
+        {
+            rc = Some(v);
+        }
+        if ra.is_some() && rc.is_some() {
+            Poll::Ready((ra.take().expect("set"), rc.take().expect("set")))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Every result, in order, with all futures advancing in the same rounds.
+async fn join_all<T>(mut futures: Vec<Boxed<'_, T>>) -> Vec<T> {
+    let mut out: Vec<Option<T>> = futures.iter().map(|_| None).collect();
+    poll_fn(move |cx| {
+        let mut waiting = false;
+        for (f, slot) in futures.iter_mut().zip(out.iter_mut()) {
+            if slot.is_none() {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(v) => *slot = Some(v),
+                    Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting {
+            Poll::Pending
+        } else {
+            Poll::Ready(out.iter_mut().map(|v| v.take().expect("set")).collect())
+        }
+    })
+    .await
+}
+
 /// One custodian's (or the counter's) run of witness generation.
+///
+/// The subprotocols are `async`: each awaits the products and openings it asks for, and
+/// a round of the backend carries the requests of every subprotocol that is waiting.
+/// [`Witgen::run`] drives a whole relation; [`Witgen::wait`] drives one subprotocol.
 pub struct Witgen<'a, B: Backend> {
-    b: &'a mut B,
-    matrices: BTreeMap<usize, Vec<Vec<F>>>,
-    unchecked: usize,
+    b: RefCell<&'a mut B>,
+    q: RefCell<Queue<B::S>>,
+    matrices: RefCell<BTreeMap<usize, Rc<Vec<Vec<F>>>>>,
+    unchecked: Cell<usize>,
+    chains: Chains,
+    counting: bool,
+    /// Random bits and exact masks made before the relation's first round.
+    pool: RefCell<Pool<B::S>>,
+    /// Random bits and exact masks asked for so far.
+    asked: Cell<(usize, usize)>,
+    /// A run that only counts what [`Self::asked`] comes to.
+    planning: bool,
     zero: B::S,
     one: B::S,
 }
 
+type Shares<B> = Result<Vec<<B as Backend>::S>, WitgenError>;
+/// Random bits, and exact masks of 64 bits each.
+type Pool<S> = (Vec<S>, Vec<Vec<S>>);
+/// What a unit's dependencies are reported to: the terms of each form it reads.
+type Visit<'v> = dyn FnMut(&[(u32, F)]) + 'v;
+/// Two integers to be multiplied.
+type IntPair<S> = (Int<S>, Int<S>);
+
 impl<'a, B: Backend> Witgen<'a, B> {
     pub fn new(b: &'a mut B) -> Self {
-        let (zero, one) = (b.public(F::ZERO), b.public(F::ONE));
+        Self::with_chains(b, CHAINS)
+    }
+
+    pub fn with_chains(b: &'a mut B, chains: Chains) -> Self {
+        let (zero, one, counting) = (b.public(F::ZERO), b.public(F::ONE), b.counting());
         Self {
-            b,
-            matrices: BTreeMap::new(),
-            unchecked: 0,
+            b: RefCell::new(b),
+            q: RefCell::new(Queue {
+                round: 0,
+                xs: Vec::new(),
+                ys: Vec::new(),
+                opens: Vec::new(),
+                checked: false,
+                products: Vec::new(),
+                opened: Vec::new(),
+            }),
+            matrices: RefCell::new(BTreeMap::new()),
+            unchecked: Cell::new(0),
+            chains,
+            counting,
+            pool: RefCell::new((Vec::new(), Vec::new())),
+            asked: Cell::new((0, 0)),
+            planning: false,
             zero,
             one,
         }
     }
 
-    fn mul(&mut self, xs: &[B::S], ys: &[B::S]) -> Result<Vec<B::S>, WitgenError> {
-        self.unchecked += 2 * xs.len();
-        Ok(self.b.mul(xs, ys)?)
+    fn public(&self, c: F) -> B::S {
+        self.b.borrow().public(c)
     }
 
-    fn mul1(&mut self, x: B::S, y: B::S) -> Result<B::S, WitgenError> {
-        Ok(self.mul(&[x], &[y])?[0])
+    fn random(&self) -> Result<B::S, WitgenError> {
+        Ok(self.b.borrow_mut().random()?)
     }
 
-    fn open(&mut self, xs: &[B::S]) -> Result<Vec<F>, WitgenError> {
-        self.unchecked += xs.len();
-        Ok(self.b.open(xs)?)
+    fn check(&self) -> Result<(), WitgenError> {
+        self.unchecked.set(0);
+        Ok(self.b.borrow_mut().check()?)
     }
 
-    fn check(&mut self) -> Result<(), WitgenError> {
-        self.unchecked = 0;
-        Ok(self.b.check()?)
+    /// Queue products for the next round; their place in its results.
+    fn push_mul(&self, xs: &[B::S], ys: &[B::S]) -> usize {
+        assert_eq!(xs.len(), ys.len());
+        let mut q = self.q.borrow_mut();
+        let at = q.xs.len();
+        q.xs.extend_from_slice(xs);
+        q.ys.extend_from_slice(ys);
+        at
+    }
+
+    async fn mul(&self, xs: &[B::S], ys: &[B::S]) -> Shares<B> {
+        if xs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let at = self.push_mul(xs, ys);
+        NextRound(false).await;
+        Ok(self.q.borrow().products[at..at + xs.len()].to_vec())
+    }
+
+    async fn mul1(&self, x: B::S, y: B::S) -> Result<B::S, WitgenError> {
+        Ok(self.mul(&[x], &[y]).await?[0])
+    }
+
+    /// Open values. With `checked`, the batch MAC check runs before the round that
+    /// opens them: for values that are masked only if every earlier opening was right.
+    async fn open(&self, xs: &[B::S], checked: bool) -> Result<Vec<F>, WitgenError> {
+        if xs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let at = {
+            let mut q = self.q.borrow_mut();
+            let at = q.opens.len();
+            q.opens.extend_from_slice(xs);
+            q.checked |= checked;
+            at
+        };
+        NextRound(false).await;
+        Ok(self.q.borrow().opened[at..at + xs.len()].to_vec())
+    }
+
+    fn idle(&self) -> bool {
+        let q = self.q.borrow();
+        q.xs.is_empty() && q.opens.is_empty()
+    }
+
+    /// Run the round that was collected.
+    fn step(&self) -> Result<(), WitgenError> {
+        let mut q = self.q.borrow_mut();
+        let opened = 2 * q.xs.len() + q.opens.len();
+        if q.checked || (self.unchecked.get() > 0 && self.unchecked.get() + opened > CHECK_EVERY) {
+            self.check()?;
+        }
+        let (products, values) = self.b.borrow_mut().round(&q.xs, &q.ys, &q.opens)?;
+        q.products = products;
+        q.opened = values;
+        q.xs.clear();
+        q.ys.clear();
+        q.opens.clear();
+        q.checked = false;
+        q.round += 1;
+        self.unchecked.set(self.unchecked.get() + opened);
+        Ok(())
+    }
+
+    /// Drive one subprotocol to its result.
+    pub fn wait<T>(
+        &self,
+        future: impl Future<Output = Result<T, WitgenError>>,
+    ) -> Result<T, WitgenError> {
+        let mut future = core::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return out;
+            }
+            if self.idle() {
+                return Err(WitgenError::Unsupported { index: usize::MAX });
+            }
+            self.step()?;
+        }
     }
 
     fn eval(&self, z: &[B::S], lc: &Lc) -> B::S {
@@ -595,18 +877,32 @@ impl<'a, B: Backend> Witgen<'a, B> {
             .fold(self.zero, |acc, &(v, c)| acc + B::scale(z[v as usize], c))
     }
 
-    /// Shared uniform bits.
-    pub fn random_bits(&mut self, n: usize) -> Result<Vec<B::S>, WitgenError> {
+    /// Shared uniform bits: from the pool when it has them, else made now.
+    pub async fn random_bits(&self, n: usize) -> Shares<B> {
+        let asked = self.asked.get();
+        self.asked.set((asked.0 + n, asked.1));
+        {
+            let bits = &mut self.pool.borrow_mut().0;
+            if bits.len() >= n && n > 0 {
+                let at = bits.len() - n;
+                return Ok(bits.split_off(at));
+            }
+        }
+        self.fresh_bits(n).await
+    }
+
+    /// Shared uniform bits, two rounds.
+    async fn fresh_bits(&self, n: usize) -> Shares<B> {
         let half = F::TWO.inv();
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
             let a: Vec<B::S> = (0..n - out.len())
-                .map(|_| self.b.random())
+                .map(|_| self.random())
                 .collect::<Result<_, _>>()?;
-            let squares = self.mul(&a, &a)?;
-            let opened = self.open(&squares)?;
+            let squares = self.mul(&a, &a).await?;
+            let opened = self.open(&squares, false).await?;
             for (&a, &v) in a.iter().zip(&opened) {
-                if self.b.counting() {
+                if self.counting {
                     out.push(a);
                 } else if v != F::ZERO {
                     let Some(root) = sqrt(v) else {
@@ -616,55 +912,177 @@ impl<'a, B: Backend> Witgen<'a, B> {
                         self.check()?;
                         return Err(WitgenError::NotABit);
                     };
-                    out.push(B::scale(a, root.inv() * half) + self.b.public(half));
+                    out.push(B::scale(a, root.inv() * half) + self.public(half));
                 }
             }
         }
         Ok(out)
     }
 
-    /// 64 shared random bits whose value is at most `p - 2`.
-    fn exact_mask(&mut self) -> Result<Vec<B::S>, WitgenError> {
+    /// The products of every prefix of `first, ps[0], ps[1], ..` that has at least two
+    /// factors: `first ps[0]`, `first ps[0] ps[1]`, and so on.
+    async fn running_products(&self, first: B::S, ps: &[B::S]) -> Shares<B> {
+        match self.chains {
+            Chains::Ripple => {
+                let mut out = Vec::with_capacity(ps.len());
+                let mut acc = first;
+                for &p in ps {
+                    acc = self.mul1(acc, p).await?;
+                    out.push(acc);
+                }
+                Ok(out)
+            }
+            Chains::Prefix | Chains::Mixed => {
+                let mut v = Vec::with_capacity(ps.len() + 1);
+                v.push(first);
+                v.extend_from_slice(ps);
+                let n = v.len();
+                let mut d = 1;
+                while d < n {
+                    let at: Vec<usize> = (2 * d - 1..n).step_by(2 * d).collect();
+                    let xs: Vec<B::S> = at.iter().map(|&i| v[i]).collect();
+                    let ys: Vec<B::S> = at.iter().map(|&i| v[i - d]).collect();
+                    for (&i, &r) in at.iter().zip(&self.mul(&xs, &ys).await?) {
+                        v[i] = r;
+                    }
+                    d *= 2;
+                }
+                while d > 1 {
+                    d /= 2;
+                    let at: Vec<usize> = (3 * d - 1..n).step_by(2 * d).collect();
+                    let xs: Vec<B::S> = at.iter().map(|&i| v[i]).collect();
+                    let ys: Vec<B::S> = at.iter().map(|&i| v[i - d]).collect();
+                    for (&i, &r) in at.iter().zip(&self.mul(&xs, &ys).await?) {
+                        v[i] = r;
+                    }
+                }
+                v.remove(0);
+                Ok(v)
+            }
+        }
+    }
+
+    /// The carries `c_1, .., c_n` of the chain `c_{i+1} = g_i + p_i c_i`, `c_0 = 0`, for
+    /// positions where `g_i` and `p_i` are bits that are not both one.
+    async fn carries(&self, mut g: Vec<B::S>, mut p: Vec<B::S>, short: bool) -> Shares<B> {
+        let n = g.len();
+        let ripple = match self.chains {
+            Chains::Ripple => true,
+            Chains::Prefix => false,
+            Chains::Mixed => short,
+        };
+        match ripple {
+            true => {
+                for i in 1..n {
+                    g[i] = g[i] + self.mul1(p[i], g[i - 1]).await?;
+                }
+            }
+            false => {
+                // Up: position `i` comes to hold its block of `2 d` positions. A block
+                // that starts at zero needs no propagate.
+                let mut d = 1;
+                while d < n {
+                    let at: Vec<usize> = (2 * d - 1..n).step_by(2 * d).collect();
+                    let mut xs: Vec<B::S> = at.iter().map(|&i| p[i]).collect();
+                    let mut ys: Vec<B::S> = at.iter().map(|&i| g[i - d]).collect();
+                    let wide: Vec<usize> = at.iter().copied().filter(|&i| i != 2 * d - 1).collect();
+                    xs.extend(wide.iter().map(|&i| p[i]));
+                    ys.extend(wide.iter().map(|&i| p[i - d]));
+                    let r = self.mul(&xs, &ys).await?;
+                    for (k, &i) in at.iter().enumerate() {
+                        g[i] = g[i] + r[k];
+                    }
+                    for (k, &i) in wide.iter().enumerate() {
+                        p[i] = r[at.len() + k];
+                    }
+                    d *= 2;
+                }
+                // Down: a block after a finished prefix.
+                while d > 1 {
+                    d /= 2;
+                    let at: Vec<usize> = (3 * d - 1..n).step_by(2 * d).collect();
+                    let xs: Vec<B::S> = at.iter().map(|&i| p[i]).collect();
+                    let ys: Vec<B::S> = at.iter().map(|&i| g[i - d]).collect();
+                    for (&i, &r) in at.iter().zip(&self.mul(&xs, &ys).await?) {
+                        g[i] = g[i] + r;
+                    }
+                }
+            }
+        }
+        Ok(g)
+    }
+
+    /// 64 shared random bits whose value is at most `p - 2`: from the pool when it has
+    /// one, else made now.
+    async fn exact_mask(&self) -> Shares<B> {
+        let asked = self.asked.get();
+        self.asked.set((asked.0, asked.1 + 1));
+        if let Some(mask) = self.pool.borrow_mut().1.pop() {
+            return Ok(mask);
+        }
+        self.fresh_mask().await
+    }
+
+    /// 64 shared random bits whose value is at most `p - 2`, eight rounds.
+    async fn fresh_mask(&self) -> Shares<B> {
         loop {
-            let bits = self.random_bits(64)?;
+            let bits = self.fresh_bits(64).await?;
             let mut level: Vec<B::S> = bits[32..].to_vec();
             while level.len() > 1 {
                 let (xs, ys): (Vec<B::S>, Vec<B::S>) =
                     level.chunks_exact(2).map(|p| (p[0], p[1])).unzip();
-                level = self.mul(&xs, &ys)?;
+                level = self.mul(&xs, &ys).await?;
             }
-            let all_ones = self.open(&level)?[0];
-            if self.b.counting() || all_ones == F::ZERO {
+            let all_ones = self.open(&level, false).await?[0];
+            if self.counting || all_ones == F::ZERO {
                 return Ok(bits);
             }
         }
     }
 
+    /// Fill the pool: the masks of a relation do not depend on its values, so all of
+    /// them are made in its first eight rounds.
+    async fn fill_pool(&self, bits: usize, masks: usize) -> Result<(), WitgenError> {
+        let futures: Vec<Boxed<'_, Shares<B>>> = (0..masks)
+            .map(|_| Box::pin(self.fresh_mask()) as Boxed<'_, _>)
+            .collect();
+        let (bits, masks) = join2(self.fresh_bits(bits), join_all(futures)).await;
+        let masks = masks.into_iter().collect::<Result<Vec<_>, _>>()?;
+        *self.pool.borrow_mut() = (bits?, masks);
+        Ok(())
+    }
+
     /// `(c - r) mod 2^len` for the public `c` and shared bits `r`, with the final borrow.
-    fn sub_from_public(
-        &mut self,
+    async fn sub_from_public(
+        &self,
         c: u64,
         r: &[B::S],
         len: usize,
+        short: bool,
     ) -> Result<(Vec<B::S>, B::S), WitgenError> {
-        let mut out = Vec::with_capacity(len);
-        let mut borrow = self.zero;
-        for (i, &ri) in r.iter().enumerate().take(len) {
-            let both = self.mul1(ri, borrow)?;
-            let xor = ri + borrow - B::scale(both, F::TWO);
-            if (c >> i) & 1 == 1 {
-                out.push(self.one - xor);
-                borrow = both;
-            } else {
-                out.push(xor);
-                borrow = ri + borrow - both;
-            }
-        }
-        Ok((out, borrow))
+        // Borrow out of a position: `r` and the borrow in where `c` has a one, `r` or
+        // the borrow in where it has a zero.
+        let bit = |i: usize| (c >> i) & 1 == 1;
+        let g: Vec<B::S> = (0..len)
+            .map(|i| if bit(i) { self.zero } else { r[i] })
+            .collect();
+        let p: Vec<B::S> = (0..len)
+            .map(|i| if bit(i) { r[i] } else { self.one - r[i] })
+            .collect();
+        let borrows = self.carries(g, p, short).await?;
+        let two = F::TWO;
+        let out = (0..len)
+            .map(|i| {
+                let before = if i == 0 { self.zero } else { borrows[i - 1] };
+                self.public(F::from_u64_reduced(u64::from(bit(i)))) - r[i] - before
+                    + B::scale(borrows[i], two)
+            })
+            .collect();
+        Ok((out, borrows[len - 1]))
     }
 
     /// The bits of `x`, which lies in `[0, 2^m)` and is below the field prime; `m <= 64`.
-    pub fn decompose(&mut self, x: B::S, m: u32) -> Result<Vec<B::S>, WitgenError> {
+    pub async fn decompose(&self, x: B::S, m: u32) -> Shares<B> {
         assert!(m <= 64);
         let m = m as usize;
         if m == 0 {
@@ -676,38 +1094,48 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 .fold(x, |acc, (i, &b)| acc + B::scale(b, pow2(i)))
         };
         if m as u32 <= STAT_MAX {
-            let r = self.random_bits(m + SIGMA as usize)?;
-            let c = self.open(&[pack(&r)])?[0].to_canonical_u64();
-            return Ok(self.sub_from_public(c, &r, m)?.0);
+            let r = self.random_bits(m + SIGMA as usize).await?;
+            let c = self.open(&[pack(&r)], false).await?[0].to_canonical_u64();
+            return Ok(self.sub_from_public(c, &r, m, true).await?.0);
         }
-        let r = self.exact_mask()?;
-        let c = self.open(&[pack(&r)])?[0].to_canonical_u64();
-        let (d, beta) = self.sub_from_public(c, &r, 64)?;
-        // x = D + beta - 2^32 beta.
+        let r = self.exact_mask().await?;
+        let c = self.open(&[pack(&r)], false).await?[0].to_canonical_u64();
+        let (d, beta) = self.sub_from_public(c, &r, 64, false).await?;
+        // x = D + beta - 2^32 beta: a carry `beta` into the low 32 bits, then a borrow of
+        // `beta` minus the carry out of them into the bits above.
+        let low = m.min(32);
+        let carries = self.running_products(beta, &d[..low]).await?;
         let mut out = Vec::with_capacity(m);
         let mut carry = beta;
-        for &di in d.iter().take(m.min(32)) {
-            let both = self.mul1(di, carry)?;
-            out.push(di + carry - B::scale(both, F::TWO));
-            carry = both;
+        for (&di, &next) in d.iter().zip(&carries) {
+            out.push(di + carry - B::scale(next, F::TWO));
+            carry = next;
         }
-        let mut borrow = beta - carry;
-        for &di in d.iter().take(m).skip(32) {
-            let both = self.mul1(di, borrow)?;
-            out.push(di + borrow - B::scale(both, F::TWO));
-            borrow = borrow - both;
+        if m > 32 {
+            let complements: Vec<B::S> = d[32..m].iter().map(|&di| self.one - di).collect();
+            let first = beta - carry;
+            let borrows = self.running_products(first, &complements).await?;
+            let mut borrow = first;
+            for (&di, &next) in d[32..m].iter().zip(&borrows) {
+                // d - borrow = out - 2 (borrow out), and the borrow out is
+                // `borrow (1 - d)`.
+                out.push(di - borrow + B::scale(next, F::TWO));
+                borrow = next;
+            }
         }
         Ok(out)
     }
 
-    fn matrix(&mut self, n: usize) -> &Vec<Vec<F>> {
+    fn matrix(&self, n: usize) -> Rc<Vec<Vec<F>>> {
         self.matrices
+            .borrow_mut()
             .entry(n)
-            .or_insert_with(|| interpolation_matrix(n))
+            .or_insert_with(|| Rc::new(interpolation_matrix(n)))
+            .clone()
     }
 
     /// Coefficients of the product of two polynomials, one secure product each.
-    pub fn poly_mul(&mut self, a: &[B::S], b: &[B::S]) -> Result<Vec<B::S>, WitgenError> {
+    pub async fn poly_mul(&self, a: &[B::S], b: &[B::S]) -> Shares<B> {
         let n = a.len() + b.len() - 1;
         let at = |poly: &[B::S], s: usize| {
             let s = F::from_u64_reduced(s as u64);
@@ -717,15 +1145,14 @@ impl<'a, B: Backend> Witgen<'a, B> {
         };
         let xs: Vec<B::S> = (0..n).map(|s| at(a, s)).collect();
         let ys: Vec<B::S> = (0..n).map(|s| at(b, s)).collect();
-        let values = self.mul(&xs, &ys)?;
-        let zero = self.zero;
+        let values = self.mul(&xs, &ys).await?;
         let matrix = self.matrix(n);
         Ok(matrix
             .iter()
             .map(|row| {
                 row.iter()
                     .zip(&values)
-                    .fold(zero, |acc, (&k, &v)| acc + B::scale(v, k))
+                    .fold(self.zero, |acc, (&k, &v)| acc + B::scale(v, k))
             })
             .collect())
     }
@@ -774,7 +1201,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
         out
     }
 
-    fn int_mul(&mut self, a: &Int<B::S>, b: &Int<B::S>) -> Result<Int<B::S>, WitgenError> {
+    async fn int_mul(&self, a: &Int<B::S>, b: &Int<B::S>) -> Result<Int<B::S>, WitgenError> {
         let wide = WitgenError::Unsupported { index: usize::MAX };
         let n = a.len() + b.len() - 1;
         let (mut lo, mut hi) = (vec![0i128; n], vec![0i128; n]);
@@ -801,26 +1228,38 @@ impl<'a, B: Backend> Witgen<'a, B> {
             return Err(wide);
         }
         Ok(Int {
-            c: self.poly_mul(&a.c, &b.c)?,
+            c: self.poly_mul(&a.c, &b.c).await?,
             lo,
             hi,
         })
     }
 
-    /// `sum_j a_j b_j + linear`.
-    fn int_expr(
-        &mut self,
-        z: &[B::S],
-        products: &[(Vec<IntCoef>, Vec<IntCoef>)],
-        linear: &[IntCoef],
+    /// `sum_j a_j b_j + linear`, the products in one round.
+    async fn int_sum(
+        &self,
+        products: &[IntPair<B::S>],
+        linear: Int<B::S>,
     ) -> Result<Int<B::S>, WitgenError> {
-        let mut acc = self.int_of(z, linear);
-        for (a, b) in products {
-            let (a, b) = (self.int_of(z, a), self.int_of(z, b));
-            let product = self.int_mul(&a, &b)?;
-            acc = self.int_add(&acc, &product);
+        let futures: Vec<Boxed<'_, _>> = products
+            .iter()
+            .map(|(a, b)| Box::pin(self.int_mul(a, b)) as Boxed<'_, _>)
+            .collect();
+        let mut acc = linear;
+        for product in join_all(futures).await {
+            acc = self.int_add(&acc, &product?);
         }
         Ok(acc)
+    }
+
+    fn int_pairs(
+        &self,
+        z: &[B::S],
+        products: &[(Vec<IntCoef>, Vec<IntCoef>)],
+    ) -> Vec<IntPair<B::S>> {
+        products
+            .iter()
+            .map(|(a, b)| (self.int_of(z, a), self.int_of(z, b)))
+            .collect()
     }
 
     /// The least `K` with `x + K q >= 0` over the intervals (as `K q`), and the largest
@@ -844,83 +1283,158 @@ impl<'a, B: Backend> Witgen<'a, B> {
     }
 
     /// The low `out_bits` bits of the integer `x + add`, which is non-negative.
-    fn normalize(
-        &mut self,
-        x: &Int<B::S>,
-        add: &[u64],
-        out_bits: usize,
-    ) -> Result<Vec<B::S>, WitgenError> {
+    ///
+    /// Every coefficient, shifted to be non-negative and with its digit of the constant,
+    /// is decomposed on its own. The bits of neighbouring coefficients overlap; full
+    /// adders bring every position down to two bits and one carry chain adds those.
+    async fn normalize(&self, x: &Int<B::S>, add: &[u64], out_bits: usize) -> Shares<B> {
         let limbs = out_bits.div_ceil(8);
+        let width = 8 * limbs;
         let mut constant = vec![0u64; limbs / 8 + 4];
         for (slot, &w) in constant.iter_mut().zip(add) {
             *slot = w;
         }
-        for k in 0..x.len().min(limbs) {
+        let shared = x.len().min(limbs);
+        for k in 0..shared {
             nat_add_signed(&mut constant, x.lo[k], k);
         }
-        let mut out = Vec::with_capacity(8 * limbs);
-        let (mut carry, mut carry_max) = (self.zero, 0u128);
-        for k in 0..limbs {
+        let mut futures: Vec<Boxed<'_, Shares<B>>> = Vec::with_capacity(shared);
+        for k in 0..shared {
             let digit = nat_byte(&constant, k);
-            if k >= x.len() && carry_max == 0 {
-                out.extend((0..8).map(|t| self.b.public(F::from_u64_reduced((digit >> t) & 1))));
-                continue;
-            }
-            let mut t = carry + self.b.public(F::from_u64_reduced(digit));
-            let mut most = carry_max + 255;
-            if k < x.len() {
-                t = t + x.c[k] - self.b.public(f_signed(x.lo[k]));
-                most += (x.hi[k] - x.lo[k]) as u128;
-            }
+            let most = (x.hi[k] - x.lo[k]) as u128 + 255;
             if most >= 1 << 63 {
                 return Err(WitgenError::Unsupported { index: usize::MAX });
             }
-            let m = 128 - most.leading_zeros();
-            let mut bits = self.decompose(t, m)?;
-            bits.resize(bits.len().max(8), self.zero);
-            carry = bits[8..]
+            let t =
+                x.c[k] - self.public(f_signed(x.lo[k])) + self.public(F::from_u64_reduced(digit));
+            futures.push(Box::pin(self.decompose(t, 128 - most.leading_zeros())));
+        }
+        let mut columns: Vec<Vec<B::S>> = vec![Vec::new(); width];
+        for (k, bits) in join_all(futures).await.into_iter().enumerate() {
+            for (j, &bit) in bits?.iter().enumerate() {
+                if let Some(column) = columns.get_mut(8 * k + j) {
+                    column.push(bit);
+                }
+            }
+        }
+        for (i, column) in columns.iter_mut().enumerate().skip(8 * shared) {
+            if nat_bit(&constant, i) == 1 {
+                column.push(self.one);
+            }
+        }
+        // Full adders, three bits of a position to one there and one above.
+        while columns.iter().any(|c| c.len() > 2) {
+            let mut triples = Vec::new();
+            let mut next: Vec<Vec<B::S>> = vec![Vec::new(); width];
+            for (i, column) in columns.iter().enumerate() {
+                let whole = column.len() / 3 * 3;
+                for t in column[..whole].chunks_exact(3) {
+                    triples.push((i, t[0], t[1], t[2]));
+                }
+                next[i].extend_from_slice(&column[whole..]);
+            }
+            let xs: Vec<B::S> = triples.iter().map(|t| t.1).collect();
+            let ys: Vec<B::S> = triples.iter().map(|t| t.2).collect();
+            let ab = self.mul(&xs, &ys).await?;
+            let xor: Vec<B::S> = triples
                 .iter()
-                .enumerate()
-                .fold(self.zero, |acc, (i, &b)| acc + B::scale(b, pow2(i)));
-            carry_max = most >> 8;
-            out.extend_from_slice(&bits[..8]);
+                .zip(&ab)
+                .map(|(t, &ab)| t.1 + t.2 - B::scale(ab, F::TWO))
+                .collect();
+            let cs: Vec<B::S> = triples.iter().map(|t| t.3).collect();
+            let xc = self.mul(&xor, &cs).await?;
+            for (k, t) in triples.iter().enumerate() {
+                next[t.0].push(xor[k] + t.3 - B::scale(xc[k], F::TWO));
+                if t.0 + 1 < width {
+                    next[t.0 + 1].push(ab[k] + xc[k]);
+                }
+            }
+            columns = next;
+        }
+        // Two rows. Below the first position with two bits there is nothing to add.
+        let start = columns.iter().position(|c| c.len() == 2).unwrap_or(width);
+        let mut out: Vec<B::S> = columns[..start]
+            .iter()
+            .map(|c| c.first().copied().unwrap_or(self.zero))
+            .collect();
+        if start < width {
+            let rows = &columns[start..];
+            let pairs: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].len() == 2).collect();
+            let xs: Vec<B::S> = pairs.iter().map(|&i| rows[i][0]).collect();
+            let ys: Vec<B::S> = pairs.iter().map(|&i| rows[i][1]).collect();
+            let both = self.mul(&xs, &ys).await?;
+            let mut g = vec![self.zero; rows.len()];
+            for (&i, &v) in pairs.iter().zip(&both) {
+                g[i] = v;
+            }
+            let p: Vec<B::S> = rows
+                .iter()
+                .zip(&g)
+                .map(|(row, &g)| {
+                    row.iter().fold(self.zero, |acc, &b| acc + b) - B::scale(g, F::TWO)
+                })
+                .collect();
+            let carries = self.carries(g.clone(), p.clone(), false).await?;
+            for i in 0..rows.len() {
+                let before = if i == 0 { self.zero } else { carries[i - 1] };
+                // The sum bit is `p + carry in - 2 (p and carry in)`, and the carry out
+                // is `g + (p and carry in)`.
+                out.push(p[i] + before - B::scale(carries[i] - g[i], F::TWO));
+            }
         }
         out.truncate(out_bits);
         Ok(out)
     }
 
     /// `bits >= c ? bits - c : bits` for the public `c`.
-    fn conditional_sub(&mut self, bits: &[B::S], c: &[u64]) -> Result<Vec<B::S>, WitgenError> {
+    async fn conditional_sub(&self, bits: &[B::S], c: &[u64]) -> Shares<B> {
         if nat_bitlen(c) > bits.len() {
             return Ok(bits.to_vec());
         }
-        let mut diff = Vec::with_capacity(bits.len());
-        let mut borrow = self.zero;
-        for (i, &v) in bits.iter().enumerate() {
-            let both = self.mul1(v, borrow)?;
-            let xor = v + borrow - B::scale(both, F::TWO);
-            if nat_bit(c, i) == 1 {
-                diff.push(self.one - xor);
-                borrow = self.one - v + both;
-            } else {
-                diff.push(xor);
-                borrow = borrow - both;
-            }
-        }
+        // Borrow out of a position: `not v` or the borrow in where `c` has a one,
+        // `not v` and the borrow in where it has a zero.
+        let g: Vec<B::S> = bits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if nat_bit(c, i) == 1 {
+                    self.one - v
+                } else {
+                    self.zero
+                }
+            })
+            .collect();
+        let p: Vec<B::S> = bits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if nat_bit(c, i) == 1 { v } else { self.one - v })
+            .collect();
+        let borrows = self.carries(g, p, false).await?;
+        let diff: Vec<B::S> = bits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let before = if i == 0 { self.zero } else { borrows[i - 1] };
+                v - self.public(F::from_u64_reduced(nat_bit(c, i))) - before
+                    + B::scale(borrows[i], F::TWO)
+            })
+            .collect();
         // A final borrow means `bits < c`: keep `bits`.
         let deltas: Vec<B::S> = bits.iter().zip(&diff).map(|(&v, &d)| v - d).collect();
-        let keep = self.mul(&vec![borrow; bits.len()], &deltas)?;
+        let keep = self
+            .mul(&vec![borrows[bits.len() - 1]; bits.len()], &deltas)
+            .await?;
         Ok(diff.iter().zip(&keep).map(|(&d, &k)| d + k).collect())
     }
 
     /// The canonical residue modulo `q` of the integer with the given bits and bound.
-    fn reduce_bits(
-        &mut self,
+    async fn reduce_bits(
+        &self,
         mut bits: Vec<B::S>,
         mut most: Nat,
         q: &Modulus,
         scale: Option<&[u64]>,
-    ) -> Result<Vec<B::S>, WitgenError> {
+    ) -> Shares<B> {
         let base = 8 * q.limbs;
         let mut scale = scale.map(<[u64]>::to_vec);
         loop {
@@ -972,30 +1486,40 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 break;
             }
             scale = None;
-            bits = self.normalize(&folded, &[], nat_bitlen(&next_most))?;
+            bits = self.normalize(&folded, &[], nat_bitlen(&next_most)).await?;
             most = next_most;
         }
         let count = nat_divrem(&most, &q.p).0;
         for j in (0..nat_bitlen(&count)).rev() {
-            bits = self.conditional_sub(&bits, &nat_shl(&q.p, j))?;
+            bits = self.conditional_sub(&bits, &nat_shl(&q.p, j)).await?;
         }
         bits.resize(q.bits, self.zero);
         Ok(bits)
     }
 
-    /// The canonical residue of `x` modulo `q`, as bits.
-    fn canonical(&mut self, x: &Int<B::S>, q: &Modulus) -> Result<Vec<B::S>, WitgenError> {
+    /// The bits of the non-negative lift of `x` by a multiple of `q`, and their bound.
+    async fn lifted_bits(
+        &self,
+        x: &Int<B::S>,
+        q: &Modulus,
+    ) -> Result<(Vec<B::S>, Nat), WitgenError> {
         let (kq, most) = Self::lift(x, q);
-        let bits = self.normalize(x, &kq, nat_bitlen(&most))?;
-        self.reduce_bits(bits, most, q, None)
+        let bits = self.normalize(x, &kq, nat_bitlen(&most)).await?;
+        Ok((bits, most))
+    }
+
+    /// The canonical residue of `x` modulo `q`, as bits.
+    async fn canonical(&self, x: &Int<B::S>, q: &Modulus) -> Shares<B> {
+        let (bits, most) = self.lifted_bits(x, q).await?;
+        self.reduce_bits(bits, most, q, None).await
     }
 
     /// `x mod q`, opened. The integer that is opened is `x + (K + S) q` for a shared
     /// uniform `S` with [`SIGMA`] bits more than the quotient of `x` can have.
-    fn open_residue(&mut self, x: &Int<B::S>, q: &Modulus) -> Result<Nat, WitgenError> {
+    async fn open_residue(&self, x: &Int<B::S>, q: &Modulus) -> Result<Nat, WitgenError> {
         let (_, most) = Self::lift(x, q);
         let quotient_bits = nat_bitlen(&nat_divrem(&most, &q.p).0) + 1;
-        let s_bits = self.random_bits(quotient_bits + SIGMA as usize)?;
+        let s_bits = self.random_bits(quotient_bits + SIGMA as usize).await?;
         let s = self.int_of_bits(&s_bits);
         let mut qs = Int {
             c: vec![self.zero; s.len() + q.limbs + 1],
@@ -1011,10 +1535,8 @@ impl<'a, B: Backend> Witgen<'a, B> {
             }
         }
         let masked = self.int_add(x, &qs);
-        let (kq, most) = Self::lift(&masked, q);
-        let bits = self.normalize(&masked, &kq, nat_bitlen(&most))?;
-        self.check()?;
-        let opened = self.open(&bits)?;
+        let (bits, _) = self.lifted_bits(&masked, q).await?;
+        let opened = self.open(&bits, true).await?;
         let mut value = vec![0u64; opened.len() / 64 + 1];
         for (i, &v) in opened.iter().enumerate() {
             match v.to_canonical_u64() {
@@ -1027,32 +1549,31 @@ impl<'a, B: Backend> Witgen<'a, B> {
     }
 
     /// The canonical residue of `num / den` modulo `q`, as bits.
-    fn quotient_mod(
-        &mut self,
-        num: &Int<B::S>,
-        den: &Int<B::S>,
-        q: &Modulus,
-    ) -> Result<Vec<B::S>, WitgenError> {
-        let rho_bits = self.random_bits(q.bits + SIGMA as usize)?;
+    async fn quotient_mod(&self, num: &Int<B::S>, den: &Int<B::S>, q: &Modulus) -> Shares<B> {
+        let rho_bits = self.random_bits(q.bits + SIGMA as usize).await?;
         let rho = self.int_of_bits(&rho_bits);
-        let masked_den = self.int_mul(den, &rho)?;
-        let w = self.open_residue(&masked_den, q)?;
-        let inverse = if self.b.counting() {
+        let (masked_den, masked_num) =
+            join2(self.int_mul(den, &rho), self.int_mul(num, &rho)).await;
+        let (masked_den, masked_num) = (masked_den?, masked_num?);
+        let (w, lifted) = join2(
+            self.open_residue(&masked_den, q),
+            self.lifted_bits(&masked_num, q),
+        )
+        .await;
+        let (w, (bits, most)) = (w?, lifted?);
+        let inverse = if self.counting {
             vec![1]
         } else if w.is_empty() {
             return Err(WitgenError::ZeroDenominator);
         } else {
             nat_invmod(&w, &q.p)
         };
-        let masked_num = self.int_mul(num, &rho)?;
-        let (kq, most) = Self::lift(&masked_num, q);
-        let bits = self.normalize(&masked_num, &kq, nat_bitlen(&most))?;
-        self.reduce_bits(bits, most, q, Some(&inverse))
+        self.reduce_bits(bits, most, q, Some(&inverse)).await
     }
 
     /// `flag ? on_one : on_zero`, coefficient by coefficient.
-    fn int_select(
-        &mut self,
+    async fn int_select(
+        &self,
         flag: B::S,
         on_one: &Int<B::S>,
         on_zero: &Int<B::S>,
@@ -1065,7 +1586,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
         let (ones, zeros): (Vec<_>, Vec<_>) =
             (0..n).map(|k| (get(on_one, k), get(on_zero, k))).unzip();
         let deltas: Vec<B::S> = ones.iter().zip(&zeros).map(|(a, b)| a.0 - b.0).collect();
-        let moved = self.mul(&vec![flag; n], &deltas)?;
+        let moved = self.mul(&vec![flag; n], &deltas).await?;
         Ok(Int {
             c: zeros.iter().zip(&moved).map(|(z, &m)| z.0 + m).collect(),
             lo: ones.iter().zip(&zeros).map(|(a, b)| a.1.min(b.1)).collect(),
@@ -1075,45 +1596,43 @@ impl<'a, B: Backend> Witgen<'a, B> {
 
     /// The canonical residue of `num / den` modulo `q` where `den` is not zero modulo
     /// `q`, and of `alt_num / alt_den` where it is. Which one is not revealed.
-    fn slope(
-        &mut self,
+    async fn slope(
+        &self,
         num: &Int<B::S>,
         den: &Int<B::S>,
         alt_num: &Int<B::S>,
         alt_den: &Int<B::S>,
         q: &Modulus,
-    ) -> Result<Vec<B::S>, WitgenError> {
+    ) -> Shares<B> {
         // den = 0 mod q exactly when every bit of its canonical residue is zero.
-        let one = self.one;
         let mut level: Vec<B::S> = self
-            .canonical(den, q)?
+            .canonical(den, q)
+            .await?
             .iter()
-            .map(|&b| one - b)
+            .map(|&b| self.one - b)
             .collect();
         while level.len() > 1 {
             let odd = (level.len() % 2 == 1).then(|| level[level.len() - 1]);
             let (xs, ys): (Vec<B::S>, Vec<B::S>) =
                 level.chunks_exact(2).map(|p| (p[0], p[1])).unzip();
-            level = self.mul(&xs, &ys)?;
+            level = self.mul(&xs, &ys).await?;
             level.extend(odd);
         }
         let is_zero = level[0];
-        let num = self.int_select(is_zero, alt_num, num)?;
-        let den = self.int_select(is_zero, alt_den, den)?;
-        self.quotient_mod(&num, &den, q)
+        let (num, den) = join2(
+            self.int_select(is_zero, alt_num, num),
+            self.int_select(is_zero, alt_den, den),
+        )
+        .await;
+        self.quotient_mod(&num?, &den?, q).await
     }
 
     /// `N / q` for an integer `N` that `q` divides, with the quotient below `2^bits`.
-    fn exact_quotient(
-        &mut self,
-        num: &Int<B::S>,
-        q: &Modulus,
-        bits: usize,
-    ) -> Result<Vec<B::S>, WitgenError> {
+    async fn exact_quotient(&self, num: &Int<B::S>, q: &Modulus, bits: usize) -> Shares<B> {
         if bits > 56 {
             return Err(WitgenError::Unsupported { index: usize::MAX });
         }
-        let low = self.normalize(num, &[], bits)?;
+        let low = self.normalize(num, &[], bits).await?;
         // q^-1 mod 2^64 by Newton's iteration.
         let q0 = q.p[0];
         let mut inverse = q0;
@@ -1127,24 +1646,23 @@ impl<'a, B: Backend> Witgen<'a, B> {
             sum = sum + B::scale(bit, F::from_u64_reduced(weight));
             most += u128::from(weight);
         }
-        let mut out = self.decompose(sum, 128 - most.leading_zeros())?;
+        let mut out = self.decompose(sum, 128 - most.leading_zeros()).await?;
         out.resize(bits, self.zero);
         Ok(out)
     }
 
     /// The inverse of `x`, or zero; `x` lies in `[0, max]`.
-    fn inverse_or_zero(&mut self, x: B::S, max: usize) -> Result<B::S, WitgenError> {
+    async fn inverse_or_zero(&self, x: B::S, max: usize) -> Result<B::S, WitgenError> {
         let mut powers = vec![self.one, x];
         while powers.len() <= max {
             let have = powers.len();
             let upto = (2 * have - 1).min(max + 1);
             let xs: Vec<B::S> = (have..upto).map(|k| powers[k / 2]).collect();
             let ys: Vec<B::S> = (have..upto).map(|k| powers[k - k / 2]).collect();
-            powers.extend(self.mul(&xs, &ys)?);
+            powers.extend(self.mul(&xs, &ys).await?);
         }
-        let zero = self.zero;
         let matrix = self.matrix(max + 1);
-        Ok((1..=max).fold(zero, |acc, k| {
+        Ok((1..=max).fold(self.zero, |acc, k| {
             let coefficient = (1..=max).fold(F::ZERO, |c, j| {
                 c + matrix[k][j] * F::from_u64_reduced(j as u64).inv()
             });
@@ -1152,37 +1670,142 @@ impl<'a, B: Backend> Witgen<'a, B> {
         }))
     }
 
-    fn source(
-        &mut self,
-        z: &[B::S],
-        source: &Source,
-        input: Option<&Vec<B::S>>,
-    ) -> Result<Vec<B::S>, WitgenError> {
-        let unsupported = WitgenError::Unsupported { index: usize::MAX };
-        match source {
-            Source::Input { bits } => match input {
-                Some(shares) if shares.len() == *bits as usize => Ok(shares.clone()),
-                _ => Err(WitgenError::Inputs),
-            },
+    /// `scale (num / den - minus)` in the field, for a nonzero `den`.
+    async fn ratio(&self, num: B::S, den: B::S, minus: B::S, scale: F) -> Shares<B> {
+        let mask = self.random()?;
+        let masked = self.mul(&[den, num], &[mask, mask]).await?;
+        // A denominator can only be what the definitions say once every earlier opening
+        // is known to be right.
+        let opened = self.open(&masked[..1], true).await?[0];
+        let inverse = if self.counting {
+            F::ONE
+        } else if opened == F::ZERO {
+            return Err(WitgenError::ZeroDenominator);
+        } else {
+            opened.inv()
+        };
+        Ok(vec![
+            B::scale(masked[1], inverse * scale) - B::scale(minus, scale),
+        ])
+    }
+
+    /// The indicator of the value of `x` over `0..2^bits`: entry `j` is one where
+    /// `x = j`. For an `x` outside that range the entries are not an indicator, and the
+    /// relation has no proof.
+    async fn one_hot(&self, x: B::S, bits: u32) -> Shares<B> {
+        // Products of every subset of the bits, by halves: one round per doubling.
+        let mut blocks: Vec<Vec<B::S>> = self
+            .decompose(x, bits)
+            .await?
+            .iter()
+            .map(|&b| vec![self.one, b])
+            .collect();
+        while blocks.len() > 1 {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for pair in blocks.chunks_exact(2) {
+                for &h in &pair[1][1..] {
+                    for &l in &pair[0][1..] {
+                        xs.push(l);
+                        ys.push(h);
+                    }
+                }
+            }
+            let products = self.mul(&xs, &ys).await?;
+            let mut at = 0;
+            let mut next = Vec::with_capacity(blocks.len().div_ceil(2));
+            for pair in blocks.chunks(2) {
+                let mut joined = pair[0].clone();
+                if let Some(high) = pair.get(1) {
+                    for &h in &high[1..] {
+                        joined.push(h);
+                        let n = pair[0].len() - 1;
+                        joined.extend_from_slice(&products[at..at + n]);
+                        at += n;
+                    }
+                }
+                next.push(joined);
+            }
+            blocks = next;
+        }
+        // From subset products to the indicator: where a bit is zero the factor is
+        // `1 - bit`.
+        let mut out = blocks.pop().unwrap_or_else(|| vec![self.one]);
+        for bit in 0..bits as usize {
+            for mask in 0..out.len() {
+                if (mask >> bit) & 1 == 0 {
+                    out[mask] = out[mask] - out[mask | (1 << bit)];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The task of a variable that is neither a product nor read from a source.
+    fn var_task<'s>(&'s self, z: &[B::S], def: &Def) -> Option<Boxed<'s, Shares<B>>> {
+        Some(match def {
+            Def::Ratio {
+                num,
+                den,
+                minus,
+                scale,
+            } => {
+                let (n, d, m) = (self.eval(z, num), self.eval(z, den), self.eval(z, minus));
+                Box::pin(self.ratio(n, d, m, *scale))
+            }
+            Def::SumOfProducts { base, products } => {
+                let xs: Vec<B::S> = products.iter().map(|(a, _)| self.eval(z, a)).collect();
+                let ys: Vec<B::S> = products.iter().map(|(_, b)| self.eval(z, b)).collect();
+                let base = self.eval(z, base);
+                Box::pin(async move {
+                    let terms = self.mul(&xs, &ys).await?;
+                    Ok(vec![terms.iter().fold(base, |acc, &t| acc + t)])
+                })
+            }
+            Def::Power7(a) => {
+                let a = self.eval(z, a);
+                Box::pin(async move {
+                    let a2 = self.mul1(a, a).await?;
+                    let next = self.mul(&[a2, a2], &[a, a2]).await?;
+                    Ok(vec![self.mul1(next[0], next[1]).await?])
+                })
+            }
+            Def::InverseOrZero { of, max } => {
+                let (x, max) = (self.eval(z, of), *max as usize);
+                Box::pin(async move { Ok(vec![self.inverse_or_zero(x, max).await?]) })
+            }
+            _ => return None,
+        })
+    }
+
+    /// The task of a source that is not an input.
+    fn source_task<'s>(&'s self, z: &[B::S], source: &Source) -> Option<Boxed<'s, Shares<B>>> {
+        Some(match source {
+            Source::Input { .. } => return None,
             Source::PolyProduct { a, b } => {
                 let a: Vec<B::S> = a.iter().map(|lc| self.eval(z, lc)).collect();
                 let b: Vec<B::S> = b.iter().map(|lc| self.eval(z, lc)).collect();
-                self.poly_mul(&a, &b)
+                Box::pin(async move { self.poly_mul(&a, &b).await })
             }
             Source::Form { lc, bits } => {
-                if *bits > 64 {
-                    return Err(unsupported);
-                }
-                let x = self.eval(z, lc);
-                self.decompose(x, *bits)
+                let (x, bits) = (self.eval(z, lc), *bits);
+                Box::pin(async move {
+                    if bits > 64 {
+                        return Err(WitgenError::Unsupported { index: usize::MAX });
+                    }
+                    self.decompose(x, bits).await
+                })
             }
             Source::Integer {
                 products,
                 linear,
                 bits,
             } => {
-                let x = self.int_expr(z, products, linear)?;
-                self.normalize(&x, &[], *bits as usize)
+                let (products, linear) = (self.int_pairs(z, products), self.int_of(z, linear));
+                let bits = *bits as usize;
+                Box::pin(async move {
+                    let x = self.int_sum(&products, linear).await?;
+                    self.normalize(&x, &[], bits).await
+                })
             }
             Source::Residue {
                 products,
@@ -1190,14 +1813,16 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 den,
                 modulus,
             } => {
+                let (products, linear) = (self.int_pairs(z, products), self.int_of(z, linear));
+                let den = (!den.is_empty()).then(|| self.int_of(z, den));
                 let q = Modulus::new(modulus);
-                let num = self.int_expr(z, products, linear)?;
-                if den.is_empty() {
-                    self.canonical(&num, &q)
-                } else {
-                    let den = self.int_of(z, den);
-                    self.quotient_mod(&num, &den, &q)
-                }
+                Box::pin(async move {
+                    let num = self.int_sum(&products, linear).await?;
+                    match &den {
+                        None => self.canonical(&num, &q).await,
+                        Some(den) => self.quotient_mod(&num, den, &q).await,
+                    }
+                })
             }
             Source::Slope {
                 num,
@@ -1207,190 +1832,431 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 tangent_den,
                 modulus,
             } => {
-                let q = Modulus::new(modulus);
                 let (num, den) = (self.int_of(z, num), self.int_of(z, den));
-                let alt_num = self.int_expr(z, tangent_products, tangent_linear)?;
+                let products = self.int_pairs(z, tangent_products);
+                let linear = self.int_of(z, tangent_linear);
                 let alt_den = self.int_of(z, tangent_den);
-                self.slope(&num, &den, &alt_num, &alt_den, &q)
+                let q = Modulus::new(modulus);
+                Box::pin(async move {
+                    let alt_num = self.int_sum(&products, linear).await?;
+                    self.slope(&num, &den, &alt_num, &alt_den, &q).await
+                })
             }
             Source::Quotient { num, divisor, bits } => {
-                let q = Modulus::new(divisor);
-                let num = self.int_of(z, num);
-                self.exact_quotient(&num, &q, *bits as usize)
+                let (num, q, bits) = (self.int_of(z, num), Modulus::new(divisor), *bits as usize);
+                Box::pin(async move { self.exact_quotient(&num, &q, bits).await })
             }
-        }
+        })
     }
 
     /// Shares of the assignment of `shape`, whose variables are defined by `defs`.
     /// `inputs[k]` holds the bit shares of the relation's `k`-th input source. The masking
     /// variables are left zero.
+    ///
+    /// A product is asked for in the round after its factors are known, and a source or
+    /// a division starts then; one round of the backend serves everything that is
+    /// waiting. The order of requests is a function of the relation alone.
     pub fn run(
-        &mut self,
+        &self,
         shape: &Shape,
         defs: &Definitions,
         public_inputs: &[F],
         inputs: &[Vec<B::S>],
-    ) -> Result<Vec<B::S>, WitgenError> {
+    ) -> Shares<B> {
         let unsupported = |index: usize| WitgenError::Unsupported { index };
         if defs.vars.len() != shape.num_vars || public_inputs.len() != shape.num_public {
             return Err(unsupported(0));
         }
-        let max_var = |lc: &Lc| {
-            lc.terms()
-                .iter()
-                .map(|&(v, _)| v as usize)
-                .max()
-                .unwrap_or(0)
+        let first = 1 + shape.num_public;
+        let stop = shape.mask_var_base;
+        let vars = shape.num_vars;
+        let after_sources = vars + defs.sources.len();
+        let lookups = shape.lookups();
+        let units = after_sources + lookups.map_or(0, |l| l.num_lookups);
+        // The range tables of the relation: per table tag, its first entry and its bits.
+        let constant = |m: &dregg_sig_agg::zk_hem::relation::Csr, i: usize| {
+            m.row(i)
+                .try_fold(F::ZERO, |acc, (col, c)| (col == 0).then_some(acc + c))
         };
-        let mut z = vec![self.zero; shape.num_vars];
+        let mut tables: BTreeMap<u64, (usize, u32)> = BTreeMap::new();
+        if let Some(l) = lookups {
+            let rows = l.num_lookups..l.num_lookups + l.num_table_rows;
+            let mut at = rows.start;
+            while at < rows.end {
+                let tag = constant(&l.den[0], at);
+                let len = (at..rows.end)
+                    .take_while(|&e| constant(&l.den[0], e) == tag)
+                    .count();
+                let range = len.is_power_of_two()
+                    && l.den.len() >= 2
+                    && (0..len).all(|j| {
+                        constant(&l.den[1], at + j) == Some(F::from_u64_reduced(j as u64))
+                            && l.den[2..].iter().all(|m| m.row(at + j).next().is_none())
+                    });
+                if let (Some(tag), true) = (tag, range) {
+                    tables.insert(tag.to_canonical_u64(), (at, len.trailing_zeros()));
+                }
+                at += len;
+            }
+        }
+        // The table of lookup `i`, when it is a range table and the tuple has one column.
+        let table_of = |i: usize| {
+            let l = lookups?;
+            let tag = constant(&l.den[0], i)?.to_canonical_u64();
+            let narrow = l.den[2..].iter().all(|m| m.row(i).next().is_none());
+            tables.get(&tag).copied().filter(|_| narrow)
+        };
+        if let Some(l) = lookups
+            && let Some(lookup) = (0..l.num_lookups).find(|&i| table_of(i).is_none())
+        {
+            return Err(WitgenError::Table { lookup });
+        }
+
+        // The variables read from each source; the forms each unit waits for.
+        let mut readers: Vec<Vec<u32>> = vec![Vec::new(); defs.sources.len()];
+        for i in first..stop {
+            match &defs.vars[i] {
+                Def::Bits { source, .. }
+                | Def::Coefficient {
+                    product: source, ..
+                } => readers
+                    .get_mut(source.index())
+                    .ok_or(unsupported(i))?
+                    .push(i as u32),
+                Def::Undefined | Def::One | Def::Public | Def::Mask => return Err(unsupported(i)),
+                _ => {}
+            }
+        }
+        let unit_forms = |unit: usize, visit: &mut Visit<'_>| {
+            let coefs =
+                |v: &[IntCoef], visit: &mut Visit<'_>| v.iter().for_each(|c| visit(c.lc.terms()));
+            let pairs = |v: &[(Vec<IntCoef>, Vec<IntCoef>)], visit: &mut Visit<'_>| {
+                for (a, b) in v {
+                    coefs(a, visit);
+                    coefs(b, visit);
+                }
+            };
+            if unit < vars {
+                match &defs.vars[unit] {
+                    Def::Product(a, b) => {
+                        visit(a.terms());
+                        visit(b.terms());
+                    }
+                    Def::Power7(a) => visit(a.terms()),
+                    Def::SumOfProducts { base, products } => {
+                        visit(base.terms());
+                        for (a, b) in products {
+                            visit(a.terms());
+                            visit(b.terms());
+                        }
+                    }
+                    Def::Ratio {
+                        num, den, minus, ..
+                    } => {
+                        visit(num.terms());
+                        visit(den.terms());
+                        visit(minus.terms());
+                    }
+                    Def::InverseOrZero { of, .. } => visit(of.terms()),
+                    _ => {}
+                }
+            } else if unit >= after_sources {
+                // A lookup waits for the variables of its value.
+                if let Some(l) = lookups {
+                    let terms: Vec<(u32, F)> = l.den[1]
+                        .row(unit - after_sources)
+                        .map(|(col, c)| (col as u32, c))
+                        .collect();
+                    visit(&terms);
+                }
+            } else {
+                match &defs.sources[unit - vars] {
+                    Source::Input { .. } => {}
+                    Source::PolyProduct { a, b } => {
+                        a.iter().chain(b).for_each(|lc| visit(lc.terms()))
+                    }
+                    Source::Form { lc, .. } => visit(lc.terms()),
+                    Source::Integer {
+                        products, linear, ..
+                    } => {
+                        pairs(products, visit);
+                        coefs(linear, visit);
+                    }
+                    Source::Residue {
+                        products,
+                        linear,
+                        den,
+                        ..
+                    } => {
+                        pairs(products, visit);
+                        coefs(linear, visit);
+                        coefs(den, visit);
+                    }
+                    Source::Slope {
+                        num,
+                        den,
+                        tangent_products,
+                        tangent_linear,
+                        tangent_den,
+                        ..
+                    } => {
+                        coefs(num, visit);
+                        coefs(den, visit);
+                        pairs(tangent_products, visit);
+                        coefs(tangent_linear, visit);
+                        coefs(tangent_den, visit);
+                    }
+                    Source::Quotient { num, .. } => coefs(num, visit),
+                }
+            }
+        };
+        let is_unit = |unit: usize| {
+            if unit < vars {
+                (first..stop).contains(&unit)
+                    && !matches!(
+                        defs.vars[unit],
+                        Def::Bits { .. } | Def::Coefficient { .. } | Def::Multiplicity
+                    )
+            } else if unit >= after_sources {
+                true
+            } else {
+                !readers[unit - vars].is_empty()
+                    && !matches!(defs.sources[unit - vars], Source::Input { .. })
+            }
+        };
+        // waiting[u]: terms of unit `u` whose variable is not set yet. dependents: for
+        // each variable, the units with a term in it (one entry per term).
+        let mut waiting = vec![0u32; units];
+        let mut starts = vec![0u32; vars + 1];
+        let mut bad = None;
+        for unit in (0..units).filter(|&u| is_unit(u)) {
+            let limit = match (unit < vars, lookups) {
+                (true, _) => unit,
+                (false, Some(l)) => l.mult_var_base,
+                (false, None) => stop,
+            };
+            unit_forms(unit, &mut |terms| {
+                for &(v, _) in terms {
+                    let v = v as usize;
+                    if v >= limit {
+                        bad = Some(unit);
+                    } else if v >= first {
+                        waiting[unit] += 1;
+                        starts[v + 1] += 1;
+                    }
+                }
+            });
+        }
+        if let Some(unit) = bad {
+            return Err(unsupported(unit));
+        }
+        for v in 0..vars {
+            starts[v + 1] += starts[v];
+        }
+        let mut dependents = vec![0u32; starts[vars] as usize];
+        let mut fill = starts.clone();
+        for unit in (0..units).filter(|&u| is_unit(u)) {
+            unit_forms(unit, &mut |terms| {
+                for &(v, _) in terms {
+                    let v = v as usize;
+                    if v >= first {
+                        dependents[fill[v] as usize] = unit as u32;
+                        fill[v] += 1;
+                    }
+                }
+            });
+        }
+        drop(fill);
+
+        let mut z = vec![self.zero; vars];
         z[0] = self.one;
         for (slot, &v) in z[1..].iter_mut().zip(public_inputs) {
-            *slot = self.b.public(v);
+            *slot = self.public(v);
         }
-        let mut sources: Vec<Option<Vec<B::S>>> = vec![None; defs.sources.len()];
-        let mut next_input = 0;
-        let stop = shape.mask_var_base;
-        let mut i = 1 + shape.num_public;
-        while i < stop {
-            if self.unchecked >= CHECK_EVERY {
-                self.check()?;
+        let mut ready: Vec<u32> = (0..units)
+            .filter(|&u| is_unit(u) && waiting[u] == 0)
+            .map(|u| u as u32)
+            .collect();
+        let mut unset = stop - first;
+        let mut set = |z: &mut Vec<B::S>, ready: &mut Vec<u32>, i: usize, value: B::S| {
+            z[i] = value;
+            unset -= 1;
+            for &unit in &dependents[starts[i] as usize..starts[i + 1] as usize] {
+                waiting[unit as usize] -= 1;
+                if waiting[unit as usize] == 0 {
+                    ready.push(unit);
+                }
             }
+        };
+        // What a finished source gives its readers.
+        let read = |i: usize, values: &[B::S]| -> Result<B::S, WitgenError> {
             match &defs.vars[i] {
-                Def::Product(..) => {
-                    let (mut xs, mut ys) = (Vec::new(), Vec::new());
-                    let mut end = i;
-                    while end < stop {
-                        match &defs.vars[end] {
-                            Def::Product(a, b) if max_var(a) < i && max_var(b) < i => {
-                                xs.push(self.eval(&z, a));
-                                ys.push(self.eval(&z, b));
-                                end += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                    if end == i {
-                        return Err(unsupported(i));
-                    }
-                    let products = self.mul(&xs, &ys)?;
-                    z[i..end].copy_from_slice(&products);
-                    i = end;
-                    continue;
+                Def::Coefficient { index, .. } => {
+                    values.get(*index as usize).copied().ok_or(unsupported(i))
                 }
-                Def::Ratio { .. } => {
-                    let mut run = Vec::new();
-                    let mut end = i;
-                    while end < stop {
-                        match &defs.vars[end] {
-                            Def::Ratio {
-                                num,
-                                den,
-                                minus,
-                                scale,
-                            } if [num, den, minus].iter().all(|lc| max_var(lc) < i) => {
-                                run.push((
-                                    self.eval(&z, num),
-                                    self.eval(&z, den),
-                                    self.eval(&z, minus),
-                                    *scale,
-                                ));
-                                end += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-                    if end == i {
-                        return Err(unsupported(i));
-                    }
-                    let n = run.len();
-                    let masks: Vec<B::S> =
-                        (0..n).map(|_| self.b.random()).collect::<Result<_, _>>()?;
-                    let mut xs: Vec<B::S> = run.iter().map(|r| r.1).collect();
-                    xs.extend(run.iter().map(|r| r.0));
-                    let ys: Vec<B::S> = masks.iter().chain(&masks).copied().collect();
-                    let masked = self.mul(&xs, &ys)?;
-                    // A denominator can only be what the definitions say once every
-                    // earlier opening is known to be right.
-                    self.check()?;
-                    let opened = self.open(&masked[..n])?;
-                    for (k, r) in run.iter().enumerate() {
-                        let inverse = if self.b.counting() {
-                            F::ONE
-                        } else if opened[k] == F::ZERO {
-                            return Err(WitgenError::ZeroDenominator);
-                        } else {
-                            opened[k].inv()
-                        };
-                        z[i + k] = B::scale(masked[n + k], inverse * r.3) - B::scale(r.2, r.3);
-                    }
-                    i = end;
-                    continue;
-                }
-                Def::SumOfProducts { base, products } => {
-                    let xs: Vec<B::S> = products.iter().map(|(a, _)| self.eval(&z, a)).collect();
-                    let ys: Vec<B::S> = products.iter().map(|(_, b)| self.eval(&z, b)).collect();
-                    let terms = self.mul(&xs, &ys)?;
-                    z[i] = terms.iter().fold(self.eval(&z, base), |acc, &t| acc + t);
-                }
-                Def::Power7(a) => {
-                    let a = self.eval(&z, a);
-                    let a2 = self.mul1(a, a)?;
-                    let a4 = self.mul1(a2, a2)?;
-                    let a6 = self.mul1(a4, a2)?;
-                    z[i] = self.mul1(a6, a)?;
-                }
-                Def::InverseOrZero { of, max } => {
-                    let x = self.eval(&z, of);
-                    z[i] = self.inverse_or_zero(x, *max as usize)?;
-                }
-                Def::Coefficient { product: id, index } => {
-                    let id = id.index();
-                    if id >= sources.len() {
-                        return Err(unsupported(i));
-                    }
-                    if sources[id].is_none() {
-                        sources[id] = Some(self.source(&z, &defs.sources[id], None)?);
-                    }
-                    z[i] = *sources[id]
-                        .as_ref()
-                        .and_then(|c| c.get(*index as usize))
-                        .ok_or(unsupported(i))?;
-                }
-                Def::Bits {
-                    source: id,
-                    lo,
-                    width,
-                } => {
-                    let id = id.index();
-                    if id >= sources.len() {
-                        return Err(unsupported(i));
-                    }
-                    if sources[id].is_none() {
-                        let input = match &defs.sources[id] {
-                            Source::Input { .. } => {
-                                next_input += 1;
-                                inputs.get(next_input - 1)
-                            }
-                            _ => None,
-                        };
-                        sources[id] = Some(self.source(&z, &defs.sources[id], input)?);
-                    }
-                    let bits = sources[id].as_ref().expect("just computed");
-                    z[i] = (0..*width as usize).fold(self.zero, |acc, t| {
-                        match bits.get(*lo as usize + t) {
+                Def::Bits { lo, width, .. } => {
+                    Ok((0..*width as usize).fold(self.zero, |acc, t| {
+                        match values.get(*lo as usize + t) {
                             Some(&b) => acc + B::scale(b, pow2(t)),
                             None => acc,
                         }
-                    });
+                    }))
                 }
-                Def::Undefined | Def::One | Def::Public | Def::Mask => {
-                    return Err(unsupported(i));
-                }
+                _ => Err(unsupported(i)),
             }
-            i += 1;
+        };
+
+        // Inputs, in the order their sources are first read.
+        let mut next_input = 0;
+        for (id, source) in defs.sources.iter().enumerate() {
+            let Source::Input { bits } = source else {
+                continue;
+            };
+            if readers[id].is_empty() {
+                continue;
+            }
+            let shares = inputs
+                .get(next_input)
+                .filter(|s| s.len() == *bits as usize)
+                .ok_or(WitgenError::Inputs)?;
+            next_input += 1;
+            for &i in &readers[id] {
+                let value = read(i as usize, shares)?;
+                set(&mut z, &mut ready, i as usize, value);
+            }
         }
         if next_input != inputs.len() {
             return Err(WitgenError::Inputs);
+        }
+
+        if !self.planning {
+            let (bits, masks) = plan(shape, defs, self.chains)?;
+            self.wait(self.fill_pool(bits, masks))?;
+        }
+        // Multiplicities: the sum over the lookups of the indicator of each one's row.
+        let mut counts: Vec<B::S> = vec![self.zero; lookups.map_or(0, |l| l.num_table_rows)];
+        let mut uncounted = lookups.map_or(0, |l| l.num_lookups);
+        if let (Some(l), 0) = (lookups, uncounted) {
+            for (r, &count) in counts.iter().enumerate() {
+                set(&mut z, &mut ready, l.mult_var_base + r, count);
+            }
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut active: Vec<(u32, Boxed<'_, Shares<B>>)> = Vec::new();
+        let mut direct: Vec<(usize, u32)> = Vec::new();
+        loop {
+            // Start what is ready; a unit that finishes at once may make more ready.
+            let mut next = 0;
+            let mut finished: Vec<(u32, Vec<B::S>)> = Vec::new();
+            loop {
+                while next < ready.len() {
+                    let unit = ready[next] as usize;
+                    next += 1;
+                    if unit < vars
+                        && let Def::Product(a, b) = &defs.vars[unit]
+                    {
+                        let at = self.push_mul(&[self.eval(&z, a)], &[self.eval(&z, b)]);
+                        direct.push((at, unit as u32));
+                        continue;
+                    }
+                    let task = if unit < vars {
+                        self.var_task(&z, &defs.vars[unit])
+                    } else if unit >= after_sources {
+                        lookups
+                            .zip(table_of(unit - after_sources))
+                            .map(|(l, (_, bits))| {
+                                let x = l.den[1]
+                                    .row(unit - after_sources)
+                                    .fold(self.zero, |acc, (col, c)| acc + B::scale(z[col], c));
+                                Box::pin(self.one_hot(x, bits)) as Boxed<'_, Shares<B>>
+                            })
+                    } else {
+                        self.source_task(&z, &defs.sources[unit - vars])
+                    };
+                    let mut task = task.ok_or(unsupported(unit))?;
+                    match task.as_mut().poll(&mut cx) {
+                        Poll::Ready(values) => finished.push((unit as u32, values?)),
+                        Poll::Pending => active.push((unit as u32, task)),
+                    }
+                }
+                if finished.is_empty() {
+                    break;
+                }
+                for (unit, values) in finished.drain(..) {
+                    let unit = unit as usize;
+                    if unit < vars {
+                        let value = *values.first().ok_or(unsupported(unit))?;
+                        set(&mut z, &mut ready, unit, value);
+                    } else if unit >= after_sources {
+                        let (l, (start, _)) = lookups
+                            .zip(table_of(unit - after_sources))
+                            .ok_or(unsupported(unit))?;
+                        let row = start - l.num_lookups;
+                        for (count, &hit) in counts[row..].iter_mut().zip(&values) {
+                            *count = *count + hit;
+                        }
+                        uncounted -= 1;
+                        if uncounted == 0 {
+                            for (r, &count) in counts.iter().enumerate() {
+                                set(&mut z, &mut ready, l.mult_var_base + r, count);
+                            }
+                        }
+                    } else {
+                        for &i in &readers[unit - vars] {
+                            let value = read(i as usize, &values)?;
+                            set(&mut z, &mut ready, i as usize, value);
+                        }
+                    }
+                }
+            }
+            ready.clear();
+            if self.idle() {
+                break;
+            }
+            self.step()?;
+            for (at, var) in direct.drain(..) {
+                let value = self.q.borrow().products[at];
+                set(&mut z, &mut ready, var as usize, value);
+            }
+            // Every waiting task asked for something in the round that just ran.
+            let mut finished: Vec<(u32, Vec<B::S>)> = Vec::new();
+            for (unit, mut task) in core::mem::take(&mut active) {
+                match task.as_mut().poll(&mut cx) {
+                    Poll::Ready(values) => finished.push((unit, values?)),
+                    Poll::Pending => active.push((unit, task)),
+                }
+            }
+            for (unit, values) in finished {
+                let unit = unit as usize;
+                if unit < vars {
+                    let value = *values.first().ok_or(unsupported(unit))?;
+                    set(&mut z, &mut ready, unit, value);
+                } else if unit >= after_sources {
+                    let (l, (start, _)) = lookups
+                        .zip(table_of(unit - after_sources))
+                        .ok_or(unsupported(unit))?;
+                    let row = start - l.num_lookups;
+                    for (count, &hit) in counts[row..].iter_mut().zip(&values) {
+                        *count = *count + hit;
+                    }
+                    uncounted -= 1;
+                    if uncounted == 0 {
+                        for (r, &count) in counts.iter().enumerate() {
+                            set(&mut z, &mut ready, l.mult_var_base + r, count);
+                        }
+                    }
+                } else {
+                    for &i in &readers[unit - vars] {
+                        let value = read(i as usize, &values)?;
+                        set(&mut z, &mut ready, i as usize, value);
+                    }
+                }
+            }
+        }
+        drop(active);
+        if unset != 0 {
+            // A variable that waits for itself or for a variable nothing defines.
+            return Err(unsupported(first));
         }
         self.check()?;
         Ok(z)
@@ -1408,16 +2274,39 @@ pub fn input_bits(defs: &Definitions) -> Vec<usize> {
         .collect()
 }
 
-/// What one custodian's [`generate`] consumes at most: triples, uniform values, and the
-/// counts of opened values, rounds and MAC checks.
+/// What one custodian's [`generate`] consumes: triples, uniform values, and the counts
+/// of opened values, rounds and MAC checks.
 pub fn demand(shape: &Shape, defs: &Definitions) -> Result<Count, WitgenError> {
+    demand_with(shape, defs, CHAINS)
+}
+
+/// The random bits and exact masks the subprotocols of a relation ask for.
+fn plan(shape: &Shape, defs: &Definitions, chains: Chains) -> Result<(usize, usize), WitgenError> {
     let mut count = Count::default();
     let inputs: Vec<Vec<Unit>> = input_bits(defs)
         .into_iter()
         .map(|bits| vec![Unit; bits])
         .collect();
     let public = vec![F::ZERO; shape.num_public];
-    Witgen::new(&mut count).run(shape, defs, &public, &inputs)?;
+    let mut w = Witgen::with_chains(&mut count, chains);
+    w.planning = true;
+    w.run(shape, defs, &public, &inputs)?;
+    Ok(w.asked.get())
+}
+
+/// [`demand`] for a choice of carry chains.
+pub fn demand_with(
+    shape: &Shape,
+    defs: &Definitions,
+    chains: Chains,
+) -> Result<Count, WitgenError> {
+    let mut count = Count::default();
+    let inputs: Vec<Vec<Unit>> = input_bits(defs)
+        .into_iter()
+        .map(|bits| vec![Unit; bits])
+        .collect();
+    let public = vec![F::ZERO; shape.num_public];
+    Witgen::with_chains(&mut count, chains).run(shape, defs, &public, &inputs)?;
     Ok(count)
 }
 
@@ -1482,12 +2371,18 @@ pub(super) mod tests {
             self.count.randoms += 1;
             Ok(Clear(self.stream.next_base()))
         }
-        fn mul(&mut self, xs: &[Clear], ys: &[Clear]) -> Result<Vec<Clear>, MpcError> {
+        fn round(
+            &mut self,
+            xs: &[Clear],
+            ys: &[Clear],
+            opens: &[Clear],
+        ) -> Result<(Vec<Clear>, Vec<F>), MpcError> {
             self.count.triples += xs.len();
-            Ok(xs.iter().zip(ys).map(|(x, y)| Clear(x.0 * y.0)).collect())
-        }
-        fn open(&mut self, xs: &[Clear]) -> Result<Vec<F>, MpcError> {
-            Ok(xs.iter().map(|x| x.0).collect())
+            self.count.rounds += 1;
+            Ok((
+                xs.iter().zip(ys).map(|(x, y)| Clear(x.0 * y.0)).collect(),
+                opens.iter().map(|x| x.0).collect(),
+            ))
         }
         fn check(&mut self) -> Result<(), MpcError> {
             Ok(())
@@ -1572,7 +2467,7 @@ pub(super) mod tests {
     fn decomposition_is_exact_at_every_width_and_boundary() {
         let mut plain = Plain::new(2);
         let mut s = SeedStream::new(b"DREGG.TEST.WITGEN", &[3; 32]);
-        let mut w = Witgen::new(&mut plain);
+        let w = Witgen::new(&mut plain);
         for m in [1u32, 2, 8, 22, 23, 31, 32, 33, 40, 63, 64] {
             let top = if m == 64 {
                 0xFFFF_FFFF_0000_0000
@@ -1583,20 +2478,22 @@ pub(super) mod tests {
             cases.extend((0..12).map(|_| s.next_base().to_canonical_u64() & top));
             for x in cases {
                 let x = x.min(top);
-                let bits = w.decompose(Clear(f(x)), m).unwrap();
+                let bits = w.wait(w.decompose(Clear(f(x)), m)).unwrap();
                 assert_eq!(bits.len(), m as usize);
                 assert_eq!(value(&bits), nat_trim(vec![x]), "m={m} x={x}");
             }
         }
         // The counter is an upper bound on what a real run uses.
-        let used = w.b.count;
+        drop(w);
+        let used = plain.count;
         let mut count = Count::default();
-        let mut c = Witgen::new(&mut count);
+        let c = Witgen::new(&mut count);
         for m in [1u32, 2, 8, 22, 23, 31, 32, 33, 40, 63, 64] {
             for _ in 0..17 {
-                c.decompose(Unit, m).unwrap();
+                c.wait(c.decompose(Unit, m)).unwrap();
             }
         }
+        drop(c);
         assert!(count.triples >= used.triples && count.triples <= used.triples + used.triples / 4);
         assert!(count.randoms <= used.randoms && count.randoms + 64 * 8 >= used.randoms);
     }
@@ -1622,7 +2519,7 @@ pub(super) mod tests {
     fn residues_quotients_and_inverses_match_public_arithmetic() {
         let mut s = SeedStream::new(b"DREGG.TEST.WITGEN", &[4; 32]);
         let mut plain = Plain::new(5);
-        let mut w = Witgen::new(&mut plain);
+        let w = Witgen::new(&mut plain);
         let mut limbs = |n: usize, lo: i128, hi: i128| -> Vec<i128> {
             (0..n)
                 .map(|_| lo + (s.next_base().to_canonical_u64() as i128) % (hi - lo + 1))
@@ -1639,7 +2536,7 @@ pub(super) mod tests {
                     int(&b, -255, 255),
                     int(&c, -(1 << 40), 1 << 40),
                 );
-                let product = w.int_mul(&ia, &ib).unwrap();
+                let product = w.wait(w.int_mul(&ia, &ib)).unwrap();
                 let x = w.int_add(&product, &ic);
                 let (ap, an) = int_value(&a);
                 let (bp, bn) = int_value(&b);
@@ -1650,7 +2547,7 @@ pub(super) mod tests {
                 };
                 let (am, bm, cm) = (reduce(&ap, &an), reduce(&bp, &bn), reduce(&cp, &cn));
                 let want = nat_divrem(&nat_add(&nat_mulmod(&am, &bm, &q.p), &cm), &q.p).1;
-                let got = w.canonical(&x, &q).unwrap();
+                let got = w.wait(w.canonical(&x, &q)).unwrap();
                 assert_eq!(got.len(), q.bits);
                 assert_eq!(value(&got), want, "residue, round {round}");
 
@@ -1659,7 +2556,7 @@ pub(super) mod tests {
                 let id = int(&d, -255, 255);
                 let (dp, dn) = int_value(&d);
                 let dm = reduce(&dp, &dn);
-                let got = w.quotient_mod(&x, &id, &q).unwrap();
+                let got = w.wait(w.quotient_mod(&x, &id, &q)).unwrap();
                 assert_eq!(
                     value(&got),
                     nat_mulmod(&want, &nat_invmod(&dm, &q.p), &q.p),
@@ -1670,7 +2567,7 @@ pub(super) mod tests {
             let zero = int(&[0; 32], -255, 255);
             let one = int(&[1], 0, 255);
             assert_eq!(
-                w.quotient_mod(&one, &zero, &q).err(),
+                w.wait(w.quotient_mod(&one, &zero, &q)).err(),
                 Some(WitgenError::ZeroDenominator)
             );
 
@@ -1683,12 +2580,12 @@ pub(super) mod tests {
             coefficients[2] -= 256 * 77;
             coefficients[3] += 77;
             let num = int(&coefficients, -(1 << 20), 1 << 20);
-            let got = w.exact_quotient(&num, &q, 27).unwrap();
+            let got = w.wait(w.exact_quotient(&num, &q, 27)).unwrap();
             assert_eq!(value(&got), vec![quotient]);
         }
         for max in [1usize, 2, 5, 40] {
             for x in 0..=max as u64 {
-                let got = w.inverse_or_zero(Clear(f(x)), max).unwrap();
+                let got = w.wait(w.inverse_or_zero(Clear(f(x)), max)).unwrap();
                 assert_eq!(got.0, f(x).inv_or_zero(), "max={max} x={x}");
             }
         }
@@ -1696,8 +2593,8 @@ pub(super) mod tests {
 
     use crate::hem::relations::{
         Bip32Root, Ed25519ExtendedKey, KeySource, Lock, OwnershipStatement, OwnershipWitness,
-        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions,
-        ownership_shape, synthesize_ownership,
+        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions, ownership_shape,
+        synthesize_ownership,
     };
 
     fn statement(lock: Lock, source: KeySource, witness: &OwnershipWitness) -> OwnershipStatement {
@@ -1910,7 +2807,12 @@ pub(super) mod tests {
             };
             let z = run(&inputs).unwrap();
             let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
-            assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None, "{:?}", st.source);
+            assert_eq!(
+                wrong.map(|i| (i, defs.vars[i].clone())),
+                None,
+                "{:?}",
+                st.source
+            );
 
             // The auxiliary inputs matter: flipping the first or the last of them moves
             // the assignment (or leaves the relation without one).
@@ -1929,12 +2831,19 @@ pub(super) mod tests {
             assert_eq!(aux(65, &path, root.as_ref()), None);
             let long = [path.clone(), vec![H, H, H]].concat();
             assert_eq!(aux(secret.len(), &long, root.as_ref()), None);
-            let flipped = if root.is_some() { None } else { Some(&[1u8; 32]) };
+            let flipped = if root.is_some() {
+                None
+            } else {
+                Some(&[1u8; 32])
+            };
             assert_eq!(aux(secret.len(), &path, flipped), None);
         }
         // A SLIP-0010 path has hardened steps only.
         let (st, _, secret, _, _) = derived_cases().swap_remove(2);
-        assert_eq!(ownership_auxiliary_inputs(&st, secret.len(), &[5], None), None);
+        assert_eq!(
+            ownership_auxiliary_inputs(&st, secret.len(), &[5], None),
+            None
+        );
     }
 
     /// An addition that may be a doubling: the chord where the denominator is nonzero
@@ -1965,15 +2874,17 @@ pub(super) mod tests {
             (prime.clone(), true),
         ] {
             let mut plain = Plain::new(8);
-            let got = Witgen::new(&mut plain)
-                .slope(
+            let w = Witgen::new(&mut plain);
+            let got = w
+                .wait(w.slope(
                     &int(&num, -300, 300),
                     &int(&den, -300, 300),
                     &int(&alt_num, -3000, 3000),
                     &int(&alt_den, -300, 300),
                     &q,
-                )
+                ))
                 .unwrap();
+            drop(w);
             let (n, d) = if tangent {
                 (reduce(&alt_num), reduce(&alt_den))
             } else {
@@ -2015,6 +2926,41 @@ pub(super) mod tests {
         assert_eq!(used[0], used[1]);
     }
 
+    /// Triples and rounds of the two reference statements under each kind of chain.
+    /// `cargo test --release -p dregg-sig-migrate --features std --lib --
+    /// hem::collab::witgen::tests::measure_chains --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_chains() {
+        let mut cases: Vec<OwnershipStatement> =
+            reference_cases().into_iter().map(|c| c.0).collect();
+        cases.push(derived_cases().swap_remove(0).0);
+        // m/44'/0'/0'/0/0 from a master seed.
+        const H: u32 = 1 << 31;
+        let seed = OwnershipWitness::seed(&[0x31; 16]);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Public(vec![H + 44, H, H, 0, 0]),
+        };
+        cases.push(statement(Lock::P2pkh, source, &seed));
+        for st in cases {
+            let (shape, defs) = ownership_definitions(&st).unwrap();
+            for chains in [Chains::Ripple, Chains::Prefix, Chains::Mixed] {
+                let c = demand_with(&shape, &defs, chains).unwrap();
+                std::println!(
+                    "{:?} {:?} {chains:?}: triples={} randoms={} rounds={} checks={} opened={}",
+                    st.lock,
+                    st.source,
+                    c.triples,
+                    c.randoms,
+                    c.rounds,
+                    c.checks,
+                    c.opened
+                );
+            }
+        }
+    }
+
     /// The definitions mean what the gadgets compute: evaluated on plain values from the
     /// secret alone they give the gadget's assignment, variable for variable.
     #[test]
@@ -2050,8 +2996,17 @@ pub(super) mod tests {
                 bound.rounds,
                 bound.checks,
             );
-            assert!(bound.triples >= plain.count.triples && bound.randoms >= plain.count.randoms);
-            assert!(bound.triples <= plain.count.triples + plain.count.triples / 8);
+            // The run consumes exactly what the count says, in as many rounds, and the
+            // rounds are the relation's depth (pinned), not its size.
+            assert_eq!(
+                (bound.triples, bound.randoms, bound.rounds),
+                (plain.count.triples, plain.count.randoms, plain.count.rounds)
+            );
+            let pinned = match st.lock {
+                Lock::P2pkh => (2_151_917, 14_049),
+                _ => (2_286_466, 13_443),
+            };
+            assert_eq!((bound.triples, bound.rounds), pinned);
 
             // A wrong input bit gives a different assignment, and too few inputs are refused.
             let mut flipped = bits.clone();
@@ -2104,6 +3059,119 @@ pub(super) mod tests {
         let reduced = field.mul(&mut cs, &Lazy::from_bits(&bits), &Lazy::from_bits(&mixed));
         field.enforce_canonical(&mut cs, &reduced);
         cs.finish_recorded()
+    }
+
+    /// A relation over a 4-byte secret, with or without byte lookups of six values: the
+    /// four secret bytes, one of them again, and a constant.
+    fn byte_lookup_recorded(secret: &[u8; 4], lookups: bool) -> (Shape, Vec<F>, Definitions) {
+        let mut cs = ConstraintSystem::new_recording();
+        let public: Lc = cs
+            .public_input(f(u64::from(secret[0]) * u64::from(secret[1])))
+            .into();
+        let bits = alloc_bits(&mut cs, secret);
+        let bytes: Vec<Lc> = bits.chunks(8).map(pack_bits).collect();
+        let product = cs.mul(&bytes[0], &bytes[1]);
+        cs.enforce_equal(&product.into(), &public);
+        if lookups {
+            for byte in bytes.iter().chain([&bytes[2], &Lc::constant(f(200))]) {
+                cs.enforce_byte(byte);
+            }
+        }
+        cs.finish_recorded()
+    }
+
+    /// Multiplicities on shares: the count of each table row over the lookups, at 302
+    /// triples and 48 uniform values a byte lookup, in the rounds the rest takes.
+    #[test]
+    fn multiplicities_of_byte_lookups_are_counted_on_shares() {
+        let secret = [0xa7, 0x00, 0xff, 0xa7];
+        let (shape, assignment, defs) = byte_lookup_recorded(&secret, true);
+        assert!(shape.is_satisfied(&assignment));
+        assert_eq!(defs.undefined(), Vec::<usize>::new());
+        let l = shape.lookups().unwrap();
+        assert_eq!((l.num_lookups, l.num_table_rows), (6, 256));
+        // 0xa7 twice, 0xff twice (bytes[2] is looked up again), 0x00 and 200 once.
+        let count = |row: usize| assignment[l.mult_var_base + row].to_canonical_u64();
+        assert_eq!(
+            (count(0xa7), count(0xff), count(0), count(200), count(1)),
+            (2, 2, 1, 1, 0)
+        );
+
+        let inputs = clear_inputs(&defs, &secret, &[]);
+        let publics = assignment[1..=shape.num_public].to_vec();
+        let mut plain = Plain::new(9);
+        let z = Witgen::new(&mut plain)
+            .run(&shape, &defs, &publics, &inputs)
+            .unwrap();
+        let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
+        assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None);
+
+        let with = demand(&shape, &defs).unwrap();
+        assert_eq!(
+            (with.triples, with.randoms),
+            (plain.count.triples, plain.count.randoms)
+        );
+        let (bare, _, bare_defs) = byte_lookup_recorded(&secret, false);
+        let without = demand(&bare, &bare_defs).unwrap();
+        assert_eq!(with.triples - without.triples, 6 * 302);
+        assert_eq!(with.randoms - without.randoms, 6 * 48);
+        std::println!(
+            "rounds with lookups {} without {}",
+            with.rounds,
+            without.rounds
+        );
+        assert!(with.rounds <= without.rounds + 14);
+    }
+
+    /// A table that is not a range table is refused by name.
+    #[test]
+    fn a_lookup_into_a_table_that_is_not_a_range_is_refused() {
+        let mut cs = ConstraintSystem::new_recording();
+        let bits = alloc_bits(&mut cs, &[5]);
+        let table = cs.table(1, vec![f(5), f(9)]);
+        cs.enforce_in_table(table, &[pack_bits(&bits)]);
+        let (shape, _, defs) = cs.finish_recorded();
+        assert_eq!(
+            demand(&shape, &defs).err(),
+            Some(WitgenError::Table { lookup: 0 })
+        );
+    }
+
+    /// From shares of the secret to a proof of a relation with lookups that the split
+    /// verifier accepts; a wrong message during it makes the honest custodians abort.
+    #[test]
+    fn a_quorum_proves_a_relation_with_lookups_from_shares_of_its_inputs() {
+        use super::super::prover::{prove_party, prover_demand};
+        use dregg_sig_agg::pcs::WhirSecurityRegime;
+        use dregg_sig_agg::zk_hem::protocol::verify_split;
+        let regime = WhirSecurityRegime::default();
+        let secret = [0x31, 0x07, 0xe0, 0x31];
+        let (shape, assignment, defs) = byte_lookup_recorded(&secret, true);
+        let publics = assignment[1..=shape.num_public].to_vec();
+        let need = demand(&shape, &defs).unwrap();
+        let prove = prover_demand(&shape, regime).unwrap();
+        for fault in [None, Some(2 * need.rounds / 3)] {
+            let mut dealer = Dealer::new(3, &[11; 32]);
+            let inputs = deal_bits(&mut dealer, 3, &secret);
+            let preps = dealer.preprocessing(need.triples + prove.0, need.randoms + prove.1);
+            let out = run_engines(preps, fault, |e| {
+                let z = generate(e, &shape, &defs, &publics, &[inputs[e.me()].clone()])
+                    .map_err(|e| std::format!("{e:?}"))?;
+                prove_party(e, &shape, &publics, b"lookups", regime, z)
+                    .map_err(|e| std::format!("{e:?}"))
+            });
+            match fault {
+                None => {
+                    let proof = out[0].0.clone().unwrap();
+                    assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
+                    assert!(verify_split(&shape, &publics, b"lookups", regime, &proof));
+                    let mut other = publics.clone();
+                    other[0] += F::ONE;
+                    assert!(!verify_split(&shape, &other, b"lookups", regime, &proof));
+                }
+                Some(_) => assert!(out[0].0.is_err() && out[2].0.is_err(), "{:?}", out[0].0),
+            }
+        }
     }
 
     /// A transport that flips one bit of its `at`-th outgoing message.

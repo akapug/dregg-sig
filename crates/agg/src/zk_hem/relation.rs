@@ -504,6 +504,9 @@ pub enum Def {
     Public,
     /// A masking variable appended by [`ConstraintSystem::finish`].
     Mask,
+    /// The multiplicity of a table row: how many of the relation's lookups
+    /// ([`Shape::lookups`]) have that row as their tuple.
+    Multiplicity,
     /// `a b`.
     Product(Lc, Lc),
     /// `a^7`.
@@ -861,12 +864,12 @@ impl ConstraintSystem {
             !self.hologram_aligned,
             "recording a hologram-aligned relation"
         );
-        // A multiplicity is a count over the whole witness, not a function of earlier
-        // variables; no definition kind states it.
-        assert!(self.num_lookups == 0, "recording a relation with lookups");
         let mut defs = self.defs.take().expect("a recording builder");
         let (shape, z) = self.finish();
         defs.vars.resize(shape.num_vars, Def::Mask);
+        if let Some(lookups) = shape.lookups() {
+            defs.vars[lookups.mult_var_base..shape.mask_var_base].fill(Def::Multiplicity);
+        }
         (shape, z, defs)
     }
 
