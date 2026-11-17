@@ -15,7 +15,9 @@
 //! Merkle accumulator. Issuance discloses the attributes and commitment to the
 //! issuer while hiding the holder blind. Presentations prove selective disclosure
 //! and membership against an issuer-signed root, which verifiers must authenticate
-//! and apply an epoch policy to. There is no independent publicly verifiable
+//! and apply an epoch policy to. Verification consumes a challenge from the verifier's
+//! [`presentation_challenge`] ledger, so a captured presentation is accepted once.
+//! There is no independent publicly verifiable
 //! signature on each credential. Fresh presentation entropy avoids an intentional
 //! stable pseudonym; attributes and application metadata may still link holders.
 //!
@@ -26,6 +28,7 @@ extern crate alloc;
 extern crate std;
 pub mod blind_vc;
 pub mod fips204_ntt;
+pub mod presentation_challenge;
 pub mod rss_mpc;
 pub mod threshold_mldsa;
 pub mod threshold_mldsa_shamir;
