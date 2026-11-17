@@ -69,8 +69,9 @@ Run a dealerless 2-of-3 RSS key generation ceremony with zero central secret rec
   --public-out <path>           destination for the quorum public key JSON
   --tree-height <1..=20>         Merkle tree height (default: 3, capacity = 2^height signatures)
   --anchor-dir <dir>            enroll per-party external monotone anchors in <dir>
+  --anchor-tpm-nv <base>         six predefined exclusive counters: party p belt=base+2p, ceremony=base+2p+1
   --ephemeral-unanchored        enroll a disposable quorum without rollback protection
-                                (one of the two is required)
+                                (an anchor or this waiver is required)
   --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir
   --passphrase-env <VAR> / --passphrase-file <PATH>  seal each party secret share
   --policy-ledger-dir <dir>     enroll the quorum against this custody policy ledger: it will
@@ -89,6 +90,7 @@ Execute a 2-of-3 Jorts Mode 3A threshold signing ceremony gated by FsBeltWal and
   --in <file|->                 message path (or '-' for standard input)
   --out <path>                  destination for the quorum signature JSON
   --anchor-dir <dir>            external monotone anchor directory (required if enrolled)
+  --anchor-tpm-nv <base>         same six-counter base reserved at enrollment
   --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir
   --policy-id-hex <64-hex>      32-byte policy digest committed into CeremonyContext
   --spend-amount <u64>          spend amount committed into CeremonyContext
@@ -149,6 +151,19 @@ pub(crate) fn ensure_absent(path: &str) -> Result<(), CliError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(CliError::io(format_args!("inspecting {path}"), e)),
     }
+}
+
+/// A quorum reserves six TPM2 NV counters from `--anchor-tpm-nv <base>`: party `p` has
+/// `base + 2p` for its belt anchor and `base + 2p + 1` for its ceremony anchor. Every
+/// anchor seals its own counter value, so no two may share an index.
+const QUORUM_TPM_SLOTS: u32 = 6;
+
+fn quorum_tpm_slot(
+    cfg: &AnchorConfig,
+    party: usize,
+    ceremony: bool,
+) -> Result<AnchorConfig, CliError> {
+    cfg.tpm_slot(2 * party as u32 + u32::from(ceremony), QUORUM_TPM_SLOTS)
 }
 
 fn derive_party_secret(seed: &[u8; 32], party: usize, role: &[u8]) -> Secret32 {
@@ -487,6 +502,9 @@ fn keygen(raw: &[String]) -> Result<(), CliError> {
     let params = JortsParams::with_height(height);
     let passphrase = crate::envelope::passphrase(&args)?;
     let anchor_cfg = AnchorConfig::from_quorum_args(&args, vault_dir)?;
+    if let Some(cfg) = &anchor_cfg {
+        cfg.check_tpm_range(QUORUM_TPM_SLOTS)?;
+    }
     crate::anchor::require_anchor_or_waiver(
         anchor_cfg.is_some(),
         args.flag("ephemeral-unanchored"),
@@ -551,7 +569,7 @@ fn keygen(raw: &[String]) -> Result<(), CliError> {
             let belt_anchor_mac =
                 derive_party_secret(&party_seeds[p].0, p, b"external_belt_anchor_mac");
             let belt_anchor = FsExternalMountAnchor::provision_fresh(
-                cfg,
+                &quorum_tpm_slot(cfg, p, false)?,
                 &party_sk_refs,
                 &[vault_dir],
                 "quorum_belt",
@@ -577,7 +595,7 @@ fn keygen(raw: &[String]) -> Result<(), CliError> {
             let ceremony_anchor_mac =
                 derive_party_secret(&party_seeds[p].0, p, b"external_ceremony_anchor_mac");
             let ceremony_anchor = FsExternalMountAnchor::provision_fresh(
-                cfg,
+                &quorum_tpm_slot(cfg, p, true)?,
                 &party_sk_refs,
                 &[vault_dir],
                 "quorum_ceremony",
@@ -776,6 +794,9 @@ fn sign(raw: &[String]) -> Result<(), CliError> {
     let mut base_context = parse_ceremony_context(&args, 0)?;
     let passphrase = crate::envelope::passphrase(&args)?;
     let anchor_cfg = AnchorConfig::from_quorum_args(&args, vault_dir)?;
+    if let Some(cfg) = &anchor_cfg {
+        cfg.check_tpm_range(QUORUM_TPM_SLOTS)?;
+    }
     // The ledger lock is taken before any party's and held until the signature is written.
     let mut gate = crate::policy_ledger::Gate::from_args(&args, true)?;
     let policy_retry = args.flag("policy-retry");
@@ -908,7 +929,7 @@ fn sign(raw: &[String]) -> Result<(), CliError> {
             let belt_anchor_mac =
                 derive_party_secret(&party.seed.0, p, b"external_belt_anchor_mac");
             let belt_anchor = FsExternalMountAnchor::open_existing(
-                cfg,
+                &quorum_tpm_slot(cfg, p, false)?,
                 &party_sk_refs,
                 &[vault_dir],
                 "quorum_belt",
@@ -944,7 +965,7 @@ fn sign(raw: &[String]) -> Result<(), CliError> {
             let ceremony_anchor_mac =
                 derive_party_secret(&party.seed.0, p, b"external_ceremony_anchor_mac");
             let ceremony_anchor = FsExternalMountAnchor::open_existing(
-                cfg,
+                &quorum_tpm_slot(cfg, p, true)?,
                 &party_sk_refs,
                 &[vault_dir],
                 "quorum_ceremony",
@@ -1354,5 +1375,192 @@ mod hem_flag_guard_tests {
                 err.message
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tpm_anchor_tests {
+    use super::*;
+    use crate::anchor::tpm_model;
+
+    const BASE: u32 = 0x0180_0001;
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "qsag-quorum-tpm-{label}-{}",
+                crate::codec::to_hex(&os_random_32().unwrap()[..8])
+            ));
+            private_dir(root.to_str().unwrap(), true).unwrap();
+            Self(root)
+        }
+
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_owned()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn quorum(args: &[&str]) -> Result<(), CliError> {
+        run(&args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    }
+
+    fn regular_files(dir: &str) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| std::fs::symlink_metadata(p).unwrap().is_file())
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap();
+                (p, bytes)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    // The real `quorum keygen` and `quorum sign` call chains against one TPM. With a
+    // single shared NV index every later anchor's provisioning increment left the earlier
+    // seals behind, and the first reopen reported a rollback on honest storage.
+    #[test]
+    fn tpm_anchored_quorum_reopens_and_refuses_rollback_of_each_domain() {
+        let scratch = Scratch::new("domains");
+        let installed = tpm_model::install(BASE, QUORUM_TPM_SLOTS, 41);
+        let tpm = &installed.0;
+        let vault = scratch.path("vault");
+        let pk_path = scratch.path("pk");
+        let message = scratch.path("message");
+        std::fs::write(&message, b"TPM multi-domain regression").unwrap();
+        quorum(&[
+            "keygen",
+            "--vault-dir",
+            &vault,
+            "--public-out",
+            &pk_path,
+            "--tree-height",
+            "1",
+            "--anchor-tpm-nv",
+            "0x01800001",
+        ])
+        .unwrap();
+        let enrolled = regular_files(&vault);
+
+        let sign = |epoch: &str, out: &str| {
+            quorum(&[
+                "sign",
+                "--vault-dir",
+                &vault,
+                "--epoch",
+                epoch,
+                "--in",
+                &message,
+                "--out",
+                out,
+                "--anchor-tpm-nv",
+                "0x01800001",
+            ])
+        };
+        // Honest storage: all six anchors reopen and the leaf is spent.
+        sign("0", &scratch.path("sig0")).unwrap();
+        assert!(
+            tpm.counters().values().all(|n| *n > 41),
+            "every reserved counter backs one domain: {:?}",
+            tpm.counters()
+        );
+
+        // Restoring the whole vault in place (every inode kept) must not reopen leaf 0.
+        let spent = regular_files(&vault);
+        for (path, bytes) in &enrolled {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let err = sign("0", &scratch.path("sig0-again")).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("lags TPM2 NV monotonic counter"),
+            "{err:?}"
+        );
+        assert!(!Path::new(&scratch.path("sig0-again")).exists());
+        for (path, bytes) in &spent {
+            std::fs::write(path, bytes).unwrap();
+        }
+        sign("1", &scratch.path("sig1")).unwrap();
+
+        // Each of the six domains on its own.
+        let cfg = AnchorConfig {
+            tpm_nv_index: Some(BASE),
+            vault_dir: Some(vault.clone()),
+            ..Default::default()
+        };
+        for p in 0..3 {
+            let secret =
+                Json::parse(&std::fs::read_to_string(party_secret_path(&vault, p)).unwrap())
+                    .unwrap();
+            let seed: [u8; 32] = from_hex_exact(secret.field_str("seed").unwrap(), "seed").unwrap();
+            let pk = JortsPublicKey {
+                pk_seed: from_hex_exact(secret.field_str("pk_seed").unwrap(), "pk_seed").unwrap(),
+                pk_root: from_hex_exact(secret.field_str("pk_root").unwrap(), "pk_root").unwrap(),
+            };
+            let key_id = derive_party_key_id(&pk, 1, p);
+            for (slot, domain, role) in [
+                (
+                    2 * p as u32,
+                    "quorum_belt",
+                    &b"external_belt_anchor_mac"[..],
+                ),
+                (
+                    2 * p as u32 + 1,
+                    "quorum_ceremony",
+                    &b"external_ceremony_anchor_mac"[..],
+                ),
+            ] {
+                tpm_model::assert_domain_reopens_and_refuses_rollback(
+                    tpm,
+                    &cfg,
+                    &vault,
+                    BASE + slot,
+                    domain,
+                    key_id,
+                    derive_party_secret(&seed, p, role).0,
+                );
+            }
+        }
+    }
+
+    // A range the TPM cannot serve is refused before the vault exists: numerically
+    // out of the NV handle space, or with a counter that was never defined.
+    #[test]
+    fn tpm_anchored_quorum_checks_its_whole_counter_range_before_enrolling() {
+        let scratch = Scratch::new("range");
+        let installed = tpm_model::install(BASE, QUORUM_TPM_SLOTS - 1, 41);
+        for (base, reason) in [
+            ("0x01fffffb", "needs 6 distinct NV indices"),
+            ("0x01800001", "TPM2 NV counter 0x01800006"),
+        ] {
+            let vault = scratch.path("vault");
+            let err = quorum(&[
+                "keygen",
+                "--vault-dir",
+                &vault,
+                "--public-out",
+                &scratch.path("pk"),
+                "--tree-height",
+                "1",
+                "--anchor-tpm-nv",
+                base,
+            ])
+            .unwrap_err();
+            assert!(format!("{err:?}").contains(reason), "{err:?}");
+            assert!(!Path::new(&vault).exists(), "preflight precedes enrollment");
+        }
+        assert!(
+            installed.0.counters().values().all(|n| *n == 41),
+            "a refused enrollment increments nothing"
+        );
     }
 }

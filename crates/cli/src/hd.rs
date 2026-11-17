@@ -498,7 +498,7 @@ fn keygen(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig hd keygen [--threshold <t>] [--parties <n>] [--count <pow2>] --vault-dir <dir> --watch-out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--allow-unencrypted] [--deterministic] [--json]"
+            "dregg-sig hd keygen [--threshold <t>] [--parties <n>] [--count <pow2>] --vault-dir <dir> --watch-out <path> [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--allow-unencrypted] [--deterministic] [--json]\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }
@@ -910,7 +910,7 @@ fn recover(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig hd recover --vault-dir <dir> [--signers <i,j,..>] --index <child_idx> --proof <child.json> --secret-out <path> [--public-out <path>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--json]"
+            "dregg-sig hd recover --vault-dir <dir> [--signers <i,j,..>] --index <child_idx> --proof <child.json> --secret-out <path> [--public-out <path>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--json]\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }
@@ -1133,7 +1133,7 @@ fn export_rss(raw: &[String]) -> Result<(), CliError> {
     let args = Args::parse(raw, &opts, &flags)?;
     if args.flag("help") {
         println!(
-            "dregg-sig hd export-rss --vault-dir <dir> --index <child_idx> [--proof <child.json>] [--party <0|1|2> --secret-out <path> | --out-dir <dir>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --anchor-vmgenid | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--out-passphrase-env <VAR> | --out-passphrase-file <path> | --allow-unencrypted] [--json]"
+            "dregg-sig hd export-rss --vault-dir <dir> --index <child_idx> [--proof <child.json>] [--party <0|1|2> --secret-out <path> | --out-dir <dir>] [--anchor-dir <dir> | --anchor-tpm-nv <idx> | --ephemeral-unanchored] [--passphrase-env <VAR> | --passphrase-file <path>] [--out-passphrase-env <VAR> | --out-passphrase-file <path> | --allow-unencrypted] [--json]\n  --anchor-vmgenid adds snapshot/clone detection; requires a disjoint-device directory anchor or TPM."
         );
         return Ok(());
     }

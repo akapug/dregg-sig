@@ -46,7 +46,7 @@ cargo run --release -p dregg-sig-cli --example succinct_k_to_1_aggregation
 cargo run --release -p dregg-sig-cli --example pq_address_and_policy
 ```
 
-`crates/agg/examples/mock_ethereum_beam.rs` and `mock_solana_alpenglow.rs` are single-host consensus harnesses with explicit network models. The GPU prover is selected with `--features vulkan` and `DREGG_SIG_ACCEL=vulkan`. Stateful CLI vaults require `--anchor-dir <dir>` on a disjoint device, `--anchor-tpm-nv <index>` or `--anchor-vmgenid`; use `--ephemeral-unanchored` for disposable test keys.
+`crates/agg/examples/mock_ethereum_beam.rs` and `mock_solana_alpenglow.rs` are single-host consensus harnesses with explicit network models. The GPU prover is selected with `--features vulkan` and `DREGG_SIG_ACCEL=vulkan`. Stateful CLI vaults require `--anchor-dir <dir>` on a disjoint device or `--anchor-tpm-nv <index>`; `--anchor-vmgenid` adds VM snapshot/clone detection and must accompany one of those anchors. Use `--ephemeral-unanchored` for disposable test keys.
 
 ## Tests
 
