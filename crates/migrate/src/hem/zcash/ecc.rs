@@ -68,7 +68,7 @@ fn fp_value(cs: &ConstraintSystem, f: &Field, x: &Num) -> Fp {
 // ============================================================================
 
 /// All `2^n` products of subsets of `bits`, indexed by subset mask.
-fn monomials(cs: &mut ConstraintSystem, bits: &[Lc]) -> Vec<Lc> {
+pub(super) fn monomials(cs: &mut ConstraintSystem, bits: &[Lc]) -> Vec<Lc> {
     let mut out = Vec::with_capacity(1 << bits.len());
     out.push(Lc::constant(F::ONE));
     for mask in 1usize..1 << bits.len() {
@@ -84,17 +84,17 @@ fn monomials(cs: &mut ConstraintSystem, bits: &[Lc]) -> Vec<Lc> {
     out
 }
 
-/// The multilinear coefficients of a table of public points, byte by byte.
+/// The multilinear coefficients of a table of public byte strings (the coordinates of
+/// points), byte by byte.
 pub struct PointTable {
     nbits: usize,
-    /// `coef[limb][mask]` for the 64 bytes `x || y` of a point.
+    /// `coef[limb][mask]` for the bytes of an entry (`x || y` for a Pallas point).
     coef: Vec<Vec<i32>>,
 }
 
 impl PointTable {
     /// A table of `2^nbits` affine points, `nbits <= 10`.
     pub fn new(points: &[(Fp, Fp)], nbits: usize) -> Self {
-        assert!(nbits <= 10 && points.len() == 1 << nbits);
         let bytes: Vec<[u8; 64]> = points
             .iter()
             .map(|(x, y)| {
@@ -104,7 +104,14 @@ impl PointTable {
                 b
             })
             .collect();
-        let coef = (0..2 * LIMBS)
+        Self::from_bytes(&bytes, nbits)
+    }
+
+    /// A table of `2^nbits` entries of `N` bytes each, `nbits <= 10`: the coordinates of
+    /// a point of any curve, with whatever else is looked up beside them.
+    pub fn from_bytes<const N: usize>(bytes: &[[u8; N]], nbits: usize) -> Self {
+        assert!(nbits <= 10 && bytes.len() == 1 << nbits);
+        let coef = (0..N)
             .map(|limb| {
                 let mut c: Vec<i32> = bytes.iter().map(|b| b[limb] as i32).collect();
                 for i in 0..nbits {
@@ -123,11 +130,20 @@ impl PointTable {
     /// The limbs `(x, y)` of the point addressed by `bits` (Boolean, little-endian). Each
     /// limb is one variable holding exactly the table byte.
     pub fn lookup(&self, cs: &mut ConstraintSystem, bits: &[Lc]) -> (Vec<Lc>, Vec<Lc>) {
+        assert_eq!(self.coef.len(), 2 * LIMBS);
+        let mut limbs = self.lookup_bytes(cs, bits);
+        let y = limbs.split_off(LIMBS);
+        (limbs, y)
+    }
+
+    /// The bytes of the entry addressed by `bits` (Boolean, little-endian), each one
+    /// variable holding exactly the table byte.
+    pub fn lookup_bytes(&self, cs: &mut ConstraintSystem, bits: &[Lc]) -> Vec<Lc> {
         assert_eq!(bits.len(), self.nbits);
         let low_bits = self.nbits.min(8);
         let low = monomials(cs, &bits[..low_bits]);
         let high = monomials(cs, &bits[low_bits..]);
-        let mut limbs = Vec::with_capacity(2 * LIMBS);
+        let mut limbs = Vec::with_capacity(self.coef.len());
         for coef in &self.coef {
             let forms: Vec<Lc> = (0..high.len())
                 .map(|h| {
@@ -160,13 +176,12 @@ impl PointTable {
             }
             limbs.push(out);
         }
-        let y = limbs.split_off(LIMBS);
-        (limbs, y)
+        limbs
     }
 }
 
 /// Select among `2^n` witness limb vectors by `n` Boolean bits: `2^n - 1` rows per limb.
-fn select_limbs(cs: &mut ConstraintSystem, monos: &[Lc], options: &[&[Lc]]) -> Vec<Lc> {
+pub(super) fn select_limbs(cs: &mut ConstraintSystem, monos: &[Lc], options: &[&[Lc]]) -> Vec<Lc> {
     assert_eq!(monos.len(), options.len());
     let n = options.len();
     let width = options[0].len();

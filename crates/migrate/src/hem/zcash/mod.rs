@@ -228,6 +228,7 @@ pub mod poseidon;
 pub mod recovery;
 pub mod rehash;
 pub mod sapling;
+pub mod sapling_address;
 pub mod sinsemilla;
 pub mod transparent;
 #[cfg(test)]
