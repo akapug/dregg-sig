@@ -438,12 +438,14 @@ impl ZkHemProof {
     }
 }
 
-/// Upper bounds on the three parts of a proof encoding for one relation and layout. Every
-/// count below is one the verifier pins (`from_bytes`, [`verify`], `whir_verify_blend`), so
-/// the only freedom an accepted proof has is which leaves the transcript queries, and with
-/// it how many sibling digests the multiproofs carry.
+/// Upper bounds on the three parts of the encoding of one committed batch (the assignment
+/// batch, or the helper batch of a relation with lookups): its sumcheck messages and its
+/// opening. Every count below is one the verifier pins (`from_bytes`, [`verify`],
+/// `whir_verify_blend`), so the only freedom an accepted proof has is which leaves the
+/// transcript queries, and with it how many sibling digests the multiproofs carry.
 struct WireBound {
-    /// The sumcheck messages `to_bytes` writes between the commitment and the opening.
+    /// The extension elements `to_bytes` writes between the batch's commitment and its
+    /// opening.
     front: usize,
     /// The opening without its Stage-0 leaves (`push_whir_stage_fields` in `pcs`).
     stages: usize,
@@ -473,15 +475,34 @@ impl WireBound {
         (1..depth).map(|j| queries.min(1 << j)).sum::<usize>() + 2 - queries
     }
 
-    fn new(shape: &Shape, layout: &Layout) -> Self {
-        let front = Self::EXT
-            * (1 + shape.log_rows * (ROW_DEGREE + 1)
+    /// The batches of a proof for `shape`, in wire order: the assignment batch, then the
+    /// helper batch when the relation has lookups.
+    fn batches(shape: &Shape, layout: &Layout) -> impl Iterator<Item = Self> {
+        // Mask sum, row rounds, row values, mask sum, column rounds, companion claims.
+        let assignment = Self::new(
+            1 + shape.log_rows * (ROW_DEGREE + 1)
                 + 3
                 + 1
                 + layout.var_bits * (COL_DEGREE + 1)
-                + COMPANIONS);
-        let schedule = &layout.schedule;
-        let fold_vars = layout.log_cells - schedule.early_stop_vars;
+                + COMPANIONS,
+            layout.log_cells,
+            &layout.schedule,
+        );
+        // Mask sum, lookup rounds, `(n, v, h)(rl)`, companion claims.
+        let helper = layout.lookup.as_ref().map(|ll| {
+            Self::new(
+                1 + ll.log_entries * (LOOKUP_DEGREE + 1) + 3 + COMPANIONS,
+                ll.log_cells,
+                &ll.schedule,
+            )
+        });
+        core::iter::once(assignment).chain(helper)
+    }
+
+    /// A batch of five tables of `2^log_cells` cells opened under `schedule`, with
+    /// `front_elements` extension elements in front of the opening.
+    fn new(front_elements: usize, log_cells: usize, schedule: &WhirSchedule) -> Self {
+        let fold_vars = log_cells - schedule.early_stop_vars;
         // Out-of-domain values, the bridge polynomials and their nonces, the layer count,
         // the terminal coefficients and the Stage-0 nonce.
         let mut stages = 2 * Self::EXT
@@ -492,7 +513,7 @@ impl WireBound {
             + ((1usize << schedule.early_stop_vars) + 2) * Self::EXT
             + Self::NONCE;
         let mut stage0 = 0;
-        let mut vars = layout.log_cells;
+        let mut vars = log_cells;
         for (index, stage) in schedule.stages.iter().enumerate() {
             let depth = vars + stage.blowup.trailing_zeros() as usize - stage.step_vars;
             let queries = stage.num_queries.min(1usize << depth);
@@ -515,7 +536,7 @@ impl WireBound {
             vars -= stage.step_vars;
         }
         Self {
-            front,
+            front: front_elements * Self::EXT,
             stages,
             stage0,
         }
@@ -525,21 +546,26 @@ impl WireBound {
 /// An upper bound on `to_bytes().len()` over every [`ZkHemProof`] that [`verify`] accepts
 /// for `shape` under `regime`. It is the length of a proof whose queries fall on the
 /// leaves that share the fewest tree nodes; every other accepted proof is shorter by
-/// sibling digests only. `None` when the relation has no
-/// layout under `regime`, or has lookups (their second opening is not bounded here).
+/// sibling digests only. Per committed batch: the root, the sumcheck messages and the
+/// opening. A relation with lookups has two batches, the assignment batch and the helper
+/// batch at [`LookupLayout::log_cells`], whose sumcheck messages are the `5 d + 8`
+/// elements of [`LookupProof`]. `None` when the relation has no layout under `regime`.
 pub fn max_proof_bytes(shape: &Shape, regime: WhirSecurityRegime) -> Option<usize> {
-    // The lookup section (a second opening) is not bounded here.
-    if shape.lookups().is_some() {
-        return None;
-    }
-    let bound = WireBound::new(shape, &Layout::new(shape, regime)?);
-    Some(WireBound::COMMITMENT + bound.front + bound.stages + bound.stage0)
+    let layout = Layout::new(shape, regime)?;
+    Some(
+        WireBound::batches(shape, &layout)
+            .map(|b| WireBound::COMMITMENT + b.front + b.stages + b.stage0)
+            .sum(),
+    )
 }
 
 /// [`max_proof_bytes`] for a [`ZkHemSplitProof`] of `custodians` committers that
-/// [`verify_split`] accepts: the magic and the root count, one root and one Stage-0 opening
-/// per committer and one byte for the share count, around the messages of the single
-/// proof. `None` also when `custodians` is not in `1..=MAX_SPLIT_COMMITTERS`.
+/// [`verify_split`] accepts: the magic and the root count, then per committed batch one
+/// root and one Stage-0 opening per committer and one byte for the share count, around the
+/// batch's messages of the single proof. A relation with lookups has the helper batch as
+/// its second batch, with one helper root and one helper Stage-0 opening per committer
+/// ([`SplitLookupProof`]). `None` also when `custodians` is not in
+/// `1..=MAX_SPLIT_COMMITTERS`.
 pub fn max_split_proof_bytes(
     shape: &Shape,
     regime: WhirSecurityRegime,
@@ -548,18 +574,13 @@ pub fn max_split_proof_bytes(
     if !(1..=MAX_SPLIT_COMMITTERS).contains(&custodians) {
         return None;
     }
-    // The lookup section (a second opening) is not bounded here.
-    if shape.lookups().is_some() {
-        return None;
-    }
-    let bound = WireBound::new(shape, &Layout::new(shape, regime)?);
+    let layout = Layout::new(shape, regime)?;
     Some(
         SPLIT_PROOF_WIRE_MAGIC.len()
             + 1
-            + bound.front
-            + bound.stages
-            + 1
-            + custodians * (WireBound::COMMITMENT + bound.stage0),
+            + WireBound::batches(shape, &layout)
+                .map(|b| b.front + b.stages + 1 + custodians * (WireBound::COMMITMENT + b.stage0))
+                .sum::<usize>(),
     )
 }
 
@@ -6317,64 +6338,121 @@ mod tests {
         }
     }
 
+    /// `n` range-checked bytes and one multiplication row.
+    fn byte_relation(n: usize) -> (Shape, Vec<F>) {
+        let mut cs = ConstraintSystem::new();
+        let vars: Vec<Lc> = (0..n)
+            .map(|i| cs.alloc(f((i * 131 + 7) as u64 & 0xFF)).into())
+            .collect();
+        for v in &vars {
+            cs.enforce_byte(v);
+        }
+        let _ = cs.mul(&vars[0], &vars[1]);
+        cs.finish()
+    }
+
+    /// A split proof with the messages of `proof` and each of its Stage-0 openings once per
+    /// committer: the query sets, and so every length, are real ones.
+    fn split_from_single(proof: &ZkHemProof, custodians: usize) -> ZkHemSplitProof {
+        let split_opening = |opening: &HemWhirOpeningProof| {
+            let share = crate::pcs::Stage0ShareOpening {
+                salts: opening.round0_salts.clone(),
+                vals: opening.round0_vals.clone(),
+                multiproof: opening.round0_multiproof.clone(),
+            };
+            HemWhirSplitOpeningProof {
+                stage0_ood_evals: opening.stage0_ood_evals,
+                fold_sumcheck_polys: opening.fold_sumcheck_polys.clone(),
+                fold_pow_nonces: opening.fold_pow_nonces.clone(),
+                folded_layers: opening.folded_layers.clone(),
+                final_coeffs: opening.final_coeffs.clone(),
+                pow_nonce: opening.pow_nonce,
+                shares: vec![share; custodians],
+            }
+        };
+        ZkHemSplitProof {
+            roots: vec![proof.commitment; custodians],
+            row_mask_sum: proof.row_mask_sum,
+            row_rounds: proof.row_rounds.clone(),
+            row_values: proof.row_values,
+            col_mask_sum: proof.col_mask_sum,
+            col_rounds: proof.col_rounds.clone(),
+            companion_claims: proof.companion_claims,
+            opening: split_opening(&proof.opening),
+            lookup: proof.lookup.as_ref().map(|l| SplitLookupProof {
+                roots: vec![l.commitment; custodians],
+                mask_sum: l.mask_sum,
+                rounds: l.rounds.clone(),
+                values: l.values,
+                companion_claims: l.companion_claims,
+                opening: split_opening(&l.opening),
+            }),
+        }
+    }
+
     #[test]
     fn proof_size_bounds_cover_real_proofs_and_are_not_loose() {
-        let regimes = [
-            WhirSecurityRegime::default(),
-            WhirSecurityRegime::Poseidon2Cdhz25JohnsonQrom128,
-        ];
+        assert_eq!(WhirSecurityRegime::default(), REGIMES[0]);
         let relations = [
             preimage_relation([1, 77]),
             sponge_chain_relation(40),
             sponge_chain_relation(200),
+            lookup_relation(&LOOKUP_BYTES, 9),
+            byte_relation(3000),
+            byte_relation(40_000),
         ];
         let mut layouts = alloc::collections::BTreeSet::new();
+        let mut helper_layouts = alloc::collections::BTreeSet::new();
         for (shape, z) in &relations {
-            for regime in regimes {
+            for regime in REGIMES {
                 let proof = prove(shape, z.clone(), b"stmt", regime, &[9; 32]).unwrap();
                 assert!(verify(shape, &[], b"stmt", regime, &proof));
                 let len = proof.to_bytes().len();
                 let bound = max_proof_bytes(shape, regime).unwrap();
-                let log_cells = Layout::new(shape, regime).unwrap().log_cells;
-                layouts.insert(log_cells);
-                std::println!("log_cells {log_cells} {regime:?}: proof {len}, bound {bound}");
+                let layout = Layout::new(shape, regime).unwrap();
+                let helper = layout.lookup.as_ref().map(|ll| ll.log_cells);
+                assert_eq!(helper.is_some(), proof.lookup.is_some());
+                layouts.insert(layout.log_cells);
+                helper_layouts.extend(helper);
+                std::println!(
+                    "log_cells {} helper {helper:?} {regime:?}: proof {len}, bound {bound}",
+                    layout.log_cells
+                );
                 assert!(len <= bound, "{len} > {bound}");
                 assert!(bound * 20 <= len * 21, "bound {bound} for {len}");
+                if let Some(lookup) = &proof.lookup {
+                    // The bound of the relation's rows alone does not cover the proof, and
+                    // the helper batch is bounded as tightly as the whole.
+                    let part = len
+                        - ZkHemProof {
+                            lookup: None,
+                            ..proof.clone()
+                        }
+                        .to_bytes()
+                        .len();
+                    let ll = layout.lookup.as_ref().unwrap();
+                    let helper_bound: usize = WireBound::batches(shape, &layout)
+                        .skip(1)
+                        .map(|b| WireBound::COMMITMENT + b.front + b.stages + b.stage0)
+                        .sum();
+                    assert_eq!(lookup.rounds.len(), ll.log_entries);
+                    assert!(len > bound - helper_bound);
+                    assert!(part <= helper_bound, "{part} > {helper_bound}");
+                    assert!(helper_bound * 20 <= part * 21, "{helper_bound} for {part}");
+                }
 
-                // A split proof with the single proof's messages and its Stage-0 opening
-                // once per committer: the query set, and so every length, is a real one.
                 for custodians in [1, 3, MAX_SPLIT_COMMITTERS] {
-                    let opening = &proof.opening;
-                    let share = crate::pcs::Stage0ShareOpening {
-                        salts: opening.round0_salts.clone(),
-                        vals: opening.round0_vals.clone(),
-                        multiproof: opening.round0_multiproof.clone(),
-                    };
-                    let split = ZkHemSplitProof {
-                        roots: vec![proof.commitment; custodians],
-                        row_mask_sum: proof.row_mask_sum,
-                        row_rounds: proof.row_rounds.clone(),
-                        row_values: proof.row_values,
-                        col_mask_sum: proof.col_mask_sum,
-                        col_rounds: proof.col_rounds.clone(),
-                        companion_claims: proof.companion_claims,
-                        lookup: None,
-                        opening: HemWhirSplitOpeningProof {
-                            stage0_ood_evals: opening.stage0_ood_evals,
-                            fold_sumcheck_polys: opening.fold_sumcheck_polys.clone(),
-                            fold_pow_nonces: opening.fold_pow_nonces.clone(),
-                            folded_layers: opening.folded_layers.clone(),
-                            final_coeffs: opening.final_coeffs.clone(),
-                            pow_nonce: opening.pow_nonce,
-                            shares: vec![share; custodians],
-                        },
-                    };
+                    let split = split_from_single(&proof, custodians);
                     let bytes = split.to_bytes();
                     assert_eq!(
                         ZkHemSplitProof::from_bytes(&bytes, shape, regime).as_ref(),
                         Some(&split)
                     );
                     let bound = max_split_proof_bytes(shape, regime, custodians).unwrap();
+                    std::println!(
+                        "    {custodians} committers: {}, bound {bound}",
+                        bytes.len()
+                    );
                     assert!(bytes.len() <= bound, "{} > {bound}", bytes.len());
                     assert!(
                         bound * 20 <= bytes.len() * 21,
@@ -6382,10 +6460,11 @@ mod tests {
                         bytes.len()
                     );
                 }
-                // One committer costs the split framing and nothing else.
+                // One committer costs the split framing and nothing else: the magic, the
+                // root count and one share count per batch.
                 assert_eq!(
                     max_split_proof_bytes(shape, regime, 1).unwrap(),
-                    bound + SPLIT_PROOF_WIRE_MAGIC.len() + 2
+                    bound + SPLIT_PROOF_WIRE_MAGIC.len() + 2 + usize::from(helper.is_some())
                 );
                 assert_eq!(max_split_proof_bytes(shape, regime, 0), None);
                 assert_eq!(
@@ -6397,6 +6476,10 @@ mod tests {
         assert!(
             layouts.len() >= 3,
             "the relations share a layout: {layouts:?}"
+        );
+        assert!(
+            helper_layouts.len() >= 3,
+            "the lookup relations share a helper layout: {helper_layouts:?}"
         );
         assert_eq!(
             max_proof_bytes(
