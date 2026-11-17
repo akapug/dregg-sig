@@ -257,6 +257,11 @@ pub struct Modulus {
     pinv: Wide,
     /// `p = sum coeff * 2^(8 * position)`, with few terms for the pseudo-Mersenne moduli.
     sparse: Vec<(usize, i64)>,
+    /// Limbs of a reduced element.
+    limbs: usize,
+    /// `fold[k - limbs]`: signed digits `(position, digit)` of `2^(8k) mod p` for the limb
+    /// positions `k >= limbs` that a product can reach.
+    fold: Vec<Vec<(usize, i64)>>,
 }
 
 impl Modulus {
@@ -278,6 +283,8 @@ impl Modulus {
             m256: [0; 4],
             pinv: [0; WIDE],
             sparse,
+            limbs: u256_bitlen(&p).div_ceil(8),
+            fold: Vec::new(),
         };
         let mut r = [1u64, 0, 0, 0];
         for _ in 0..256 {
@@ -313,6 +320,32 @@ impl Modulus {
             pw,
             "sparse form does not evaluate to p"
         );
+
+        // Digits of 2^(8k) mod p, centred to [-128, 127] below the top limb.
+        let mut v = [1u64, 0, 0, 0];
+        for _ in 0..8 * m.limbs {
+            v = m.madd(&v, &v);
+        }
+        for _ in 0..m.limbs + 8 {
+            let bytes = u256_to_bytes(&v);
+            let mut digits = Vec::new();
+            let mut carry = 0i64;
+            for (i, &b) in bytes.iter().enumerate().take(m.limbs) {
+                let mut d = b as i64 + carry;
+                carry = 0;
+                if d >= 128 && i + 1 < m.limbs {
+                    d -= 256;
+                    carry = 1;
+                }
+                if d != 0 {
+                    digits.push((i, d));
+                }
+            }
+            m.fold.push(digits);
+            for _ in 0..8 {
+                v = m.madd(&v, &v);
+            }
+        }
         m
     }
 
@@ -412,6 +445,28 @@ impl Modulus {
             }
         }
         acc
+    }
+
+    /// An integer congruent to `d` with at most `limbs` coefficients: every coefficient at
+    /// a position `k >= limbs` is replaced by itself times the digits of `2^(8k) mod p`.
+    /// No rows; the intervals follow by interval arithmetic.
+    fn fold(&self, d: &Poly) -> Poly {
+        let mut out = Poly(d.0[..self.limbs.min(d.0.len())].to_vec());
+        out.0.resize(self.limbs, Coef::zero());
+        for (k, c) in d.0.iter().enumerate().skip(self.limbs) {
+            let digits = self
+                .fold
+                .get(k - self.limbs)
+                .expect("operand too long to fold");
+            for &(j, digit) in digits {
+                let slot = &mut out.0[j];
+                let digit = digit as i128;
+                slot.lc = slot.lc.plus(&c.lc.scaled(f_int(digit)));
+                slot.lo += (c.lo * digit).min(c.hi * digit);
+                slot.hi += (c.lo * digit).max(c.hi * digit);
+            }
+        }
+        out
     }
 
     fn small(&self, v: u64) -> U256 {
@@ -823,6 +878,13 @@ impl Modulus {
 /// `|V_g + c_(g-1) - 2^(8 len) c_g| < 2^64 - 2^32 + 1` over the admitted intervals, so the
 /// range check on the form implies the integer equation. The last group must be zero.
 fn enforce_zero_mod(cs: &mut ConstraintSystem, m: &Modulus, d: &Poly) -> Element {
+    let folded;
+    let d = if d.0.len() > m.limbs {
+        folded = m.fold(d);
+        &folded
+    } else {
+        d
+    };
     assert!(d.0.len() <= 8 * WIDE - 6, "operand too long");
     let (mut pos, mut neg) = ([0u64; WIDE], [0u64; WIDE]);
     for (k, c) in d.0.iter().enumerate() {
@@ -1843,13 +1905,22 @@ mod tests {
         lc.terms()[0].0 as usize
     }
 
-    fn violated_rows(shape: &Shape, z: &[F]) -> usize {
+    /// Violated rows as `(range rows, other rows)`. A range row is `v (1 - v) = 0`: an
+    /// empty right side and a second factor of more than one term. Product rows have a
+    /// right side and the closing row of a reduction has the constant one as second factor.
+    fn violated_rows(shape: &Shape, z: &[F]) -> (usize, usize) {
         assert_eq!(shape.num_sbox, 0);
-        (0..shape.num_rows())
-            .filter(|&i| {
-                shape.a.row_dot(i, z).const_mul(shape.b.row_dot(i, z)) != shape.c.row_dot(i, z)
-            })
-            .count()
+        let (mut range, mut other) = (0, 0);
+        for i in 0..shape.num_rows() {
+            if shape.a.row_dot(i, z).const_mul(shape.b.row_dot(i, z)) != shape.c.row_dot(i, z) {
+                if shape.c.row(i).count() == 0 && shape.b.row(i).count() > 1 {
+                    range += 1;
+                } else {
+                    other += 1;
+                }
+            }
+        }
+        (range, other)
     }
 
     fn le(a: &U256) -> [u8; 32] {
@@ -1979,17 +2050,22 @@ mod tests {
         let q = enforce_zero_mod(&mut cs, &m, &r.poly().sub(&product));
         let (shape, z) = cs.finish();
         assert!(shape.is_satisfied(&z));
-        assert_eq!(violated_rows(&shape, &z), 0);
+        assert_eq!(violated_rows(&shape, &z), (0, 0));
 
         // Move 256 from one limb into the next: the represented integer, and with it every
-        // product and carry row, is unchanged. Only the two limb range rows can object.
-        for element in [&r, &q] {
+        // product row and the closing row, is unchanged. Only range rows can object: the two
+        // limbs, and a carry whose integer value moved while its bits did not.
+        for (element, most) in [(&r, 2), (&q, 3)] {
             let mut bad = z.clone();
             bad[var_of(&element.bytes_le[0])] += F::from_u64_reduced(256);
             bad[var_of(&element.bytes_le[1])] -= F::ONE;
-            assert_eq!(violated_rows(&shape, &bad), 2);
-            assert!(!shape.is_satisfied(&bad));
+            let (range, other) = violated_rows(&shape, &bad);
+            assert!((2..=most).contains(&range), "{range} range rows");
+            assert_eq!(other, 0);
         }
+        // The reduction no longer needs a wide quotient: the high limbs are folded first.
+        assert!(q.bits_le.len() < 48, "quotient of {} bits", q.bits_le.len());
+        assert!(q.bytes_le.len() >= 2);
         // A quotient that is off by one breaks the identity itself.
         let mut bad = z.clone();
         let bit = var_of(&q.bits_le[0]);
