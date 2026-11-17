@@ -176,7 +176,24 @@ pub fn ff1_aes256_encrypt_88(key: &[u8; 32], input: &[u8; 11]) -> [u8; 11] {
     let aes = Aes256::new(key);
     // b = ceil(44 / 8) = 6, d = 4 * ceil(b / 4) + 4 = 12: one PRF block per round covers S.
     // P = [1, 2, 1] || [radix]^3 || [10] || [u mod 256] || [n]^4 || [t]^4.
-    let p: [u8; 16] = [1, 2, 1, 0, 0, 2, 10, HALF_BITS as u8, 0, 0, 0, 88, 0, 0, 0, 0];
+    let p: [u8; 16] = [
+        1,
+        2,
+        1,
+        0,
+        0,
+        2,
+        10,
+        HALF_BITS as u8,
+        0,
+        0,
+        0,
+        88,
+        0,
+        0,
+        0,
+        0,
+    ];
     let mut p_enc = aes.encrypt(&p);
     let mut a = half_to_num(input, 0);
     let mut b = half_to_num(input, HALF_BITS as usize);
