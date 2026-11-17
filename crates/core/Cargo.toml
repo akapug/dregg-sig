@@ -1,0 +1,23 @@
+[package]
+name = "dregg-sig-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Zero-dependency no_std post-quantum threshold hash-based signatures (NIST FIPS 205 SLH-DSA, Corduroy, Baggy, JortsPoseidon2) with dealerless preprocessing and identifiable abort."
+
+[features]
+default = []
+testing-ephemeral = []
+std = ["dregg-sig-asm/std", "dregg-sig-accel/std"]
+
+[dependencies]
+dregg-sig-accel = { path = "../accel", default-features = false }
+dregg-sig-verified = { path = "../verified", default-features = false }
+# Strictly zero external crate dependencies.
+dregg-sig-asm = { path = "../asm", default-features = false, features = ["alloc"] }
+
+
+[[example]]
+name = "pants_bench"
+required-features = ["testing-ephemeral"]
