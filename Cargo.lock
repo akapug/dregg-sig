@@ -103,6 +103,7 @@ dependencies = [
  "dregg-sig-agg",
  "dregg-sig-asm",
  "dregg-sig-core",
+ "dregg-sig-quorum",
 ]
 
 [[package]]
