@@ -100,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "dregg-sig-accel",
  "dregg-sig-addr",
+ "dregg-sig-agg",
  "dregg-sig-asm",
  "dregg-sig-core",
 ]

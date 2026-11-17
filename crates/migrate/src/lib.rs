@@ -24,6 +24,7 @@ extern crate std;
 
 pub mod bls12_381;
 pub mod ed25519_ct;
+pub mod hem;
 pub mod legacy;
 pub mod pallas;
 pub mod scalar;

@@ -9,7 +9,7 @@ description = "Mixed-domain ZKBoo migration ownership with replicated and authen
 [features]
 default = ["alloc"]
 alloc = ["dregg-sig-accel/alloc", "dregg-sig-addr/alloc"]
-std = ["alloc", "dregg-sig-accel/std", "dregg-sig-addr/std", "dregg-sig-core/std"]
+std = ["alloc", "dregg-sig-accel/std", "dregg-sig-addr/std", "dregg-sig-core/std", "dregg-sig-agg/std"]
 vulkan = ["std"]
 # Deterministic single-seed preprocessing for tests and benchmarks. A build with
 # this feature contains a generator that knows every MAC key; never ship it.
@@ -20,3 +20,4 @@ dregg-sig-core = { path = "../core", default-features = false }
 dregg-sig-asm = { path = "../asm", default-features = false }
 dregg-sig-accel = { path = "../accel", default-features = false }
 dregg-sig-addr = { path = "../addr", default-features = false }
+dregg-sig-agg = { path = "../agg", default-features = false, features = ["alloc"] }
