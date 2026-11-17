@@ -1221,7 +1221,7 @@ pub fn verify_hierarchical_hem_evidence(
     aggregate: &HierarchicalHemAggregate,
 ) -> Option<VerifiedHierarchicalHemEvidence> {
     let message = message.as_ref();
-    if !regime.meets_qrom_128_floor()
+    if !regime.is_accepted_aggregate_profile()
         || !verify_hierarchical_hem_inner(
             policies,
             epoch_floor,
@@ -1254,7 +1254,7 @@ pub fn verify_hierarchical_hem_evidence_prepared(
     aggregate: &HierarchicalHemAggregate,
 ) -> Option<VerifiedHierarchicalHemEvidence> {
     let message = message.as_ref();
-    if !regime.meets_qrom_128_floor()
+    if !regime.is_accepted_aggregate_profile()
         || !verify_hierarchical_hem_with_roots(
             &registry.policies,
             &registry.committee_roots,
@@ -2082,7 +2082,7 @@ pub fn prove_succinct_hierarchical_hem(
     minimum_global_quorums: usize,
     config: &HemAggConfig,
 ) -> Result<SuccinctHierarchicalHemAggregate, HemAggError> {
-    if !config.regime.meets_qrom_128_floor() {
+    if !config.regime.is_accepted_aggregate_profile() {
         return Err(HemAggError::InvalidShardConfig);
     }
     let msg_ref = message.as_ref();
@@ -2147,7 +2147,7 @@ fn check_hierarchical_hem_commitment_with_roots(
     expected_regime: WhirSecurityRegime,
     aggregate: &SuccinctHierarchicalHemAggregate,
 ) -> bool {
-    if !expected_regime.meets_qrom_128_floor()
+    if !expected_regime.is_accepted_aggregate_profile()
         || aggregate.shards.len() != policies.len()
         || committee_roots.len() != policies.len()
         || minimum_global_quorums == 0
@@ -3718,7 +3718,7 @@ impl SubtreeInternalMergeRelation {
             || base_merkle_level > 58usize.saturating_sub(fan_in.trailing_zeros() as usize)
             || child_vk.num_public != SUBTREE_PUBLIC_WORDS
             || !child_vk.regime.uses_poseidon2_canopy()
-            || !parent_regime.meets_qrom_128_floor()
+            || !parent_regime.is_accepted_aggregate_profile()
         {
             return Err(FullShardError::InvalidParameters);
         }

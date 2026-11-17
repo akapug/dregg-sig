@@ -1411,7 +1411,7 @@ impl FullShardMergeProof {
         relation: &FullShardMergeRelation,
         regime: WhirSecurityRegime,
     ) -> Option<Self> {
-        if bytes.get(..8)? != b"QSAGFSM1" || !regime.meets_qrom_128_floor() {
+        if bytes.get(..8)? != b"QSAGFSM1" || !regime.is_accepted_aggregate_profile() {
             return None;
         }
         if regime == relation.verifier_key().regime {
@@ -1434,7 +1434,7 @@ pub fn prove_full_shard_merge(
     regime: WhirSecurityRegime,
     seed: &[u8; 32],
 ) -> Result<FullShardMergeProof, FullShardError> {
-    if !regime.meets_qrom_128_floor()
+    if !regime.is_accepted_aggregate_profile()
         || statements.len() != relation.children
         || proofs.len() != relation.children
     {
@@ -1466,7 +1466,7 @@ pub fn verify_full_shard_merge(
     regime: WhirSecurityRegime,
     proof: &FullShardMergeProof,
 ) -> bool {
-    if !regime.meets_qrom_128_floor() || shards.len() != relation.children {
+    if !regime.is_accepted_aggregate_profile() || shards.len() != relation.children {
         return false;
     }
     let public: Vec<F> = shards.iter().flat_map(ShardPublic::words).collect();

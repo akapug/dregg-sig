@@ -4141,7 +4141,7 @@ pub fn prove_succinct_children_whir_merge(
     regime: WhirSecurityRegime,
     seed: &[u8; 32],
 ) -> Result<SuccinctChildWhirMerge, RecursiveWhirError> {
-    if !regime.meets_qrom_128_floor()
+    if !regime.is_accepted_aggregate_profile()
         || children.len() != relation.children
         || proofs.len() != relation.children
     {
@@ -4168,7 +4168,7 @@ pub fn verify_succinct_children_whir_merge(
     regime: WhirSecurityRegime,
     parent: &SuccinctChildWhirMerge,
 ) -> bool {
-    if !regime.meets_qrom_128_floor()
+    if !regime.is_accepted_aggregate_profile()
         || children.len() != relation.children
         || children
             .iter()

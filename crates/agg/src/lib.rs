@@ -1079,7 +1079,9 @@ pub fn verify_aggregate(
     verify_aggregate_with_regime(pks, mode, proof, WhirSecurityRegime::default())
 }
 
-/// Verify every leaf under exactly the explicitly selected QROM-128 regime.
+/// Verify every leaf under exactly the explicitly selected aggregate profile.
+/// See [`WhirSecurityRegime`] for nominal work factors and bounded-query assumptions;
+/// acceptance does not establish a composed QROM security bound.
 pub fn verify_aggregate_with_regime(
     pks: &[ValidatorPublicKey],
     mode: &SigningMode<'_>,
@@ -1727,7 +1729,7 @@ mod tests {
         ));
 
         // Both prover (`aggregate_with_config`) and verifier/wire-decoder must refuse
-        // classical-only Johnson (`BciksJohnsonClassical128`, fails QROM-128 floor).
+        // classical-only Johnson (`BciksJohnsonClassical128`, excluded by aggregate profile policy).
         let mut classical_cfg = cfg.clone();
         classical_cfg.regime = wrong;
         assert!(
@@ -1773,7 +1775,7 @@ mod tests {
         bad.schedule.stages[0].num_queries = 1;
         assert!(!HemAggregator::verify(&pks, &mode, &with_leaf(&proof, bad)));
 
-        // The leaf verifier itself enforces the QROM-128 floor and exact regime parity.
+        // The leaf verifier itself enforces aggregate profile policy and exact regime parity.
         let committee_root = compute_committee_root(&pks);
         let profile = AggSigProfile::JortsPoseidon2;
         assert!(verify_shard_batch(

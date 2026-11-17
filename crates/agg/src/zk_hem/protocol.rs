@@ -100,7 +100,7 @@ pub struct Layout {
 impl Layout {
     /// Smallest table that holds the variable subcube, the masks and the opening blinders.
     pub fn new(shape: &Shape, regime: WhirSecurityRegime) -> Option<Self> {
-        if !regime.meets_qrom_128_floor() {
+        if !regime.is_accepted_aggregate_profile() {
             return None;
         }
         let var_bits = shape.num_vars.next_power_of_two().trailing_zeros().max(1) as usize;
@@ -1479,7 +1479,7 @@ fn public_layout(shape: &Shape, regime: WhirSecurityRegime) -> Option<Layout> {
         .checked_next_power_of_two()?
         .trailing_zeros()
         .max(2) as usize;
-    (regime.meets_qrom_128_floor() && var_bits <= MAX_PCS_NUM_VARS).then(|| Layout {
+    (regime.is_accepted_aggregate_profile() && var_bits <= MAX_PCS_NUM_VARS).then(|| Layout {
         log_cells: var_bits,
         var_bits,
         blind_cells: 0,
@@ -1728,7 +1728,7 @@ impl ShapeVerifierKey {
 
     /// Check bounded geometry before decoding proofs or evaluating structured matrices.
     pub fn is_well_formed(&self) -> bool {
-        if !self.regime.meets_qrom_128_floor()
+        if !self.regime.is_accepted_aggregate_profile()
             || !(4..=MAX_PCS_NUM_VARS).contains(&self.log_rows)
             || !(2..=MAX_PCS_NUM_VARS).contains(&self.var_bits)
             || self.ell_nz < self.log_rows.max(self.var_bits)
@@ -1805,7 +1805,7 @@ impl ShapeVerifierKey {
         let pub_var_blocks =
             usize::try_from(u64::from_le_bytes(bytes.get(75..83)?.try_into().ok()?)).ok()?;
         let regime = WhirSecurityRegime::from_u8(*bytes.get(83)?)?;
-        if !regime.meets_qrom_128_floor()
+        if !regime.is_accepted_aggregate_profile()
             || !(4..=MAX_PCS_NUM_VARS).contains(&log_rows)
             || !(2..=MAX_PCS_NUM_VARS).contains(&var_bits)
             || ell_nz < log_rows.max(var_bits)
@@ -3103,7 +3103,7 @@ pub fn prove_public_hologram(
     seed: &[u8; 32],
 ) -> Result<HologramPublicProof, ZkHemError> {
     let vk = &hologram.vk;
-    if vk.shape_digest != shape.digest() || !vk.regime.meets_qrom_128_floor() {
+    if vk.shape_digest != shape.digest() || !vk.regime.is_accepted_aggregate_profile() {
         return Err(ZkHemError::Unsatisfied);
     }
     if assignment.len() != shape.num_vars || assignment.first() != Some(&F::ONE) {
