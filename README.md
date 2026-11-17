@@ -11,7 +11,10 @@ Research prototype. No external audit.
 | `qsag-core` | `crates/qsag-core` | FIPS 205 SLH-DSA (all six SHAKE parameter sets), the native formats `Baggy` (stateless) and `Jorts` / `JortsPoseidon2` (stateful), and the MPC engines that threshold-sign them: only the secret hashes run under MPC, the public Merkle layers are computed in the clear. Dealerless key generation, the `BeltLatch` one-time-leaf latch, crash-atomic journals and rollback anchors. |
 | `qsag-quorum` | `crates/qsag-quorum` | Isolated one-party-per-value custodians over a framed, encrypted wire transport; quorum-switching `Jorts` (disjoint committees, or certified `(t, n)` release); threshold signing of `JortsPoseidon2` keys that Hem can aggregate. |
 | `qsag-fts` | `crates/qsag-fts` | Compact few-time signatures (`Compact1122`: 1,122 bytes) for single-use votes, single-signer and threshold, with a durable burn journal. |
-| `qsag-agg` | `crates/qsag-agg` | Hem: proves that a batch of `JortsPoseidon2` signatures verifies, using Goldilocks sumcheck and WHIR polynomial commitments; merges and recursive composition of those proofs; the zero-knowledge protocol the recursion is built on. |
+| `qsag-agg` | `crates/qsag-agg` | Hem: proves that a batch of `JortsPoseidon2` signatures verifies, using Goldilocks sumcheck and WHIR polynomial commitments; merges and recursive composition of those proofs; zk-Hem, the zero-knowledge protocol under the recursion and the credential relations. |
+| `qsag-cred` | `crates/qsag-cred` | Threshold ML-DSA-44/65/87 (FIPS 204), threshold oblivious PRFs, and `BlindVC` selective-disclosure credentials. Their presentations, bearer capabilities with revocation, and private-policy multisignatures are proved as zk-Hem relations in `qsag-agg`. |
+| `qsag-policy` | `crates/qsag-policy` | Velocity, allowlist and window rules checked before custodians release shares; `SpongeMacaroon` and `PqBiscuit` attenuable tokens. |
+| `qsag-addr` | `crates/qsag-addr` | Bech32m post-quantum addresses, hybrid keys, and the canonical 128-byte signing intent. |
 | `qsag-accel` | `crates/qsag-accel` | Hash and field kernels behind one backend trait, a CPU reference backend, and a Vulkan compute prover (feature `vulkan`, Linux). |
 | `qsag-asm` | `crates/qsag-asm` | Constant-time SIMD and assembly kernels (x86-64 and AArch64) with portable fallbacks, secret wiping, durable-file primitives. |
 | `qsag-verified`, `qsag-whir-verified` | `crates/qsag-verified`, `crates/qsag-whir-verified` | Small `no_std` kernels (field arithmetic, Keccak, release guards, WHIR fold steps) that the crates above call. They were written to be extracted to Lean; the proofs are not in this repository. |
@@ -51,10 +54,10 @@ cargo test --release -p qsag-agg --test cshake_proof_bytes_kat
 This is the signing and aggregation Rust of [`qsag`](https://github.com/emberian/qsag), cut down to what a product would depend on. `qsag` continues as the larger verification and hardware project; fixes to these crates are made there and ported here.
 
 - Crate names, identifiers, environment variables, wire formats and domain-separation tags are `qsag`'s, unchanged, so patches apply directly. Source: `qsag` commit `cf41f1c` plus that tree's uncommitted crate edits. The two `*-verified` crates live under `aeneas/` in `qsag` and under `crates/` here.
-- Not carried over: the Lean proof library and Aeneas extraction, the hardware projects, the paper, the CLI, and the wallet, migration, credential and policy crates (`qsag-hd`, `qsag-addr`, `qsag-migrate`, `qsag-cred`, `qsag-policy`).
-- Removed from the kept crates: the credential, capability and private-multisignature relations in `qsag-agg`, their guards in `qsag-verified`, the in-process CNF coordinator prototype in `qsag-core` that its own documentation quarantined, and one `qsag-core` test that needed `qsag-policy`.
+- Not carried over: the Lean proof library and Aeneas extraction, the hardware projects, the paper, the CLI, and the wallet-hierarchy and curve-migration crates (`qsag-hd`, `qsag-migrate`).
+- The only source file that differs from `qsag` is `qsag-core/src/cnf_rss.rs`: the in-process CNF coordinator prototype that its own documentation quarantined is removed. Three examples were moved out of `qsag-cli` into the crates they exercise.
 
-Doc comments that cite `lean/Qsag/…` or `Qsag.<name>` point at the proofs in `qsag`. Those proofs, the constant-time archive screen and the source-hash pins were recorded against `qsag`'s tree; they have not been re-run here, and the edited files above no longer match their pins.
+Doc comments that cite `lean/Qsag/…` or `Qsag.<name>` point at the proofs in `qsag`. Those proofs, the constant-time archive screen and the source-hash pins were recorded against `qsag`'s tree; they have not been re-run here.
 
 ## License
 

@@ -357,6 +357,7 @@ impl Shape {
 /// by running the same synthesis on a placeholder assignment.
 pub struct ConstraintSystem {
     values: Vec<F>,
+    record_rows: bool,
     num_public: usize,
     hologram_aligned: bool,
     p2_perms: usize,
@@ -376,6 +377,7 @@ impl ConstraintSystem {
     pub fn new() -> Self {
         Self {
             values: vec![F::ONE],
+            record_rows: true,
             num_public: 0,
             hologram_aligned: false,
             p2_perms: 0,
@@ -395,11 +397,31 @@ impl ConstraintSystem {
         cs
     }
 
+    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices.
+    /// The resulting assignment must still be checked against the compiled shape.
+    pub(crate) fn witness_only() -> Self {
+        let mut cs = Self::new();
+        cs.record_rows = false;
+        cs
+    }
+
+    pub(crate) fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
+        assert!(!self.record_rows && !self.hologram_aligned);
+        if self.num_public != shape.num_public || self.values.len() != shape.mask_var_base {
+            return None;
+        }
+        let masks = shape.num_vars - self.values.len();
+        qsag_core::wipe::secret_vec_reserve(&mut self.values, masks);
+        self.values.resize(shape.num_vars, F::ZERO);
+        Some(core::mem::take(&mut self.values))
+    }
+
     pub(crate) fn fork_public_inputs(&self) -> Self {
         assert_eq!(self.values.len(), self.num_public + 1);
         assert!(self.p2_values.is_empty());
         Self {
             values: self.values.clone(),
+            record_rows: self.record_rows,
             num_public: self.num_public,
             hologram_aligned: self.hologram_aligned,
             p2_perms: 0,
@@ -414,6 +436,7 @@ impl ConstraintSystem {
     /// variables. Preserves the serial allocation/row order for canonical shapes.
     pub(crate) fn append(&mut self, mut other: Self) {
         assert_eq!(self.num_public, other.num_public);
+        assert_eq!(self.record_rows, other.record_rows);
         assert_eq!(self.hologram_aligned, other.hologram_aligned);
         assert_eq!(
             &self.values[..=self.num_public],
@@ -501,7 +524,9 @@ impl ConstraintSystem {
     /// Fresh variable `y` with the row `a^7 = y`.
     pub fn sbox7(&mut self, a: &Lc) -> Var {
         let y = self.alloc(poseidon2_sbox7(self.eval(a)));
-        self.sbox.push((a.clone(), y.into()));
+        if self.record_rows {
+            self.sbox.push((a.clone(), y.into()));
+        }
         y
     }
 
@@ -514,7 +539,9 @@ impl ConstraintSystem {
         let idx = self.p2_values.len() - 1;
         assert!(idx < P2_VAR_TAG as usize, "poseidon2 variable limit");
         let y = Var(P2_VAR_TAG | (idx as u32));
-        self.p2_sbox.push((a.clone(), y.into()));
+        if self.record_rows {
+            self.p2_sbox.push((a.clone(), y.into()));
+        }
         y
     }
 
@@ -524,7 +551,9 @@ impl ConstraintSystem {
         }
         for _ in 0..10 {
             qsag_core::wipe::secret_vec_push(&mut self.p2_values, F::ZERO);
-            self.p2_sbox.push((Lc::zero(), Lc::zero()));
+            if self.record_rows {
+                self.p2_sbox.push((Lc::zero(), Lc::zero()));
+            }
         }
         self.p2_perms += 1;
         debug_assert_eq!(self.p2_values.len(), 128 * self.p2_perms);
@@ -533,17 +562,23 @@ impl ConstraintSystem {
     /// Fresh variable `y` with the row `a * b = y`.
     pub fn mul(&mut self, a: &Lc, b: &Lc) -> Var {
         let y = self.alloc(self.eval(a).const_mul(self.eval(b)));
-        self.mul.push((a.clone(), b.clone(), y.into()));
+        if self.record_rows {
+            self.mul.push((a.clone(), b.clone(), y.into()));
+        }
         y
     }
 
     pub fn enforce_mul(&mut self, a: Lc, b: Lc, c: Lc) {
-        self.mul.push((a, b, c));
+        if self.record_rows {
+            self.mul.push((a, b, c));
+        }
     }
 
     /// Row `lc * 1 = 0`.
     pub fn enforce_zero(&mut self, lc: Lc) {
-        self.mul.push((lc, Lc::constant(F::ONE), Lc::zero()));
+        if self.record_rows {
+            self.mul.push((lc, Lc::constant(F::ONE), Lc::zero()));
+        }
     }
 
     pub fn enforce_equal(&mut self, a: &Lc, b: &Lc) {
@@ -552,8 +587,10 @@ impl ConstraintSystem {
 
     /// Row `v * (1 - v) = 0`.
     pub fn enforce_boolean(&mut self, v: &Lc) {
-        self.mul
-            .push((v.clone(), Lc::constant(F::ONE).minus(v), Lc::zero()));
+        if self.record_rows {
+            self.mul
+                .push((v.clone(), Lc::constant(F::ONE).minus(v), Lc::zero()));
+        }
     }
 
     /// `if bit { on_one } else { on_zero }`, one multiplication row. `bit` must be
@@ -572,6 +609,7 @@ impl ConstraintSystem {
     /// power of two. Returns the shape and the assignment, whose masking variables are zero
     /// until the prover overwrites them.
     pub fn finish(mut self) -> (Shape, Vec<F>) {
+        assert!(self.record_rows);
         let one = Lc::constant(F::ONE);
         let two = Lc::constant(F::TWO);
         let empty = Lc::zero();

@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qsag-addr"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-verified",
+]
+
+[[package]]
 name = "qsag-agg"
 version = "0.1.0"
 dependencies = [
@@ -30,7 +38,21 @@ name = "qsag-core"
 version = "0.1.0"
 dependencies = [
  "qsag-accel",
+ "qsag-addr",
  "qsag-asm",
+ "qsag-policy",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-cred"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-addr",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-policy",
  "qsag-verified",
 ]
 
@@ -41,6 +63,17 @@ dependencies = [
  "qsag-accel",
  "qsag-asm",
  "qsag-core",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-policy"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-addr",
+ "qsag-asm",
+ "qsag-fts",
  "qsag-verified",
 ]
 

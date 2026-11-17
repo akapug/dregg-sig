@@ -100,10 +100,13 @@ dependencies = [
  "p3-field",
  "p3-goldilocks",
  "qsag-accel",
+ "qsag-addr",
  "qsag-agg",
  "qsag-asm",
  "qsag-core",
+ "qsag-cred",
  "qsag-fts",
+ "qsag-policy",
  "qsag-quorum",
  "sha2",
  "sha3",
@@ -437,6 +440,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qsag-addr"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-verified",
+]
+
+[[package]]
 name = "qsag-agg"
 version = "0.1.0"
 dependencies = [
@@ -459,12 +470,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "qsag-cred"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-addr",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-policy",
+ "qsag-verified",
+]
+
+[[package]]
 name = "qsag-fts"
 version = "0.1.0"
 dependencies = [
  "qsag-accel",
  "qsag-asm",
  "qsag-core",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-policy"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-addr",
+ "qsag-asm",
+ "qsag-fts",
  "qsag-verified",
 ]
 

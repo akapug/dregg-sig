@@ -6,13 +6,11 @@
 #![forbid(unsafe_code)]
 // Charon + Aeneas `0-FunsExternal` MIR extraction intentionally uses explicit `match`/branch/scalar
 // forms instead of `Try::branch` (`?`), closure `Option::map`, or `core::num::is_multiple_of`.
-// Permit and grant types carry a private unit field so that only this crate can construct them.
 #![allow(
     clippy::collapsible_if,
     clippy::if_same_then_else,
     clippy::manual_is_multiple_of,
     clippy::manual_map,
-    clippy::manual_non_exhaustive,
     clippy::needless_bool,
     clippy::question_mark,
     clippy::too_many_arguments
@@ -29,16 +27,24 @@ pub use belt_latch_kernel::{
     BeltLatchBindOutcome, BeltLatchBindRequest, BeltLatchDigits, BeltLatchKernel,
     BeltLatchKernelError, BeltLatchKernelRecord, belt_latch_digits_eq,
 };
+pub mod cred_and_hd_guards;
 pub mod fips205;
 pub mod fts_spn_guard;
 pub mod goldilocks;
 pub mod keccak;
 pub mod opening_guard;
 pub mod pants_and_quorum_guards;
+pub mod policy_and_addr;
 pub mod rss_cut_session;
 pub mod threshold;
 pub mod tower;
 
+pub use cred_and_hd_guards::{
+    CredHdGuardError, HdCommittedZeroTest, HdZeroTestPhase, MLDSA_Q, MLDSA44_R0_NORM_BOUND,
+    MLDSA44_Z_NORM_BOUND, MLDSA65_R0_NORM_BOUND, MLDSA65_Z_NORM_BOUND, MlDsaBarrierChecks,
+    MlDsaReleaseGate, check_mldsa44_norm_bounds, check_mldsa65_norm_bounds,
+    mldsa44_sample_eta2_nibble_mod_q, toprf_majority_of_3_goldilocks,
+};
 pub use fips205::{
     Fips205Adrs, Fips205AdrsType, decode_fips205_adrs, encode_fips205_adrs, fips205_f,
     fips205_wots_chain, fips205_wots_checksum, tsw_canonical_target_sum, tsw_check_target_sum,
@@ -67,6 +73,13 @@ pub use pants_and_quorum_guards::{
     VerifiedWotsC256Guard, WOTSC256_BASE_W, WOTSC256_CHAINS, WOTSC256_TARGET_SUM,
     WaistbandAncestorPermit, WaistbandDerivationRequest, validate_belt_quorum_config,
     verified_wotsc256_extract_digits, verified_wotsc256_verify_sum, wotsc256_extract_digit,
+};
+pub use policy_and_addr::{
+    CanonicalIntent128, HybridRoleTag, INTENT_V1_MAGIC, IntentAddressVersion, IntentIdentityKind,
+    IntentSuiteTag, MAX_VELOCITY_U128, PolicyAddrError, SUITE_HYBRID_ED25519_MLDSA65,
+    SUITE_HYBRID_SECP256K1_MLDSA44, StatefulVelocityGuard, VelocitySpendRequest,
+    check_hybrid_domain_framing, decode_intent_128, derive_hybrid_transcript_digest,
+    encode_intent_128,
 };
 pub use rss_cut_session::{
     RssCutError, RssCutGateSession, RssCutPhase, RssCutStepInput, RssCutStepOutput,
