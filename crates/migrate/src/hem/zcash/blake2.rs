@@ -75,7 +75,10 @@ fn wipe<T: Copy + Default>(buf: &mut [T]) {
 /// Initial chaining value of unkeyed BLAKE2b with digest length `out_len` and a
 /// personalization.
 pub fn blake2b_iv(out_len: usize, personal: &[u8; 16]) -> [u64; 8] {
-    assert!((1..=64).contains(&out_len), "BLAKE2b digest length is 1..=64");
+    assert!(
+        (1..=64).contains(&out_len),
+        "BLAKE2b digest length is 1..=64"
+    );
     let mut h = IV_B;
     h[0] ^= 0x0101_0000 ^ out_len as u64;
     h[6] ^= u64::from_le_bytes(personal[..8].try_into().unwrap());
@@ -259,7 +262,10 @@ impl Drop for Blake2s {
 
 impl Blake2s {
     pub fn new(out_len: usize, personal: &[u8; 8]) -> Self {
-        assert!((1..=32).contains(&out_len), "BLAKE2s digest length is 1..=32");
+        assert!(
+            (1..=32).contains(&out_len),
+            "BLAKE2s digest length is 1..=32"
+        );
         let mut h = IV_S;
         h[0] ^= 0x0101_0000 ^ out_len as u32;
         h[6] ^= u32::from_le_bytes(personal[..4].try_into().unwrap());

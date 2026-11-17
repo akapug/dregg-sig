@@ -142,10 +142,9 @@ impl PointTable {
                 .collect();
             // out = forms[0] + sum_{h > 0} high[h] * forms[h]; the last product closes the
             // equation that defines the output variable.
-            let value = forms
-                .iter()
-                .zip(&high)
-                .fold(F::ZERO, |acc, (f, h)| acc + cs.eval(f).const_mul(cs.eval(h)));
+            let value = forms.iter().zip(&high).fold(F::ZERO, |acc, (f, h)| {
+                acc + cs.eval(f).const_mul(cs.eval(h))
+            });
             let out: Lc = cs.alloc(value).into();
             let mut rest = out.minus(&forms[0]);
             for h in 1..high.len() {
@@ -184,10 +183,9 @@ fn select_limbs(cs: &mut ConstraintSystem, monos: &[Lc], options: &[&[Lc]]) -> V
                 }
                 i <<= 1;
             }
-            let value = c
-                .iter()
-                .zip(monos)
-                .fold(F::ZERO, |acc, (f, m)| acc + cs.eval(f).const_mul(cs.eval(m)));
+            let value = c.iter().zip(monos).fold(F::ZERO, |acc, (f, m)| {
+                acc + cs.eval(f).const_mul(cs.eval(m))
+            });
             let out: Lc = cs.alloc(value).into();
             let mut rest = out.minus(&c[0]);
             for u in 1..n {
@@ -325,7 +323,10 @@ pub fn add(
     canonical: bool,
 ) -> Pt {
     if distinct {
-        assert!(a.x_canonical && b.x_canonical, "distinctness needs canonical x");
+        assert!(
+            a.x_canonical && b.x_canonical,
+            "distinctness needs canonical x"
+        );
         enforce_limbs_differ(cs, &a.x, &b.x);
     }
     let mut a = a.clone();
@@ -448,7 +449,12 @@ impl FixedBase {
     ) -> Pt {
         assert_eq!(scalar_bits.len(), Field::BITS);
         let mut acc: Option<Pt> = None;
-        for (j, (points, bits)) in self.windows.iter().zip(scalar_bits.chunks(WINDOW)).enumerate() {
+        for (j, (points, bits)) in self
+            .windows
+            .iter()
+            .zip(scalar_bits.chunks(WINDOW))
+            .enumerate()
+        {
             let table = PointTable::new(points, bits.len());
             let (x, y) = table.lookup(cs, bits);
             let t = Pt::from_table(x, y);
@@ -458,7 +464,14 @@ impl FixedBase {
                     let last = j + 1 == WINDOWS;
                     // The accumulator must be canonical where distinctness is enforced.
                     let before_last = j + 2 == WINDOWS;
-                    add(cs, f, &a, &t, last, if last { canonical } else { before_last })
+                    add(
+                        cs,
+                        f,
+                        &a,
+                        &t,
+                        last,
+                        if last { canonical } else { before_last },
+                    )
                 }
             });
         }
@@ -705,7 +718,8 @@ pub fn poseidon_hash2(cs: &mut ConstraintSystem, f: &Field, a: &Num, b: &Num) ->
     let rounds = poseidon::FULL_ROUNDS + poseidon::PARTIAL_ROUNDS;
     let mut out = None;
     for r in 0..rounds {
-        let full = !(poseidon::FULL_ROUNDS / 2..poseidon::FULL_ROUNDS / 2 + poseidon::PARTIAL_ROUNDS)
+        let full = !(poseidon::FULL_ROUNDS / 2
+            ..poseidon::FULL_ROUNDS / 2 + poseidon::PARTIAL_ROUNDS)
             .contains(&r);
         let terms: Vec<Num> = (0..3)
             .map(|j| {
@@ -810,7 +824,9 @@ mod tests {
         let f = Field::pallas_base();
         let mut cs = ConstraintSystem::new();
         let bits = alloc_bits(&mut cs, &[0u8; 32]);
-        let _ = Base::SpendAuth.tables().mul(&mut cs, &f, &bits[..255], true);
+        let _ = Base::SpendAuth
+            .tables()
+            .mul(&mut cs, &f, &bits[..255], true);
         let (shape, z) = cs.finish();
         assert!(!shape.is_satisfied(&z));
     }
@@ -820,16 +836,34 @@ mod tests {
         let (fp, fq) = (Field::pallas_base(), Field::pallas_scalar());
         let g = hash_to_curve("z.cash:Orchard-gd", b"test point");
         let (gx, gy) = g.to_affine().unwrap();
-        for k in [sample_scalar(3), Fq::ONE, Fq::from_u64(8), -Fq::ONE, sample_scalar(4)] {
+        for k in [
+            sample_scalar(3),
+            Fq::ONE,
+            Fq::from_u64(8),
+            -Fq::ONE,
+            sample_scalar(4),
+        ] {
             let mut cs = ConstraintSystem::new();
             let bits = alloc_bits(&mut cs, &k.to_bytes());
-            let (ex, ey) = (fp.alloc(&mut cs, &gx.to_bytes()), fp.alloc(&mut cs, &gy.to_bytes()));
+            let (ex, ey) = (
+                fp.alloc(&mut cs, &gx.to_bytes()),
+                fp.alloc(&mut cs, &gy.to_bytes()),
+            );
             fp.enforce_canonical(&mut cs, &ex);
             enforce_on_curve(&mut cs, &fp, &ex, &ey);
             let rows0 = cs.num_rows();
-            let mut p =
-                var_base_mul(&mut cs, &fp, &fq, &Pt::from_elems(&ex, true, &ey), &bits[..255], true);
-            println!("variable-base multiplication: {} rows", cs.num_rows() - rows0);
+            let mut p = var_base_mul(
+                &mut cs,
+                &fp,
+                &fq,
+                &Pt::from_elems(&ex, true, &ey),
+                &bits[..255],
+                true,
+            );
+            println!(
+                "variable-base multiplication: {} rows",
+                cs.num_rows() - rows0
+            );
             let (x, y) = p.canonical_coordinates(&mut cs, &fp);
             let want = g.mul(&k).to_affine().unwrap();
             assert_eq!(x.value(&cs), want.0.to_bytes());
@@ -871,8 +905,14 @@ mod tests {
                 cs.num_rows() - rows0
             );
             let (x, y) = p.canonical_coordinates(&mut cs, &f);
-            let native_bits: Vec<bool> = (0..len).map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1).collect();
-            let want = domain.hash_to_point(&native_bits).unwrap().to_affine().unwrap();
+            let native_bits: Vec<bool> = (0..len)
+                .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
+                .collect();
+            let want = domain
+                .hash_to_point(&native_bits)
+                .unwrap()
+                .to_affine()
+                .unwrap();
             assert_eq!(x.value(&cs), want.0.to_bytes());
             assert_eq!(y.value(&cs), want.1.to_bytes());
             finish_ok(cs);
@@ -912,7 +952,9 @@ mod tests {
             &r_bits[..255],
         );
         let (x, _) = p.canonical_coordinates(&mut cs, &f);
-        let native_bits: Vec<bool> = (0..510).map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1).collect();
+        let native_bits: Vec<bool> = (0..510)
+            .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
+            .collect();
         assert_eq!(
             x.value(&cs),
             domain.short_commit(&native_bits, &r).unwrap().to_bytes()
@@ -925,7 +967,10 @@ mod tests {
         let f = Field::pallas_base();
         let (a, b) = (Fp::from_u64(7).square().invert(), Fp::from_u64(11).invert());
         let mut cs = ConstraintSystem::new();
-        let (ea, eb) = (f.alloc(&mut cs, &a.to_bytes()), f.alloc(&mut cs, &b.to_bytes()));
+        let (ea, eb) = (
+            f.alloc(&mut cs, &a.to_bytes()),
+            f.alloc(&mut cs, &b.to_bytes()),
+        );
         let rows0 = cs.num_rows();
         let out = poseidon_hash2(&mut cs, &f, &ea.num(), &eb.num());
         println!("Poseidon: {} rows", cs.num_rows() - rows0);

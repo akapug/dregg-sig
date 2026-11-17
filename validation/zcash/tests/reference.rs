@@ -209,12 +209,13 @@ fn merkle_tree_agrees() {
         let position = stream.next_u64() as u32;
         let (cmx, fcmx) = leaf(&mut stream);
         let path: Vec<(MerkleHashOrchard, Fp)> = (0..32).map(|_| leaf(&mut stream)).collect();
-        let reference_path: [MerkleHashOrchard; 32] =
-            core::array::from_fn(|i| path[i].0);
+        let reference_path: [MerkleHashOrchard; 32] = core::array::from_fn(|i| path[i].0);
         let ours: Vec<Fp> = path.iter().map(|p| p.1).collect();
         let cmx = ExtractedNoteCommitment::from_bytes(&cmx.to_bytes()).unwrap();
         assert_eq!(
-            MerklePath::from_parts(position, reference_path).root(cmx).to_bytes(),
+            MerklePath::from_parts(position, reference_path)
+                .root(cmx)
+                .to_bytes(),
             native::merkle_root(&fcmx, position, &ours).to_bytes()
         );
     }
@@ -237,7 +238,10 @@ fn redpallas_signatures_cross_verify() {
         // Ours verifies under the reference.
         let ours = native::redpallas_sign(&(ask + alpha), &message, &stream.bytes());
         let vk = redpallas::VerificationKey::<redpallas::SpendAuth>::try_from(rk).unwrap();
-        assert!(vk.verify(&message, &redpallas::Signature::from(ours)).is_ok());
+        assert!(
+            vk.verify(&message, &redpallas::Signature::from(ours))
+                .is_ok()
+        );
         // The reference's verifies under ours.
         let rng = rand::rand_core::UnwrapErr(rand::rngs::SysRng);
         let theirs: [u8; 64] = (&signing.sign(rng, &message)).into();
@@ -245,7 +249,10 @@ fn redpallas_signatures_cross_verify() {
         let mut bad = theirs;
         bad[5] ^= 1;
         assert!(!native::redpallas_verify(&rk, &message, &bad));
-        assert!(vk.verify(&message, &redpallas::Signature::from(bad)).is_err());
+        assert!(
+            vk.verify(&message, &redpallas::Signature::from(bad))
+                .is_err()
+        );
     }
 }
 
@@ -259,13 +266,16 @@ fn address_encodings_agree() {
             .to_raw_address_bytes();
         let p2pkh: [u8; 20] = stream.bytes();
 
-        for (network, reference_network) in
-            [(Network::Main, NetworkType::Main), (Network::Test, NetworkType::Test)]
-        {
+        for (network, reference_network) in [
+            (Network::Main, NetworkType::Main),
+            (Network::Test, NetworkType::Test),
+        ] {
             // Unified address with an Orchard receiver, with and without a transparent one.
             for with_transparent in [false, true] {
                 let mut ours = vec![Receiver::Orchard(orchard_receiver)];
-                let mut items = vec![unified::Uitem::Data(unified::Receiver::Orchard(orchard_receiver))];
+                let mut items = vec![unified::Uitem::Data(unified::Receiver::Orchard(
+                    orchard_receiver,
+                ))];
                 if with_transparent {
                     ours.push(Receiver::P2pkh(p2pkh));
                     items.push(unified::Uitem::Data(unified::Receiver::P2pkh(p2pkh)));
@@ -300,14 +310,9 @@ fn reference_notes_and_the_recovery_statement() {
         let recipient = fvk.address_at(3u32, scope);
         let (reference, native_note) = note(&mut stream, recipient, NoteVersion::V3);
         let witness = recovery_witness(&mut stream, bytes, native_note, our_scope, 9 + i as u32);
-        let statement = RecoveryStatement::derive(
-            &KeySource::SpendingKey,
-            &witness,
-            [1; 32],
-            [2; 32],
-            3,
-        )
-        .expect("a version 3 note of the key");
+        let statement =
+            RecoveryStatement::derive(&KeySource::SpendingKey, &witness, [1; 32], [2; 32], 3)
+                .expect("a version 3 note of the key");
         assert_eq!(statement.nullifier, reference.nullifier(&fvk).to_bytes());
         assert_eq!(statement.value, reference.value().inner());
 

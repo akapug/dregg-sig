@@ -147,7 +147,9 @@ mod tests {
         for (domain, bits, point, hash) in SINSEMILLA {
             let bits: Vec<bool> = bits.bytes().map(|b| b == b'1').collect();
             let d = HashDomain::new(domain);
-            let p = d.hash_to_point(&bits).expect("vector is not an exceptional case");
+            let p = d
+                .hash_to_point(&bits)
+                .expect("vector is not an exceptional case");
             assert_eq!(p.to_bytes(), hex32(point), "{domain}");
             assert_eq!(d.hash(&bits).unwrap().to_bytes(), hex32(hash), "{domain}");
         }

@@ -288,17 +288,20 @@ impl Relation {
     }
 }
 
+/// The affine coordinates of a point, each 32 bytes little-endian.
+type AffineBytes = ([u8; 32], [u8; 32]);
+
 /// Every witness value of a relation. Erased on drop.
 #[derive(Clone)]
 struct Inputs {
     /// `sk`, the seed or `qsk`.
     secret: Vec<u8>,
     /// Affine `ak^P` and `nk` (QK branch only).
-    ak: ([u8; 32], [u8; 32]),
+    ak: AffineBytes,
     nk: [u8; 32],
     internal: bool,
     alpha: [u8; 32],
-    g_d: ([u8; 32], [u8; 32]),
+    g_d: AffineBytes,
     rho: [u8; 32],
     rseed: [u8; 32],
     position: u32,
@@ -321,7 +324,7 @@ impl Inputs {
         }
     }
 
-    fn keys(witness: &KeyWitness) -> (Vec<u8>, ([u8; 32], [u8; 32]), [u8; 32]) {
+    fn keys(witness: &KeyWitness) -> (Vec<u8>, AffineBytes, [u8; 32]) {
         match witness {
             KeyWitness::SpendingKey(sk) => (sk.to_vec(), ([0; 32], [0; 32]), [0; 32]),
             KeyWitness::Zip32Seed(seed) => (seed.clone(), ([0; 32], [0; 32]), [0; 32]),
@@ -343,7 +346,7 @@ impl Drop for Inputs {
     }
 }
 
-fn affine_bytes(p: &Point) -> Option<([u8; 32], [u8; 32])> {
+fn affine_bytes(p: &Point) -> Option<AffineBytes> {
     p.to_affine().map(|(x, y)| (x.to_bytes(), y.to_bytes()))
 }
 
@@ -412,7 +415,11 @@ fn key_part(
         enforce_on_curve(cs, fp, &ax, &ay);
         let nk = fp.alloc(cs, &inputs.nk);
         fp.enforce_canonical(cs, &nk);
-        let wide = prf_expand(cs, &qk, &[&const_bits(&[0x0d]), &bytes32(&ax), &bytes32(&nk)]);
+        let wide = prf_expand(
+            cs,
+            &qk,
+            &[&const_bits(&[0x0d]), &bytes32(&ax), &bytes32(&nk)],
+        );
         let rivk_ext = to_scalar(cs, fq, &wide, true);
         return (Pt::from_elems(&ax, true, &ay), ax, nk, rivk_ext);
     }
@@ -464,7 +471,9 @@ fn ivk_part(
         &[&const_bits(&[0x83]), &bytes32(ak), &bytes32(nk)],
     );
     let rivk_int = to_scalar(cs, fq, &wide, false);
-    let internal: Lc = cs.alloc(F::from_u64_reduced(u64::from(inputs.internal))).into();
+    let internal: Lc = cs
+        .alloc(F::from_u64_reduced(u64::from(inputs.internal)))
+        .into();
     cs.enforce_boolean(&internal);
     let rivk: Vec<Lc> = rivk_ext
         .bits
@@ -1048,8 +1057,7 @@ pub fn verify_recovery(
     if proof.regime != regime || proof.key_tag != statement.key_source.tag() {
         return false;
     }
-    let (Some(shape), Some(public_inputs)) =
-        (recovery_shape(statement), statement.public_inputs())
+    let (Some(shape), Some(public_inputs)) = (recovery_shape(statement), statement.public_inputs())
     else {
         return false;
     };
@@ -1087,7 +1095,7 @@ pub struct AddressStatement {
     pub epoch: u64,
 }
 
-fn address_points(address: &[u8; 43]) -> Option<(([u8; 32], [u8; 32]), [u8; 32])> {
+fn address_points(address: &[u8; 43]) -> Option<(AffineBytes, [u8; 32])> {
     let d: [u8; 11] = address[..11].try_into().ok()?;
     let pk_d: [u8; 32] = address[11..].try_into().ok()?;
     Point::from_bytes_nonidentity(&pk_d)?;
@@ -1548,20 +1556,44 @@ mod tests {
             assert!(RecoveryStatement::from_bytes(&tag).is_none());
             // Every field is in the encoding and in the signed message.
             let variants = [
-                RecoveryStatement { epoch: 8, ..st.clone() },
-                RecoveryStatement { migration_domain: [1; 32], ..st.clone() },
-                RecoveryStatement { pq_commitment: [1; 32], ..st.clone() },
-                RecoveryStatement { anchor: [1; 32], ..st.clone() },
-                RecoveryStatement { nullifier: [1; 32], ..st.clone() },
-                RecoveryStatement { rk: st.nullifier, ..st.clone() },
-                RecoveryStatement { value: st.value + 1, ..st.clone() },
+                RecoveryStatement {
+                    epoch: 8,
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    migration_domain: [1; 32],
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    pq_commitment: [1; 32],
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    anchor: [1; 32],
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    nullifier: [1; 32],
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    rk: st.nullifier,
+                    ..st.clone()
+                },
+                RecoveryStatement {
+                    value: st.value + 1,
+                    ..st.clone()
+                },
             ];
             for other in &variants {
                 assert_ne!(other.to_bytes(), bytes);
                 assert_ne!(other.sighash(), st.sighash());
             }
         }
-        let st = statement(&KeySource::SpendingKey, &witness(&KeySource::SpendingKey, false));
+        let st = statement(
+            &KeySource::SpendingKey,
+            &witness(&KeySource::SpendingKey, false),
+        );
         // Non-canonical field element, identity and off-curve rk, unknown or bad key source.
         let at = |offset: usize| 29 + 8 + 32 + 32 + offset;
         let mut bad = st.to_bytes();
@@ -1601,7 +1633,11 @@ mod tests {
         for source in sources() {
             let (key, fvk) = key(&source);
             for internal in [false, true] {
-                let scope = if internal { Scope::Internal } else { Scope::External };
+                let scope = if internal {
+                    Scope::Internal
+                } else {
+                    Scope::External
+                };
                 let w = AddressWitness {
                     key: key.clone(),
                     internal,
@@ -1638,15 +1674,23 @@ mod tests {
                 );
                 assert_ne!(
                     st.nullifier(),
-                    AddressStatement { migration_domain: [9; 32], ..st.clone() }.nullifier()
+                    AddressStatement {
+                        migration_domain: [9; 32],
+                        ..st.clone()
+                    }
+                    .nullifier()
                 );
             }
         }
         // pk_d must decode to a point other than the identity.
         let (key, fvk) = key(&KeySource::SpendingKey);
-        let w = AddressWitness { key, internal: false };
+        let w = AddressWitness {
+            key,
+            internal: false,
+        };
         let d = fvk.diversifier(&[0; 11], Scope::External);
-        let st = AddressStatement::derive(&KeySource::SpendingKey, &w, &d, PQ, DOMAIN, EPOCH).unwrap();
+        let st =
+            AddressStatement::derive(&KeySource::SpendingKey, &w, &d, PQ, DOMAIN, EPOCH).unwrap();
         let mut zero = st.clone();
         zero.address[11..].fill(0);
         assert!(!zero.is_well_formed());
@@ -1667,11 +1711,22 @@ mod tests {
         let b = st.binding();
         assert_eq!(b.nullifier, st.nullifier);
         assert_eq!(b.exposure, KeyExposure::Hidden);
-        assert_eq!((b.pq_commitment, b.migration_domain, b.epoch), (PQ, DOMAIN, EPOCH));
+        assert_eq!(
+            (b.pq_commitment, b.migration_domain, b.epoch),
+            (PQ, DOMAIN, EPOCH)
+        );
         // The same note in another domain or epoch has the same registry identifiers, so
         // the registry refuses a second binding.
-        let again = RecoveryStatement { migration_domain: [1; 32], epoch: 9, ..st.clone() }.binding();
-        assert_eq!((again.nullifier, again.legacy_id), (b.nullifier, b.legacy_id));
+        let again = RecoveryStatement {
+            migration_domain: [1; 32],
+            epoch: 9,
+            ..st.clone()
+        }
+        .binding();
+        assert_eq!(
+            (again.nullifier, again.legacy_id),
+            (b.nullifier, b.legacy_id)
+        );
         // The identifier is not one a Bitcoin, Ethereum or Ed25519 credential can have.
         let mut twenty = [0u8; 20];
         twenty.copy_from_slice(&st.nullifier[..20]);
@@ -1713,7 +1768,10 @@ mod tests {
         let (shape, z, rows) = build(&relation, &st.public_bits(), &e.inputs);
         println!("note relation: {rows} rows, {} variables", shape.num_vars);
         assert!(shape.is_satisfied(&z));
-        assert_eq!(shape.num_sbox, 0, "the collaborative prover needs mul rows only");
+        assert_eq!(
+            shape.num_sbox, 0,
+            "the collaborative prover needs mul rows only"
+        );
         assert_eq!(shape.num_public, 831);
         // Anchor, nullifier, rk and value: a flipped bit anywhere is rejected.
         for at in [0, 100, 255, 256, 300, 510, 511, 600, 766, 767, 800, 830] {
@@ -1850,7 +1908,10 @@ mod tests {
         let mut digests = Vec::new();
         for source in sources() {
             let (key, fvk) = key(&source);
-            let w = AddressWitness { key, internal: false };
+            let w = AddressWitness {
+                key,
+                internal: false,
+            };
             let d = fvk.diversifier(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], Scope::External);
             let st = AddressStatement::derive(&source, &w, &d, PQ, DOMAIN, EPOCH).unwrap();
             let (shape, z) = synthesize_address(&st, &w).unwrap();
@@ -1912,19 +1973,47 @@ mod tests {
         let mut flipped_rk = st.rk;
         flipped_rk[31] ^= 0x80;
         for other in [
-            RecoveryStatement { epoch: 8, ..st.clone() },
-            RecoveryStatement { migration_domain: [1; 32], ..st.clone() },
-            RecoveryStatement { pq_commitment: [1; 32], ..st.clone() },
-            RecoveryStatement { anchor: tree(&w.note, 6).1, ..st.clone() },
-            RecoveryStatement { nullifier: sample_fp(8).to_bytes(), ..st.clone() },
-            RecoveryStatement { rk: flipped_rk, ..st.clone() },
-            RecoveryStatement { value: st.value + 1, ..st.clone() },
-            RecoveryStatement { key_source: KeySource::QuantumSpendingKey, ..st.clone() },
+            RecoveryStatement {
+                epoch: 8,
+                ..st.clone()
+            },
+            RecoveryStatement {
+                migration_domain: [1; 32],
+                ..st.clone()
+            },
+            RecoveryStatement {
+                pq_commitment: [1; 32],
+                ..st.clone()
+            },
+            RecoveryStatement {
+                anchor: tree(&w.note, 6).1,
+                ..st.clone()
+            },
+            RecoveryStatement {
+                nullifier: sample_fp(8).to_bytes(),
+                ..st.clone()
+            },
+            RecoveryStatement {
+                rk: flipped_rk,
+                ..st.clone()
+            },
+            RecoveryStatement {
+                value: st.value + 1,
+                ..st.clone()
+            },
+            RecoveryStatement {
+                key_source: KeySource::QuantumSpendingKey,
+                ..st.clone()
+            },
         ] {
             assert!(!verify_recovery(&other, REGIME, &proof), "{other:?}");
         }
         // Another regime, a bad signature, tampered proof bytes.
-        assert!(!verify_recovery(&st, WhirSecurityRegime::Cdhz25JohnsonQrom128, &proof));
+        assert!(!verify_recovery(
+            &st,
+            WhirSecurityRegime::Cdhz25JohnsonQrom128,
+            &proof
+        ));
         let mut bad = proof.clone();
         bad.spend_auth_sig[40] ^= 1;
         assert!(!verify_recovery(&st, REGIME, &bad));
@@ -1971,21 +2060,41 @@ mod tests {
 
         // An address of the same key.
         let (key, fvk) = key(&KeySource::SpendingKey);
-        let wa = AddressWitness { key, internal: false };
+        let wa = AddressWitness {
+            key,
+            internal: false,
+        };
         let d = fvk.diversifier(&[0; 11], Scope::External);
-        let sta = AddressStatement::derive(&KeySource::SpendingKey, &wa, &d, PQ, DOMAIN, EPOCH).unwrap();
+        let sta =
+            AddressStatement::derive(&KeySource::SpendingKey, &wa, &d, PQ, DOMAIN, EPOCH).unwrap();
         let proof_a = prove_address(&sta, &wa, REGIME, &[5; 32]).unwrap();
         let bytes_a = proof_a.to_bytes();
-        assert!(verify_address(&sta, REGIME, &AddressProof::from_bytes(&bytes_a, &sta).unwrap()));
+        assert!(verify_address(
+            &sta,
+            REGIME,
+            &AddressProof::from_bytes(&bytes_a, &sta).unwrap()
+        ));
         for other in [
-            AddressStatement { epoch: 8, ..sta.clone() },
-            AddressStatement { migration_domain: [1; 32], ..sta.clone() },
-            AddressStatement { pq_commitment: [1; 32], ..sta.clone() },
+            AddressStatement {
+                epoch: 8,
+                ..sta.clone()
+            },
+            AddressStatement {
+                migration_domain: [1; 32],
+                ..sta.clone()
+            },
+            AddressStatement {
+                pq_commitment: [1; 32],
+                ..sta.clone()
+            },
             AddressStatement {
                 address: fvk.default_address(Scope::Internal).unwrap(),
                 ..sta.clone()
             },
-            AddressStatement { key_source: KeySource::mainnet_account(0), ..sta.clone() },
+            AddressStatement {
+                key_source: KeySource::mainnet_account(0),
+                ..sta.clone()
+            },
         ] {
             assert!(!verify_address(&other, REGIME, &proof_a), "{other:?}");
         }
@@ -2048,7 +2157,10 @@ mod tests {
                 continue;
             }
             let (key, fvk) = key(&source);
-            let w = AddressWitness { key, internal: false };
+            let w = AddressWitness {
+                key,
+                internal: false,
+            };
             let d = fvk.diversifier(&[0; 11], Scope::External);
             let st = AddressStatement::derive(&source, &w, &d, PQ, DOMAIN, EPOCH).unwrap();
             let t = std::time::Instant::now();
@@ -2066,7 +2178,16 @@ mod tests {
             let decoded = AddressProof::from_bytes(&bytes, &st).unwrap();
             assert!(verify_address(&st, REGIME, &decoded));
             let warm = t.elapsed().as_secs_f64() * 1e3;
-            report(&name, &shape, rows, synth_s, prove_s, cold, warm, bytes.len());
+            report(
+                &name,
+                &shape,
+                rows,
+                synth_s,
+                prove_s,
+                cold,
+                warm,
+                bytes.len(),
+            );
         }
         for source in sources() {
             let name = std::format!("ironwood-note {source:?}");
@@ -2092,7 +2213,16 @@ mod tests {
             let decoded = RecoveryProof::from_bytes(&bytes, &st).unwrap();
             assert!(verify_recovery(&st, REGIME, &decoded));
             let warm = t.elapsed().as_secs_f64() * 1e3;
-            report(&name, &shape, rows, synth_s, prove_s, cold, warm, bytes.len());
+            report(
+                &name,
+                &shape,
+                rows,
+                synth_s,
+                prove_s,
+                cold,
+                warm,
+                bytes.len(),
+            );
         }
     }
 }

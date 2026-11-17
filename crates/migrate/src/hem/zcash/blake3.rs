@@ -151,19 +151,38 @@ mod tests {
 
     // BLAKE3 test_vectors.json: `derive_key` (first 32 bytes) for inputs `i % 251`.
     const VECTORS: [(usize, &str); 4] = [
-        (0, "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d"),
-        (1, "b3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c"),
-        (63, "b6451e30b953c206e34644c6803724e9d2725e0893039cfc49584f991f451af3"),
-        (64, "a5c4a7053fa86b64746d4bb688d06ad1f02a18fce9afd3e818fefaa7126bf73e"),
+        (
+            0,
+            "2cc39783c223154fea8dfb7c1b1660f2ac2dcbd1c1de8277b0b0dd39b7e50d7d",
+        ),
+        (
+            1,
+            "b3e2e340a117a499c6cf2398a19ee0d29cca2bb7404c73063382693bf66cb06c",
+        ),
+        (
+            63,
+            "b6451e30b953c206e34644c6803724e9d2725e0893039cfc49584f991f451af3",
+        ),
+        (
+            64,
+            "a5c4a7053fa86b64746d4bb688d06ad1f02a18fce9afd3e818fefaa7126bf73e",
+        ),
     ];
 
     #[test]
     fn derive_key_official_vectors() {
         for (len, want) in VECTORS {
             let input: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-            assert_eq!(derive_key_32(TEST_CONTEXT, &input).to_vec(), hex(want), "len {len}");
+            assert_eq!(
+                derive_key_32(TEST_CONTEXT, &input).to_vec(),
+                hex(want),
+                "len {len}"
+            );
         }
-        assert_ne!(derive_key_32(QK_CONTEXT, &[7; 32]), derive_key_32(TEST_CONTEXT, &[7; 32]));
+        assert_ne!(
+            derive_key_32(QK_CONTEXT, &[7; 32]),
+            derive_key_32(TEST_CONTEXT, &[7; 32])
+        );
     }
 
     #[test]
@@ -175,7 +194,10 @@ mod tests {
             let rows0 = cs.num_rows();
             let out = derive_key_32_gadget(&mut cs, context, &bits);
             std::println!("BLAKE3 derive_key: {} rows", cs.num_rows() - rows0);
-            assert_eq!(bits_to_bytes(&cs, &out), derive_key_32(context, &input).to_vec());
+            assert_eq!(
+                bits_to_bytes(&cs, &out),
+                derive_key_32(context, &input).to_vec()
+            );
             let var = out[0].terms().last().expect("a variable").0 as usize;
             let (shape, z) = cs.finish();
             assert!(shape.is_satisfied(&z));

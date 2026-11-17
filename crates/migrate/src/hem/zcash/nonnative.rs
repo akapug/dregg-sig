@@ -403,8 +403,11 @@ impl Num {
                 acc = acc.const_mul(point);
             }
             let at = |p: &[Coef]| {
-                let parts: Vec<(F, &Lc)> =
-                    powers.iter().copied().zip(p.iter().map(|c| &c.lc)).collect();
+                let parts: Vec<(F, &Lc)> = powers
+                    .iter()
+                    .copied()
+                    .zip(p.iter().map(|c| &c.lc))
+                    .collect();
                 Lc::combine(&parts)
             };
             cs.enforce_mul(at(&a.0), at(&b.0), at(&out));
@@ -472,7 +475,11 @@ impl Elem {
     /// A public constant of `nbits` bits.
     pub fn constant(value_le: &[u8], nbits: usize) -> Self {
         let bits = (0..nbits)
-            .map(|i| Lc::constant(F::from_u64_reduced(((value_le[i / 8] >> (i % 8)) & 1) as u64)))
+            .map(|i| {
+                Lc::constant(F::from_u64_reduced(
+                    ((value_le[i / 8] >> (i % 8)) & 1) as u64,
+                ))
+            })
             .collect();
         Self::from_bits(bits)
     }
@@ -627,9 +634,13 @@ struct Folded {
 
 impl Field {
     pub fn new(p_le: &[u8; 32]) -> Self {
-        let p: [u64; 4] =
-            core::array::from_fn(|i| u64::from_le_bytes(p_le[8 * i..8 * i + 8].try_into().unwrap()));
-        assert!(p[3] >> 62 == 1 && p[0] & 1 == 1, "modulus must have 255 bits");
+        let p: [u64; 4] = core::array::from_fn(|i| {
+            u64::from_le_bytes(p_le[8 * i..8 * i + 8].try_into().unwrap())
+        });
+        assert!(
+            p[3] >> 62 == 1 && p[0] & 1 == 1,
+            "modulus must have 255 bits"
+        );
         // r = 2^(8k) mod p by repeated doubling from 2^248.
         let mut r = [0u64, 0, 0, 1 << 56];
         let mut fold = Vec::with_capacity(MAX_COEFS - LIMBS);
@@ -784,17 +795,21 @@ impl Field {
         let mut e_lc = Vec::with_capacity(n);
         let mut e_bound = Vec::with_capacity(n);
         let mut e_value = Vec::with_capacity(n);
-        for l in 0..n {
-            let kp_l = kp_bytes[l] as i128;
+        for (l, &kp_byte) in kp_bytes.iter().enumerate().take(n) {
+            let kp_l = kp_byte as i128;
             let mut parts: Vec<(F, &Lc)> = vec![(F::ONE, folded.lc.get(l).unwrap_or(&zero))];
             let (mut qp_max, mut qp_value) = (0i128, 0i128);
-            for i in l.saturating_sub(LIMBS - 1)..=l.min(q_limbs - 1) {
+            // (q p)_l = sum over i + j = l of q_i p_j.
+            for (i, (limb, &q_byte)) in q.limbs.iter().zip(&q_bytes).enumerate() {
+                if i > l || l - i >= LIMBS {
+                    continue;
+                }
                 let pj = self.p_bytes[l - i] as i128;
                 if pj != 0 {
-                    parts.push((f_int(-pj), &q.limbs[i]));
+                    parts.push((f_int(-pj), limb));
                 }
                 qp_max += pj * q_limb_max(i);
-                qp_value += pj * q_bytes[i] as i128;
+                qp_value += pj * q_byte as i128;
             }
             e_lc.push(Lc::combine(&parts).plus_const(f_int(kp_l)));
             let (lo, hi) = (
@@ -949,7 +964,10 @@ mod tests {
         assert_eq!(field.value(&cs, &expr), want.to_bytes());
         let rows1 = cs.num_rows();
         let r = field.reduce_canonical(&mut cs, &expr);
-        std::println!("reduce of a degree-3 expression: {} rows", cs.num_rows() - rows1);
+        std::println!(
+            "reduce of a degree-3 expression: {} rows",
+            cs.num_rows() - rows1
+        );
         assert_eq!(r.value(&cs), want.to_bytes());
         // Constant factors cost no rows.
         let rows2 = cs.num_rows();
@@ -959,7 +977,10 @@ mod tests {
         assert_eq!(field.value(&cs, &ka), (sample(9) * a).to_bytes());
         let rows3 = cs.num_rows();
         field.enforce_equal(&mut cs, &ka, &Num::constant(&(sample(9) * a).to_bytes()));
-        std::println!("congruence of a constant product: {} rows", cs.num_rows() - rows3);
+        std::println!(
+            "congruence of a constant product: {} rows",
+            cs.num_rows() - rows3
+        );
         let (shape, z) = cs.finish();
         assert!(shape.is_satisfied(&z));
     }

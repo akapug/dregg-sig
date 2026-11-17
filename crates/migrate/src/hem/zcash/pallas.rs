@@ -108,10 +108,10 @@ impl Params {
     /// `a b / R mod m` for `a, b < m`.
     fn mont(&self, a: &U256, b: &U256) -> U256 {
         let mut t = [0u64; 6];
-        for i in 0..4 {
+        for &ai in a {
             let mut c = 0;
             for j in 0..4 {
-                (t[j], c) = mac(t[j], a[i], b[j], c);
+                (t[j], c) = mac(t[j], ai, b[j], c);
             }
             let (s, c2) = adc(t[4], c, 0);
             t[4] = s;
@@ -580,19 +580,84 @@ const SWU_Z: Fp = Fp::from_raw([
 
 /// Coefficients of the isogeny (`pasta_curves` `Ep::ISOGENY_CONSTANTS`).
 const ISOGENY: [[u64; 4]; 13] = [
-    [0x775f6034aaaaaaab, 0x4081775473d8375b, 0xe38e38e38e38e38e, 0x0e38e38e38e38e38],
-    [0x8cf863b02814fb76, 0x0f93b82ee4b99495, 0x267c7ffa51cf412a, 0x3509afd51872d88e],
-    [0x0eb64faef37ea4f7, 0x380af066cfeb6d69, 0x98c7d7ac3d98fd13, 0x17329b9ec5253753],
-    [0xeebec06955555580, 0x8102eea8e7b06eb6, 0xc71c71c71c71c71c, 0x1c71c71c71c71c71],
-    [0xc47f2ab668bcd71f, 0x9c434ac1c96b6980, 0x5a607fcce0494a79, 0x1d572e7ddc099cff],
-    [0x2aa3af1eae5b6604, 0xb4abf9fb9a1fc81c, 0x1d13bf2a7f22b105, 0x325669becaecd5d1],
-    [0x5ad985b5e38e38e4, 0x7642b01ad461bad2, 0x4bda12f684bda12f, 0x1a12f684bda12f68],
-    [0xc67c31d8140a7dbb, 0x07c9dc17725cca4a, 0x133e3ffd28e7a095, 0x1a84d7ea8c396c47],
-    [0x02e2be87d225b234, 0x1765e924f7459378, 0x303216cce1db9ff1, 0x3fb98ff0d2ddcadd],
-    [0x93e53ab371c71c4f, 0x0ac03e8e134eb3e4, 0x7b425ed097b425ed, 0x025ed097b425ed09],
-    [0x5a28279b1d1b42ae, 0x5941a3a4a97aa1b3, 0x0790bfb3506defb6, 0x0c02c5bcca0e6b7f],
-    [0x4d90ab820b12320a, 0xd976bbfabbc5661d, 0x573b3d7f7d681310, 0x17033d3c60c68173],
-    [0x992d30ecfffffde5, 0x224698fc094cf91b, 0x0000000000000000, 0x4000000000000000],
+    [
+        0x775f6034aaaaaaab,
+        0x4081775473d8375b,
+        0xe38e38e38e38e38e,
+        0x0e38e38e38e38e38,
+    ],
+    [
+        0x8cf863b02814fb76,
+        0x0f93b82ee4b99495,
+        0x267c7ffa51cf412a,
+        0x3509afd51872d88e,
+    ],
+    [
+        0x0eb64faef37ea4f7,
+        0x380af066cfeb6d69,
+        0x98c7d7ac3d98fd13,
+        0x17329b9ec5253753,
+    ],
+    [
+        0xeebec06955555580,
+        0x8102eea8e7b06eb6,
+        0xc71c71c71c71c71c,
+        0x1c71c71c71c71c71,
+    ],
+    [
+        0xc47f2ab668bcd71f,
+        0x9c434ac1c96b6980,
+        0x5a607fcce0494a79,
+        0x1d572e7ddc099cff,
+    ],
+    [
+        0x2aa3af1eae5b6604,
+        0xb4abf9fb9a1fc81c,
+        0x1d13bf2a7f22b105,
+        0x325669becaecd5d1,
+    ],
+    [
+        0x5ad985b5e38e38e4,
+        0x7642b01ad461bad2,
+        0x4bda12f684bda12f,
+        0x1a12f684bda12f68,
+    ],
+    [
+        0xc67c31d8140a7dbb,
+        0x07c9dc17725cca4a,
+        0x133e3ffd28e7a095,
+        0x1a84d7ea8c396c47,
+    ],
+    [
+        0x02e2be87d225b234,
+        0x1765e924f7459378,
+        0x303216cce1db9ff1,
+        0x3fb98ff0d2ddcadd,
+    ],
+    [
+        0x93e53ab371c71c4f,
+        0x0ac03e8e134eb3e4,
+        0x7b425ed097b425ed,
+        0x025ed097b425ed09,
+    ],
+    [
+        0x5a28279b1d1b42ae,
+        0x5941a3a4a97aa1b3,
+        0x0790bfb3506defb6,
+        0x0c02c5bcca0e6b7f,
+    ],
+    [
+        0x4d90ab820b12320a,
+        0xd976bbfabbc5661d,
+        0x573b3d7f7d681310,
+        0x17033d3c60c68173,
+    ],
+    [
+        0x992d30ecfffffde5,
+        0x224698fc094cf91b,
+        0x0000000000000000,
+        0x4000000000000000,
+    ],
 ];
 
 /// `hash_to_field` of the `pasta_curves` crate: two field elements from
@@ -696,8 +761,8 @@ pub fn hash_to_curve(domain_prefix: &str, message: &[u8]) -> Point {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::vectors::hex32;
+    use super::*;
 
     #[test]
     fn field_constants_are_consistent() {
@@ -726,7 +791,10 @@ mod tests {
         assert_eq!(Fp::ZERO.invert(), Fp::ZERO);
         let r = (a * a).sqrt().unwrap();
         assert!(r == a || r == -a);
-        assert!(Fp::from_u64(5).sqrt().is_none(), "5 is the non-residue behind the root");
+        assert!(
+            Fp::from_u64(5).sqrt().is_none(),
+            "5 is the non-residue behind the root"
+        );
         let s = Fq::from_u64(77);
         assert_eq!(s * s.invert(), Fq::ONE);
     }
@@ -738,7 +806,10 @@ mod tests {
         bytes[0] = 7;
         bytes[32] = 3;
         let two256 = Fp::from_u64(1 << 32).square().square().square();
-        assert_eq!(Fp::from_bytes_wide(&bytes), two256 * Fp::from_u64(3) + Fp::from_u64(7));
+        assert_eq!(
+            Fp::from_bytes_wide(&bytes),
+            two256 * Fp::from_u64(3) + Fp::from_u64(7)
+        );
         // All ones: (2^512 - 1) mod p.
         let all = Fp::from_bytes_wide(&[0xff; 64]);
         assert_eq!(all + Fp::ONE, two256.square());

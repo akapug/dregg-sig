@@ -443,7 +443,12 @@ impl Note {
 
     /// The nullifier under a nullifier deriving key.
     pub fn nullifier(&self, nk: &Fp) -> Option<Fp> {
-        Some(derive_nullifier(nk, &self.rho, &self.psi(), &self.commitment()?))
+        Some(derive_nullifier(
+            nk,
+            &self.rho,
+            &self.psi(),
+            &self.commitment()?,
+        ))
     }
 }
 
@@ -652,9 +657,7 @@ pub fn redpallas_verify(vk: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::vectors::{
-        EMPTY_ROOTS, KEY_COMPONENTS, MERKLE_TREE, ZIP32, hex32, unhex,
-    };
+    use super::super::vectors::{EMPTY_ROOTS, KEY_COMPONENTS, MERKLE_TREE, ZIP32, hex32, unhex};
     use super::*;
 
     fn fp(s: &str) -> Fp {
@@ -680,8 +683,14 @@ mod tests {
             let address = fvk.default_address(Scope::External).unwrap();
             assert_eq!(address[..11], unhex(tv.default_d)[..]);
             assert_eq!(address[11..], hex32(tv.default_pk_d)[..]);
-            assert_eq!(fvk.rivk(Scope::Internal).to_bytes(), hex32(tv.internal_rivk));
-            assert_eq!(fvk.ivk(Scope::Internal).unwrap().to_bytes(), hex32(tv.internal_ivk));
+            assert_eq!(
+                fvk.rivk(Scope::Internal).to_bytes(),
+                hex32(tv.internal_rivk)
+            );
+            assert_eq!(
+                fvk.ivk(Scope::Internal).unwrap().to_bytes(),
+                hex32(tv.internal_ivk)
+            );
             let (dk, ovk) = fvk.dk_ovk(Scope::Internal);
             assert_eq!(dk, hex32(tv.internal_dk));
             assert_eq!(ovk, hex32(tv.internal_ovk));
@@ -696,7 +705,10 @@ mod tests {
                 version: NoteVersion::V2,
             };
             assert_eq!(note.cmx().unwrap().to_bytes(), hex32(tv.note_cmx));
-            assert_eq!(note.nullifier(&fvk.nk).unwrap().to_bytes(), hex32(tv.note_nf));
+            assert_eq!(
+                note.nullifier(&fvk.nk).unwrap().to_bytes(),
+                hex32(tv.note_nf)
+            );
             // The recoverable derivation commits to the same fields with another rcm.
             let v3 = Note {
                 version: NoteVersion::V3,
@@ -746,7 +758,10 @@ mod tests {
                 );
                 let mut wrong = path.clone();
                 wrong[2] = wrong[2] + Fp::ONE;
-                assert_ne!(merkle_root(&fp(leaf), position as u32, &wrong).to_bytes(), hex32(root));
+                assert_ne!(
+                    merkle_root(&fp(leaf), position as u32, &wrong).to_bytes(),
+                    hex32(root)
+                );
             }
         }
     }
@@ -767,16 +782,25 @@ mod tests {
             assert_eq!(key.chain_code, hex32(c));
             assert_eq!(key.to_bytes().to_vec(), unhex(xsk));
             assert_eq!(
-                FullViewingKey::from_spending_key(&key.sk).unwrap().fingerprint(),
+                FullViewingKey::from_spending_key(&key.sk)
+                    .unwrap()
+                    .fingerprint(),
                 hex32(fingerprint)
             );
             assert_eq!(zip32_spending_key(&seed, path), Some(hex32(sk)));
         }
         assert!(ExtendedSpendingKey::master(&seed[..31]).is_none());
-        assert!(ExtendedSpendingKey::master(&seed).unwrap().child(5).is_none());
+        assert!(
+            ExtendedSpendingKey::master(&seed)
+                .unwrap()
+                .child(5)
+                .is_none()
+        );
         assert!(zip32_spending_key(&seed, &[5]).is_none());
         assert_eq!(
-            ExtendedSpendingKey::account(&seed, COIN_TYPE_MAINNET, 0).unwrap().sk,
+            ExtendedSpendingKey::account(&seed, COIN_TYPE_MAINNET, 0)
+                .unwrap()
+                .sk,
             zip32_spending_key(
                 &seed,
                 &[32 | ZIP32_HARDENED, 133 | ZIP32_HARDENED, ZIP32_HARDENED]
@@ -801,7 +825,10 @@ mod tests {
         assert!(!redpallas_verify(&other, b"message", &sig));
         // A rerandomized key verifies a signature made with the rerandomized secret.
         let alpha = Fq::from_u64(123_456_789);
-        let rk = spend_auth_base().mul(&ask).add(&spend_auth_base().mul(&alpha)).to_bytes();
+        let rk = spend_auth_base()
+            .mul(&ask)
+            .add(&spend_auth_base().mul(&alpha))
+            .to_bytes();
         let sig = redpallas_sign(&(ask + alpha), b"m", &[9; 80]);
         assert!(redpallas_verify(&rk, b"m", &sig));
         // A non-canonical S is rejected.
