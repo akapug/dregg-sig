@@ -8,16 +8,19 @@ Research prototype. No external audit.
 
 | Crate | Directory | What it provides |
 | --- | --- | --- |
-| `qsag-core` | `crates/qsag-core` | FIPS 205 SLH-DSA (all six SHAKE parameter sets), the native formats `Baggy` (stateless) and `Jorts` / `JortsPoseidon2` (stateful), and the MPC engines that threshold-sign them: only the secret hashes run under MPC, the public Merkle layers are computed in the clear. Dealerless key generation, the `BeltLatch` one-time-leaf latch, crash-atomic journals and rollback anchors. |
-| `qsag-quorum` | `crates/qsag-quorum` | Isolated one-party-per-value custodians over a framed, encrypted wire transport; quorum-switching `Jorts` (disjoint committees, or certified `(t, n)` release); threshold signing of `JortsPoseidon2` keys that Hem can aggregate. |
-| `qsag-fts` | `crates/qsag-fts` | Compact few-time signatures (`Compact1122`: 1,122 bytes) for single-use votes, single-signer and threshold, with a durable burn journal. |
-| `qsag-agg` | `crates/qsag-agg` | Hem: proves that a batch of `JortsPoseidon2` signatures verifies, using Goldilocks sumcheck and WHIR polynomial commitments; merges and recursive composition of those proofs; zk-Hem, the zero-knowledge protocol under the recursion and the credential relations. |
-| `qsag-cred` | `crates/qsag-cred` | Threshold ML-DSA-44/65/87 (FIPS 204), threshold oblivious PRFs, and `BlindVC` selective-disclosure credentials. Their presentations, bearer capabilities with revocation, and private-policy multisignatures are proved as zk-Hem relations in `qsag-agg`. |
-| `qsag-policy` | `crates/qsag-policy` | Velocity, allowlist and window rules checked before custodians release shares; `SpongeMacaroon` and `PqBiscuit` attenuable tokens. |
-| `qsag-addr` | `crates/qsag-addr` | Bech32m post-quantum addresses, hybrid keys, and the canonical 128-byte signing intent. |
-| `qsag-accel` | `crates/qsag-accel` | Hash and field kernels behind one backend trait, a CPU reference backend, and a Vulkan compute prover (feature `vulkan`, Linux). |
-| `qsag-asm` | `crates/qsag-asm` | Constant-time SIMD and assembly kernels (x86-64 and AArch64) with portable fallbacks, secret wiping, durable-file primitives. |
-| `qsag-verified`, `qsag-whir-verified` | `crates/qsag-verified`, `crates/qsag-whir-verified` | Small `no_std` kernels (field arithmetic, Keccak, release guards, WHIR fold steps) that the crates above call. They were written to be extracted to Lean; the proofs are not in this repository. |
+| `dregg-sig-core` | `crates/core` | FIPS 205 SLH-DSA (all six SHAKE parameter sets), the native formats `Baggy` (stateless) and `Jorts` / `JortsPoseidon2` (stateful), and the MPC engines that threshold-sign them: only the secret hashes run under MPC, the public Merkle layers are computed in the clear. Dealerless key generation, the `BeltLatch` one-time-leaf latch, crash-atomic journals and rollback anchors. |
+| `dregg-sig-quorum` | `crates/quorum` | Isolated one-party-per-value custodians over a framed, encrypted wire transport; quorum-switching `Jorts` (disjoint committees, or certified `(t, n)` release); threshold signing of `JortsPoseidon2` keys that Hem can aggregate. |
+| `dregg-sig-fts` | `crates/fts` | Compact few-time signatures (`Compact1122`: 1,122 bytes) for single-use votes, single-signer and threshold, with a durable burn journal. |
+| `dregg-sig-agg` | `crates/agg` | Hem: proves that a batch of `JortsPoseidon2` signatures verifies, using Goldilocks sumcheck and WHIR polynomial commitments; merges and recursive composition of those proofs; zk-Hem, the zero-knowledge protocol under the recursion and the credential relations. |
+| `dregg-sig-cred` | `crates/cred` | Threshold ML-DSA-44/65/87 (FIPS 204), threshold oblivious PRFs, and `BlindVC` selective-disclosure credentials. Their presentations, bearer capabilities with revocation, and private-policy multisignatures are proved as zk-Hem relations in `dregg-sig-agg`. |
+| `dregg-sig-policy` | `crates/policy` | Velocity, allowlist and window rules checked before custodians release shares; `SpongeMacaroon` and `PqBiscuit` attenuable tokens. |
+| `dregg-sig-addr` | `crates/addr` | Bech32m post-quantum addresses, hybrid keys, and the canonical 128-byte signing intent. |
+| `dregg-sig-hd` | `crates/hd` | Dealerless module-lattice key hierarchies and committed watch-only inventories. |
+| `dregg-sig-migrate` | `crates/migrate` | Zero-knowledge ownership proofs for secp256k1, Ed25519, Pallas and BLS12-381 keys, local or threshold, bound to a post-quantum address. Read `crates/migrate/SECURITY.md` before relying on it. |
+| `dregg-sig-cli` | `crates/cli` | The `dregg-sig` command-line tool and the runnable examples. |
+| `dregg-sig-accel` | `crates/accel` | Hash and field kernels behind one backend trait, a CPU reference backend, and a Vulkan compute prover (feature `vulkan`, Linux). |
+| `dregg-sig-asm` | `crates/asm` | Constant-time SIMD and assembly kernels (x86-64 and AArch64) with portable fallbacks, secret wiping, durable-file primitives. |
+| `dregg-sig-verified`, `dregg-sig-whir-verified` | `crates/verified`, `crates/whir-verified` | Small `no_std` kernels (field arithmetic, Keccak, release guards, WHIR fold steps) that the crates above call. They were written to be extracted to Lean; the proofs are not in this repository. |
 
 Library crates are `no_std` + `alloc`; storage, anchors and transports need the `std` feature.
 
@@ -26,38 +29,45 @@ Library crates are `no_std` + `alloc`; storage, anchors and transports need the 
 The toolchain is pinned to Rust 1.99.1 (`rust-toolchain.toml`).
 
 ```sh
-# FIPS 205 sign and verify, and dealerless 2-of-3 key shares.
-cargo run --release -p qsag-core --features std --example slh_dsa_quickstart
+# Known-answer tests and supported formats.
+cargo run --release -p dregg-sig-cli -- kat
+cargo run --release -p dregg-sig-cli -- info
 
-# Threshold SLH-DSA: 2-of-3, and with `-- --cnf-rss-3of5` an isolated 3-of-5 ceremony.
-cargo run --release -p qsag-quorum --features std --example threshold_slh_dsa_quickstart
+# Generate an SLH-DSA key, sign a file, verify it.
+umask 077 && D=$(mktemp -d /tmp/dregg-sig.XXXXXX) && printf 'hello\n' > "$D/msg"
+cargo run --release -p dregg-sig-cli -- keygen --scheme slh-dsa-shake-128f \
+  --secret-out "$D/sk.json" --public-out "$D/pk.json"
+cargo run --release -p dregg-sig-cli -- sign --secret "$D/sk.json" --in "$D/msg" --out "$D/sig.json"
+cargo run --release -p dregg-sig-cli -- verify --public "$D/pk.json" --in "$D/msg" --sig "$D/sig.json"
 
-# Aggregate eight signatures in two shards, merge, verify.
-cargo run --release -p qsag-agg --example succinct_k_to_1_aggregation
+# Examples.
+cargo run --release -p dregg-sig-cli --example threshold_slh_dsa_quickstart
+cargo run --release -p dregg-sig-cli --example succinct_k_to_1_aggregation
+cargo run --release -p dregg-sig-cli --example pq_address_and_policy
 ```
 
-`crates/qsag-agg/examples/mock_ethereum_beam.rs` and `mock_solana_alpenglow.rs` are single-host consensus harnesses with explicit network models. The GPU prover is selected with `--features vulkan` and `QSAG_ACCEL=vulkan`.
+`crates/agg/examples/mock_ethereum_beam.rs` and `mock_solana_alpenglow.rs` are single-host consensus harnesses with explicit network models. The GPU prover is selected with `--features vulkan` and `DREGG_SIG_ACCEL=vulkan`. Stateful CLI vaults require `--anchor-dir <dir>` on a disjoint device, `--anchor-tpm-nv <index>` or `--anchor-vmgenid`; use `--ephemeral-unanchored` for disposable test keys.
 
 ## Tests
 
 Run a filtered set: the full suites take hours of CPU and tens of GB.
 
 ```sh
-cargo test --release -p qsag-core --features std fips205::
-cargo test --release -p qsag-agg --test cshake_proof_bytes_kat
+cargo test --release -p dregg-sig-core --features std fips205::
+cargo test --release -p dregg-sig-agg --test cshake_proof_bytes_kat
 ```
 
-`fuzz/` holds five libFuzzer targets for the wire decoders and verifiers (`cargo fuzz run <target>` from that directory; it is a separate workspace with its own dependencies).
+`fuzz/` holds eight libFuzzer targets for the wire decoders and verifiers (`cargo fuzz run <target>` from that directory; it is a separate workspace with its own dependencies).
 
-## Relation to qsag
+## Origin
 
-This is the signing and aggregation Rust of [`qsag`](https://github.com/emberian/qsag), cut down to what a product would depend on. `qsag` continues as the larger verification and hardware project; fixes to these crates are made there and ported here.
+dregg-sig started from the Rust crates of `qsag` (commit `cf41f1c` plus that tree's uncommitted crate edits) and is developed independently of it.
 
-- Crate names, identifiers, environment variables, wire formats and domain-separation tags are `qsag`'s, unchanged, so patches apply directly. Source: `qsag` commit `cf41f1c` plus that tree's uncommitted crate edits. The two `*-verified` crates live under `aeneas/` in `qsag` and under `crates/` here.
-- Not carried over: the Lean proof library and Aeneas extraction, the hardware projects, the paper, the CLI, and the wallet-hierarchy and curve-migration crates (`qsag-hd`, `qsag-migrate`).
-- The only source file that differs from `qsag` is `qsag-core/src/cnf_rss.rs`: the in-process CNF coordinator prototype that its own documentation quarantined is removed. Three examples were moved out of `qsag-cli` into the crates they exercise.
+- Crates, Rust identifiers, assembly symbols, environment variables and the CLI binary carry the `dregg-sig` name. Data-format identifiers do not: domain-separation tags, wire magics and JSON format strings still read `QSAG.…` / `qsag-…-v1`, because changing them changes every signature, proof, known-answer vector and the precomputed hash midstates in the GPU shaders.
+- Not carried over: the Lean proof library and Aeneas extraction, the hardware projects and the paper.
+- Removed: the in-process CNF coordinator prototype in `dregg-sig-core` that its own documentation quarantined.
 
-Doc comments that cite `lean/Qsag/…` or `Qsag.<name>` point at the proofs in `qsag`. Those proofs, the constant-time archive screen and the source-hash pins were recorded against `qsag`'s tree; they have not been re-run here.
+Doc comments that cite `lean/Qsag/…`, `Qsag.<name>` or `paper/qsag.typ` point at material in `qsag`. Those proofs, the constant-time archive screen and the source-hash pins were recorded against `qsag`'s sources and symbol names; none has been re-run on this tree.
 
 ## License
 
