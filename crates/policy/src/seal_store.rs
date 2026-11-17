@@ -1,21 +1,35 @@
 //! One-use acceptance records for authenticated capability seals.
 //!
-//! A verifier must use the same store for every request in its acceptance domain.
-//! Creating a fresh store for each request, or using independent stores on replicas,
-//! permits replay. Consumption happens after authentication and before authorization
-//! is returned; later application failure does not refund a consumed seal.
+//! A seal is accepted once per **consumption domain**: the single set of records
+//! that every verifier of an audience consults before it accepts. The verifier API
+//! takes that domain as [`SealConsumptionDomain`], so a caller cannot verify without
+//! naming it. What a domain must be is a deployment requirement this crate cannot
+//! check:
+//!
+//! * one domain per audience. A fresh store per request, or one store per replica,
+//!   lets every seal be accepted once per store. Replicas share one linearizable
+//!   implementation of [`SealConsumptionDomain`], or route to one host;
+//! * as durable as the acceptance lifetime: [`MemorySealConsumptionStore`] ends with
+//!   its process;
+//! * protected against being put back: [`FsSealConsumptionStore`] with an external
+//!   anchor refuses a restored file; without one it does not.
+//!
+//! Consumption happens after authentication and before authorization is returned;
+//! later application failure does not refund a consumed seal.
 
 use alloc::vec::Vec;
 
 use crate::MAX_POLICY_CAPACITY;
 use crate::macaroon::CapabilityError;
 
-/// Atomically reserve a previously unseen seal identifier before returning success.
-/// Implementations must reject repeats, retain all accepted identifiers, and fail
-/// closed on storage errors or exhaustion. Replicated verifiers need a shared,
+/// The one consumption domain of an audience (see the module documentation).
+///
+/// `consume` atomically reserves a previously unseen seal identifier before returning
+/// success. Implementations must reject repeats, retain all accepted identifiers, and
+/// fail closed on storage errors or exhaustion. Replicated verifiers need a shared,
 /// linearizable implementation. Returning success without recording the identifier
 /// violates this contract.
-pub trait SealConsumptionStore {
+pub trait SealConsumptionDomain {
     fn consume(&mut self, seal_id: [u8; 32]) -> Result<(), CapabilityError>;
 }
 
@@ -48,7 +62,7 @@ impl MemorySealConsumptionStore {
     }
 }
 
-impl SealConsumptionStore for MemorySealConsumptionStore {
+impl SealConsumptionDomain for MemorySealConsumptionStore {
     fn consume(&mut self, seal_id: [u8; 32]) -> Result<(), CapabilityError> {
         let index = self.insertion_index(&seal_id)?;
         self.consumed
@@ -292,7 +306,7 @@ impl AnchoredSnapshot {
 /// An anchor does nothing for a second, independent copy of the service: two replicas
 /// with their own stores each accept every seal once. That cannot be detected locally.
 /// A deployment has exactly one consumption domain per audience: one store on one
-/// host, or one linearizable service behind [`SealConsumptionStore`].
+/// host, or one linearizable service behind [`SealConsumptionDomain`].
 ///
 /// No accepted entry is evicted on exhaustion.
 #[cfg(feature = "std")]
@@ -489,7 +503,7 @@ impl FsSealConsumptionStore {
 }
 
 #[cfg(feature = "std")]
-impl SealConsumptionStore for FsSealConsumptionStore {
+impl SealConsumptionDomain for FsSealConsumptionStore {
     fn consume(&mut self, seal_id: [u8; 32]) -> Result<(), CapabilityError> {
         // A failed commit may already be durable: the snapshot handle refuses every
         // later commit until a fresh open has recovered the committed record.
@@ -508,6 +522,17 @@ mod tests {
     use super::*;
     #[cfg(all(feature = "std", unix))]
     use alloc::boxed::Box;
+
+    /// A forked child holds copies of this process's lock descriptors until it execs,
+    /// so a store dropped and reopened on one thread while another thread spawns a
+    /// child can find its own lock still held. Tests that lock files or spawn take this.
+    #[cfg(all(feature = "std", unix))]
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn memory_rejects_replay_without_eviction() {
@@ -533,6 +558,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn disk_rejects_replay_after_restart_and_competing_process() {
+        let _serial = serial();
         const CHILD: &str = "QSAG_SEAL_STORE_CHILD_PATH";
         if let Some(path) = std::env::var_os(CHILD) {
             assert!(FsSealConsumptionStore::open_existing(path, 2).is_err());
@@ -571,6 +597,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn disk_write_failure_poison_and_invalid_format_fail_closed() {
+        let _serial = serial();
         let dir = temporary_directory("failure");
         let path = dir.join("consumed");
         let mut store = FsSealConsumptionStore::create_new(&path, 2).unwrap();
@@ -653,6 +680,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn anchored_store_refuses_in_place_and_whole_directory_restore() {
+        let _serial = serial();
         for anchored in [false, true] {
             let dir = temporary_directory(if anchored { "anchored" } else { "bare" });
             let path = dir.join("consumed");
@@ -743,6 +771,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn anchored_store_recovers_an_interrupted_commit_and_binds_its_anchor() {
+        let _serial = serial();
         let dir = temporary_directory("anchor-binding");
         let path = dir.join("consumed");
         let anchor = TestAnchor::default();

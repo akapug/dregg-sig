@@ -5579,6 +5579,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn fs_ledger_refuses_a_replayed_presentation_in_another_process() {
+        let _serial = crate::presentation_challenge::test_support::serial();
         const ROLE: &str = "QSAG_VC_CHALLENGE_CHILD_ROLE";
         const DIR: &str = "QSAG_VC_CHALLENGE_CHILD_DIR";
         let fx = ReplayFixture::new();
@@ -5641,6 +5642,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn anchored_fs_ledger_refuses_a_restored_file_and_the_bare_one_replays() {
+        let _serial = crate::presentation_challenge::test_support::serial();
         use crate::presentation_challenge::test_support::{
             TestAnchor, dir_files, temporary_directory,
         };

@@ -27,7 +27,7 @@ pub use macaroon::{
 };
 #[cfg(feature = "std")]
 pub use seal_store::{AnchoredSnapshot, FsSealConsumptionStore};
-pub use seal_store::{MemorySealConsumptionStore, SealConsumptionStore};
+pub use seal_store::{MemorySealConsumptionStore, SealConsumptionDomain};
 
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -3589,7 +3589,8 @@ pub enum CapabilityGate<'a> {
         authority_pk: &'a PqBiscuitAuthorityPublicKey,
         dp: &'a dregg_sig_fts::FrontierDpTable,
         token: &'a PqBiscuit,
-        consumption: &'a mut dyn SealConsumptionStore,
+        /// The audience's one consumption domain; see [`SealConsumptionDomain`].
+        domain: &'a mut dyn SealConsumptionDomain,
     },
 }
 
@@ -3660,8 +3661,8 @@ impl<'a> PolicyEngine<'a> {
                 authority_pk,
                 dp,
                 token,
-                consumption,
-            } => token.verify(authority_pk, dp, &req, *consumption),
+                domain,
+            } => token.verify(authority_pk, dp, &req, *domain),
         };
         res.map_err(PolicyViolation::CapabilityDenied)
     }
@@ -6602,6 +6603,32 @@ mod cleanup_tests {
         );
         let party_tokens = release.into_quorum_party_tokens();
         assert_eq!(party_tokens.len(), 2);
+        // The same macaroon authorizes a different intent: nothing in the engine treats
+        // it as spent. What stops a second execution is the intent's own nonce above.
+        let mut next_intent = intent.clone();
+        next_intent.session_id = [0x73; 32];
+        next_intent.nonce = [0x74; 32];
+        let next_bytes = next_intent.to_canonical_signing_bytes(&policy_digest);
+        next_intent.message_digest = cshake256_framed_32(b"QSAG.POLICY.MSG.V1", &[&next_bytes]);
+        let next_release = engine
+            .authorize_committed_barrier(
+                &next_intent,
+                next_intent.session_id,
+                next_intent.timestamp_secs,
+                Some(&mut CapabilityGate::Macaroon {
+                    verifier: &verifier,
+                    token: &ok_mac,
+                    discharges: &discharges,
+                }),
+                &mut guards,
+                &accel,
+            )
+            .unwrap();
+        assert_eq!(
+            next_release.intent_digest(),
+            &next_intent.canonical_digest()
+        );
+        drop(next_release);
 
         // 2. Ephemeral Compact1122 PqBiscuit 2-hop delegation chain + PoP seal gates BDOZ barrier!
         let dp =
@@ -6655,7 +6682,7 @@ mod cleanup_tests {
                     authority_pk: &auth_pk,
                     dp: &dp,
                     token: &b_sealed,
-                    consumption: &mut MemorySealConsumptionStore::new(16),
+                    domain: &mut MemorySealConsumptionStore::new(16),
                 }),
                 &mut guards,
                 &accel,

@@ -517,6 +517,16 @@ pub(crate) mod test_support {
     use std::sync::{Arc, Mutex};
     use std::vec::Vec;
 
+    /// A forked child holds copies of this process's lock descriptors until it execs,
+    /// so a store dropped and reopened on one thread while another thread spawns a
+    /// child can find its own lock still held. Tests that lock files or spawn take this.
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// An anchor outside the ledger's directory: it keeps what it was last given.
     #[derive(Clone, Default)]
     pub(crate) struct TestAnchor {
@@ -676,6 +686,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn fs_ledger_keeps_issues_and_consumptions_across_reopen() {
+        let _serial = super::test_support::serial();
         let dir = test_support::temporary_directory("reopen");
         let path = dir.join("challenges");
         let mut ledger = FsVerifierChallengeLedger::create_new(&path, 2).unwrap();
@@ -722,6 +733,7 @@ mod tests {
     #[cfg(all(feature = "std", unix))]
     #[test]
     fn fs_ledger_failed_commit_fails_closed_and_kills_the_handle() {
+        let _serial = super::test_support::serial();
         use alloc::boxed::Box;
         use std::sync::atomic::Ordering;
         let dir = test_support::temporary_directory("failure");

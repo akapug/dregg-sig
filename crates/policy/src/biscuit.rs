@@ -19,10 +19,11 @@
 //!   verified until sealed by the final holder (`seal`), preventing in-transit caveat
 //!   appendage; passing `Some(&request)` binds the terminal signature to the exact
 //!   [`CapabilityRequest`], including its complete canonical intent digest.
-//! - **One-use verification:** every successful verification consumes the seal via
-//!   an explicit [`SealConsumptionStore`]. The application must share a durable
-//!   store across all accepting verifier instances; process-local stores provide
-//!   only process-lifetime protection. Consumption is not an execution transaction.
+//! - **One-use verification:** every successful verification consumes the seal in
+//!   the audience's one [`SealConsumptionDomain`], which `verify` requires. A
+//!   deployment has exactly one such domain per audience, shared by every accepting
+//!   instance; [`crate::FsSealConsumptionStore`] with an external anchor also refuses
+//!   a rolled-back store. Consumption is not an execution transaction.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -38,7 +39,7 @@ use dregg_sig_fts::{
     FrontierFtsSignature, FrontierFtsSigningKey, FtsEpochWal, verify_frontier_fts,
 };
 
-use crate::seal_store::SealConsumptionStore;
+use crate::seal_store::SealConsumptionDomain;
 
 use crate::macaroon::{CapabilityError, CapabilityRequest, Caveat, MAX_CAVEATS};
 
@@ -982,8 +983,10 @@ impl PqBiscuit {
 
     /// Verify every `Compact1122` hop signature from `authority_pk` to the terminal seal and
     /// evaluate all caveats across all hops conjunctively against `request`, then
-    /// atomically consume the authenticated seal before returning success. Reuse the
-    /// same durable store across requests, processes and restarts. Invalid tokens
+    /// atomically consume the authenticated seal in `domain` before returning success.
+    /// `domain` must be the audience's one consumption domain
+    /// ([`SealConsumptionDomain`]): the same durable, rollback-protected records for
+    /// every request, process, restart and replica. Invalid tokens
     /// never consume an entry; failures after consumption do not refund it.
     /// V1 token wire encodings and V1 terminal signatures are refused.
     pub fn verify(
@@ -991,7 +994,7 @@ impl PqBiscuit {
         authority_pk: &PqBiscuitAuthorityPublicKey,
         dp: &FrontierDpTable,
         request: &CapabilityRequest,
-        consumption: &mut dyn SealConsumptionStore,
+        domain: &mut dyn SealConsumptionDomain,
     ) -> Result<(), CapabilityError> {
         let seal = self.seal.as_ref().ok_or(CapabilityError::Denied)?;
         if !ct_eq_bytes(&self.audience, &request.audience) {
@@ -1110,7 +1113,7 @@ impl PqBiscuit {
             b"QSAG.BISCUIT.CONSUME.V2",
             &[&authority_pk.to_bytes(), &seal_msg],
         );
-        consumption.consume(seal_id)
+        domain.consume(seal_id)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, CapabilityError> {
