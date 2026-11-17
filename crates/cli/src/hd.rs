@@ -506,6 +506,7 @@ fn keygen(raw: &[String]) -> Result<(), CliError> {
     let vault_dir = args.require("vault-dir")?;
     let watch_out = args.require("watch-out")?;
     let anchor_cfg = AnchorConfig::from_quorum_args(&args, vault_dir)?;
+    crate::anchor::preflight_tpm_enrollment(anchor_cfg.as_ref(), &args, 1)?;
     require_anchor_or_waiver(
         anchor_cfg.is_some(),
         args.flag("ephemeral-unanchored"),

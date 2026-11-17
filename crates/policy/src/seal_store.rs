@@ -204,8 +204,11 @@ impl AnchoredSnapshot {
             }
             _ => return Err(Self::invalid("invalid anchor flag in snapshot record")),
         }
-        let sequence = u64::from_be_bytes(frame[16..24].try_into().unwrap());
-        let previous: [u8; 32] = frame[24..56].try_into().unwrap();
+        let mut sequence = [0; 8];
+        sequence.copy_from_slice(&frame[16..24]);
+        let sequence = u64::from_be_bytes(sequence);
+        let mut previous = [0; 32];
+        previous.copy_from_slice(&frame[24..56]);
         let this = Self {
             record,
             anchor,
@@ -410,11 +413,11 @@ impl FsSealConsumptionStore {
                 "this seal consumption store was created without an external anchor; it has no anchored history to check",
             ));
         }
-        Ok(
-            frame[AnchoredSnapshot::HEADER_BYTES..AnchoredSnapshot::HEADER_BYTES + 32]
-                .try_into()
-                .unwrap(),
-        )
+        let mut domain_id = [0; 32];
+        domain_id.copy_from_slice(
+            &frame[AnchoredSnapshot::HEADER_BYTES..AnchoredSnapshot::HEADER_BYTES + 32],
+        );
+        Ok(domain_id)
     }
 
     pub fn domain_id(&self) -> &[u8; 32] {
@@ -438,9 +441,17 @@ impl FsSealConsumptionStore {
         if payload.len() < Self::PAYLOAD_HEADER_BYTES {
             return Err(Self::invalid());
         }
-        let domain_id: [u8; 32] = payload[..32].try_into().unwrap();
-        let stored_capacity = u32::from_be_bytes(payload[32..36].try_into().unwrap());
-        let count = u32::from_be_bytes(payload[36..40].try_into().unwrap()) as usize;
+        let mut domain_id = [0; 32];
+        domain_id.copy_from_slice(&payload[..32]);
+        let word = |at: usize| {
+            u32::from_be_bytes([
+                payload[at],
+                payload[at + 1],
+                payload[at + 2],
+                payload[at + 3],
+            ])
+        };
+        let (stored_capacity, count) = (word(32), word(36) as usize);
         if stored_capacity as usize != capacity
             || count > capacity
             || payload.len() != Self::PAYLOAD_HEADER_BYTES + count * 32
@@ -685,7 +696,7 @@ mod tests {
             }
             let in_place = open().map(|mut store| store.consume([2; 32]));
             if anchored {
-                let err = in_place.err().expect("rolled-back store must not open");
+                let err = in_place.expect_err("rolled-back store must not open");
                 assert!(alloc::format!("{err}").contains("rollback"), "{err}");
                 // The current state still opens and still refuses the replay.
                 for (file, bytes) in &current {

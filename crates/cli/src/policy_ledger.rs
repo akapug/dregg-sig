@@ -1491,6 +1491,7 @@ fn init(raw: &[String]) -> Result<(), CliError> {
         ));
     }
     let anchor_cfg = AnchorConfig::for_vault(&args, dir, "anchor-dir", "allow-single-disk-anchor")?;
+    crate::anchor::preflight_tpm_enrollment(anchor_cfg.as_ref(), &args, 1)?;
     crate::anchor::require_anchor_or_waiver(
         anchor_cfg.is_some(),
         args.flag("ephemeral-unanchored"),

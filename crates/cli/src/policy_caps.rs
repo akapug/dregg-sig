@@ -640,6 +640,7 @@ fn biscuit_keygen(raw: &[String]) -> Result<(), CliError> {
     }
     args.no_positionals()?;
     let anchor_cfg = AnchorConfig::from_args(&args)?;
+    crate::anchor::preflight_tpm_enrollment(anchor_cfg.as_ref(), &args, 1)?;
     require_anchor_or_waiver(
         anchor_cfg.is_some(),
         args.flag("ephemeral-unanchored"),
