@@ -172,50 +172,65 @@ fn limbs_to_bytes(limbs: &Limbs) -> [u8; 32] {
     out
 }
 
+/// `q_J`, little-endian.
+pub(super) const BASE_MODULUS_LE: [u8; 32] = limbs_to_le_bytes(&Q);
+/// `r_J`, little-endian.
+pub(super) const SCALAR_MODULUS_LE: [u8; 32] = limbs_to_le_bytes(&R_J);
+
+const fn limbs_to_le_bytes(limbs: &Limbs) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (limbs[i / 8] >> (8 * (i % 8))) as u8;
+        i += 1;
+    }
+    out
+}
+
 /// An element of the Jubjub base field, in Montgomery form and fully reduced.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Fq(Limbs);
+pub(super) struct Fq(Limbs);
 
 impl Fq {
-    const ZERO: Fq = Fq([0; 4]);
-    const ONE: Fq = Fq(MONT_R);
+    pub(super) const ZERO: Fq = Fq([0; 4]);
+    pub(super) const ONE: Fq = Fq(MONT_R);
 
     /// The element with the given canonical little-endian limbs (below `q`).
     const fn from_raw(limbs: Limbs) -> Fq {
         Fq(mont_mul(&limbs, &MONT_R2))
     }
 
-    fn from_bytes(bytes: &[u8; 32]) -> Option<Fq> {
+    pub(super) fn from_bytes(bytes: &[u8; 32]) -> Option<Fq> {
         let limbs = limbs_from_bytes(bytes);
         let (_, borrow) = limbs_sub(&limbs, &Q);
         (borrow != 0).then(|| Fq::from_raw(limbs))
     }
 
-    fn to_bytes(self) -> [u8; 32] {
+    pub(super) fn to_bytes(self) -> [u8; 32] {
         limbs_to_bytes(&mont_mul(&self.0, &[1, 0, 0, 0]))
     }
 
-    fn add(&self, rhs: &Fq) -> Fq {
+    pub(super) fn add(&self, rhs: &Fq) -> Fq {
         Fq(add_mod(&self.0, &rhs.0, &Q))
     }
 
-    fn sub(&self, rhs: &Fq) -> Fq {
+    pub(super) fn sub(&self, rhs: &Fq) -> Fq {
         Fq(sub_mod(&self.0, &rhs.0, &Q))
     }
 
-    fn neg(&self) -> Fq {
+    pub(super) fn neg(&self) -> Fq {
         Fq::ZERO.sub(self)
     }
 
-    const fn mul(&self, rhs: &Fq) -> Fq {
+    pub(super) const fn mul(&self, rhs: &Fq) -> Fq {
         Fq(mont_mul(&self.0, &rhs.0))
     }
 
-    fn square(&self) -> Fq {
+    pub(super) fn square(&self) -> Fq {
         self.mul(self)
     }
 
-    fn double(&self) -> Fq {
+    pub(super) fn double(&self) -> Fq {
         self.add(self)
     }
 
@@ -232,7 +247,7 @@ impl Fq {
     }
 
     /// The inverse, or zero for zero.
-    fn invert(&self) -> Fq {
+    pub(super) fn invert(&self) -> Fq {
         const Q_MINUS_2: Limbs = [Q[0] - 2, Q[1], Q[2], Q[3]];
         self.pow(&Q_MINUS_2)
     }
@@ -295,7 +310,7 @@ const ROOT_OF_UNITY: Fq = Fq::from_raw([
 ]);
 
 /// `d_J = -10240 / 10241`.
-const JUBJUB_D: Fq = Fq::from_raw([
+pub(super) const JUBJUB_D: Fq = Fq::from_raw([
     0x0106_5fd6_d634_3eb1,
     0x292d_7f6d_3757_9d26,
     0xf5fd_9207_e6bd_7fd4,
@@ -306,7 +321,7 @@ const JUBJUB_2D: Fq = Fq(add_mod(&JUBJUB_D.0, &JUBJUB_D.0, &Q));
 /// A point of Jubjub, `-u^2 + v^2 = 1 + d u^2 v^2`, in extended coordinates
 /// `(U : V : Z : T)` with `u = U/Z`, `v = V/Z`, `T = UV/Z`.
 #[derive(Clone, Copy)]
-struct Point {
+pub(super) struct Point {
     u: Fq,
     v: Fq,
     z: Fq,
@@ -314,7 +329,7 @@ struct Point {
 }
 
 impl Point {
-    const IDENTITY: Point = Point {
+    pub(super) const IDENTITY: Point = Point {
         u: Fq::ZERO,
         v: Fq::ONE,
         z: Fq::ONE,
@@ -324,7 +339,7 @@ impl Point {
     /// The complete twisted Edwards addition law for `a = -1` (Hisil, Wong, Carter,
     /// Dawson 2008, section 3.1). It has no exceptional case on Jubjub because `a` is a
     /// square and `d` is not.
-    fn add(&self, rhs: &Point) -> Point {
+    pub(super) fn add(&self, rhs: &Point) -> Point {
         let a = self.v.sub(&self.u).mul(&rhs.v.sub(&rhs.u));
         let b = self.v.add(&self.u).mul(&rhs.v.add(&rhs.u));
         let c = self.t.mul(&JUBJUB_2D).mul(&rhs.t);
@@ -341,7 +356,7 @@ impl Point {
         }
     }
 
-    fn double(&self) -> Point {
+    pub(super) fn double(&self) -> Point {
         self.add(self)
     }
 
@@ -356,7 +371,7 @@ impl Point {
 
     /// `[scalar] self` for a 256-bit little-endian scalar: 256 doublings and 256
     /// additions whatever the scalar.
-    fn mul(&self, scalar: &[u8; 32]) -> Point {
+    pub(super) fn mul(&self, scalar: &[u8; 32]) -> Point {
         let mut acc = Point::IDENTITY;
         for i in (0..256).rev() {
             acc = acc.double();
@@ -375,8 +390,33 @@ impl Point {
         self.u == Fq::ZERO && self.v == self.z
     }
 
+    /// The affine coordinates `(u, v)`.
+    pub(super) fn to_affine(self) -> (Fq, Fq) {
+        let zinv = self.z.invert();
+        (self.u.mul(&zinv), self.v.mul(&zinv))
+    }
+
+    /// The affine coordinates of many points, with one inversion.
+    pub(super) fn batch_to_affine(points: &[Point]) -> alloc::vec::Vec<(Fq, Fq)> {
+        // prefix[i] = z_0 .. z_(i-1); no z is zero.
+        let mut prefix = alloc::vec::Vec::with_capacity(points.len());
+        let mut acc = Fq::ONE;
+        for p in points {
+            prefix.push(acc);
+            acc = acc.mul(&p.z);
+        }
+        let mut inv = acc.invert();
+        let mut out = alloc::vec![(Fq::ZERO, Fq::ZERO); points.len()];
+        for (i, p) in points.iter().enumerate().rev() {
+            let zinv = inv.mul(&prefix[i]);
+            inv = inv.mul(&p.z);
+            out[i] = (p.u.mul(&zinv), p.v.mul(&zinv));
+        }
+        out
+    }
+
     /// `repr_J`.
-    fn to_bytes(self) -> [u8; 32] {
+    pub(super) fn to_bytes(self) -> [u8; 32] {
         let zinv = self.z.invert();
         let u = self.u.mul(&zinv);
         let v = self.v.mul(&zinv);
@@ -387,7 +427,7 @@ impl Point {
 
     /// `abst_J` as the current specification defines it: the two encodings with `u = 0`
     /// and the sign bit set are accepted.
-    fn from_bytes(bytes: &[u8; 32]) -> Option<Point> {
+    pub(super) fn from_bytes(bytes: &[u8; 32]) -> Option<Point> {
         let sign = bytes[31] >> 7 == 1;
         let mut v_bytes = *bytes;
         v_bytes[31] &= 0x7f;
@@ -477,7 +517,7 @@ pub fn jubjub_is_prime_order(point: &[u8; 32]) -> bool {
 pub const GROUP_HASH_URS: &[u8; 64] =
     b"096b36a5804bfacef1691e173c366a47ff5ba84a44f26ddd7e8d9f79d5b42df0";
 
-fn group_hash_point(personal: &[u8; 8], message: &[u8]) -> Option<Point> {
+pub(super) fn group_hash_point(personal: &[u8; 8], message: &[u8]) -> Option<Point> {
     let digest = blake2s_256(personal, &[GROUP_HASH_URS, message]);
     let q = Point::from_bytes(&digest)?.mul_by_cofactor();
     (!q.is_identity()).then_some(q)
@@ -509,11 +549,11 @@ pub fn jubjub_find_group_hash(personal: &[u8; 8], message: &[u8]) -> [u8; 32] {
     find_group_hash_point(personal, message).to_bytes()
 }
 
-fn spend_auth_point() -> Point {
+pub(super) fn spend_auth_point() -> Point {
     find_group_hash_point(b"Zcash_G_", b"")
 }
 
-fn proof_generation_point() -> Point {
+pub(super) fn proof_generation_point() -> Point {
     find_group_hash_point(b"Zcash_H_", b"")
 }
 
@@ -1005,11 +1045,11 @@ impl SaplingExtendedFullViewingKey {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use alloc::vec::Vec;
 
-    fn hex(s: &str) -> Vec<u8> {
+    pub(crate) fn hex(s: &str) -> Vec<u8> {
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
             .collect()
@@ -1222,7 +1262,7 @@ mod tests {
 
     /// sapling_key_components.json, all ten vectors: `sk, ask, nsk, ovk, ak, nk, ivk,
     /// default_d, default_pk_d`.
-    const KEY_COMPONENTS: [[&str; 9]; 10] = [
+    pub(crate) const KEY_COMPONENTS: [[&str; 9]; 10] = [
         [
             "0000000000000000000000000000000000000000000000000000000000000000",
             "8548a14a473ea547aa2378402044f818cf1911cf5dd2054f678345f00d0e8806",

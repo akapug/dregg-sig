@@ -1,5 +1,7 @@
-//! Arithmetic modulo a 255-bit prime (the Pallas base and scalar fields) over the
-//! Goldilocks constraint system, with unreduced products.
+//! Arithmetic modulo an odd prime `p` with `2^248 < p < 2^255` (the Pallas base and scalar
+//! fields, the Jubjub base field and the 252-bit Jubjub scalar order) over the Goldilocks
+//! constraint system, with unreduced products. Elements are 255-bit representatives of
+//! their residue whatever the bit length of `p`.
 //!
 //! This is the same technique as `hem::curve` (integers as polynomials in `2^8` with
 //! proven coefficient intervals, congruences checked limb group by limb group with
@@ -138,7 +140,7 @@ fn wide_bytes(a: &Wide) -> [u8; 48] {
     out
 }
 
-/// Quotient and remainder by a prime `p` with `2^254 < p < 2^255`; 384 fixed iterations.
+/// Quotient and remainder by a modulus `p < 2^255`; 384 fixed iterations.
 fn wide_divrem(n: &Wide, p: &[u64; 4]) -> (Wide, [u64; 4]) {
     let mut q = [0u64; 6];
     let mut r = [0u64; 4];
@@ -617,7 +619,7 @@ pub fn enforce_limbs_differ(cs: &mut ConstraintSystem, a: &[Lc], b: &[Lc]) {
 // Moduli
 // ============================================================================
 
-/// A prime `p` with `2^254 < p < 2^255` and the constants `2^(8k) mod p`.
+/// An odd prime `p` with `2^248 < p < 2^255` and the constants `2^(8k) mod p`.
 pub struct Field {
     p: [u64; 4],
     p_bytes: [u8; 32],
@@ -637,9 +639,16 @@ impl Field {
         let p: [u64; 4] = core::array::from_fn(|i| {
             u64::from_le_bytes(p_le[8 * i..8 * i + 8].try_into().unwrap())
         });
+        // What the rest of this type needs from `p`: `p > 2^248`, so that the doubling
+        // chain below starts from a reduced value and a 255-bit representative is below
+        // `2^7 p` (the quotients of `enforce_zero` grow by at most seven bits against a
+        // 255-bit modulus); `p < 2^255`, so that `2 r` for `r < p` fits four words here and
+        // in `wide_divrem`, and every residue has a 255-bit representative; `p` odd, for
+        // `enforce_canonical`. For a modulus shorter than 255 bits, `enforce_canonical`
+        // also forces the bits above its length to zero.
         assert!(
-            p[3] >> 62 == 1 && p[0] & 1 == 1,
-            "modulus must have 255 bits"
+            p[3] >> 63 == 0 && p[3] >> 56 != 0 && p[0] & 1 == 1,
+            "modulus must be odd and between 2^248 and 2^255"
         );
         // r = 2^(8k) mod p by repeated doubling from 2^248.
         let mut r = [0u64, 0, 0, 1 << 56];
@@ -681,7 +690,7 @@ impl Field {
         Self::new(&super::pallas::SCALAR_MODULUS_LE)
     }
 
-    /// Bit length of the modulus and of every reduced element.
+    /// Bit length of every reduced element (and of the longest admitted modulus).
     pub const BITS: usize = 255;
 
     /// A fresh 255-bit witness.
@@ -1016,6 +1025,87 @@ mod tests {
         assert_eq!(r.value(&cs), Fq::from_bytes_wide(&bytes).to_bytes());
         let (shape, z) = cs.finish();
         assert!(shape.is_satisfied(&z));
+    }
+
+    #[test]
+    fn jubjub_scalar_order_wide_reduction() {
+        // ToScalar^Sapling: a 512-bit integer modulo the 252-bit order r_J.
+        use super::super::sapling::{SCALAR_MODULUS_LE, to_scalar};
+        let field = Field::new(&SCALAR_MODULUS_LE);
+        let mut all_ones = [0xffu8; 64];
+        all_ones[63] = 0x7f;
+        let mut order = [0u8; 64];
+        order[..32].copy_from_slice(&SCALAR_MODULUS_LE);
+        for bytes in [
+            core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+            [0xff; 64],
+            all_ones,
+            order,
+            [0u8; 64],
+        ] {
+            let mut cs = ConstraintSystem::new();
+            let bits = crate::hem::hash::alloc_bits(&mut cs, &bytes);
+            let rows0 = cs.num_rows();
+            let r = field.reduce_canonical(&mut cs, &Num::from_bits(&bits));
+            std::println!("wide reduction modulo r_J: {} rows", cs.num_rows() - rows0);
+            assert_eq!(r.value(&cs), to_scalar(&bytes));
+            // A canonical residue of a 252-bit modulus has no bit above 251.
+            assert!(r.value(&cs)[31] < 0x10);
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+        }
+    }
+
+    #[test]
+    fn jubjub_scalar_order_false_congruence_is_unsatisfiable() {
+        use super::super::sapling::{SCALAR_MODULUS_LE, to_scalar};
+        let field = Field::new(&SCALAR_MODULUS_LE);
+        let bytes: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(91).wrapping_add(3));
+        let good = to_scalar(&bytes);
+        // The residue plus one, plus 2^200, and the non-canonical representative
+        // residue + r_J (congruent, so only the canonical check can reject it).
+        let mut plus_one = good;
+        plus_one[0] ^= 1;
+        let mut plus_high = good;
+        plus_high[25] ^= 1;
+        let mut plus_order = [0u8; 32];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let t = good[i] as u16 + SCALAR_MODULUS_LE[i] as u16 + carry;
+            plus_order[i] = t as u8;
+            carry = t >> 8;
+        }
+        assert_eq!(carry, 0);
+        for (claim, canonical, ok) in [
+            (good, true, true),
+            (plus_one, false, false),
+            (plus_high, false, false),
+            (plus_order, false, true),
+            (plus_order, true, false),
+        ] {
+            let mut cs = ConstraintSystem::new();
+            let bits = crate::hem::hash::alloc_bits(&mut cs, &bytes);
+            let e = field.alloc(&mut cs, &claim);
+            field.enforce_equal(&mut cs, &Num::from_bits(&bits), &e.num());
+            if canonical {
+                field.enforce_canonical(&mut cs, &e);
+            }
+            let (shape, z) = cs.finish();
+            assert_eq!(
+                shape.is_satisfied(&z),
+                ok,
+                "{claim:?} canonical={canonical}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "modulus must be odd")]
+    fn a_modulus_below_2_248_is_refused() {
+        let mut p = [0u8; 32];
+        p[0] = 1;
+        p[30] = 0xff;
+        let _ = Field::new(&p);
     }
 
     #[test]
