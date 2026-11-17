@@ -60,7 +60,7 @@
 //!    columns `t0_c`, `t1_c` and sends `u_c = t0_c + t1_c + x` ([`OtExtUColsMsg`]). This is Roy
 //!    Fig. 7 with `k = 1` followed by the correction of Fig. 8.
 //! 2. The sender, having received all of `u`, samples 32 fresh bytes ([`OtExtChallengeMsg`]):
-//!    two points `s_0, s_1` of `GF(2^128)` (`Tower128`). They key the `GF(2)`-linear hash
+//!    two points `s_0, s_1` of `GF(2)[z]/(z^128 + z^7 + z^2 + z + 1)`. They key the linear hash
 //!    `H(v) = (P_v(s_0) + tail_0(v), P_v(s_1) + tail_1(v))` of a bit column `v`, where
 //!    `P_v(s) = sum_k block_k(v) s^(k+1)` runs over the 128-bit blocks of the payload bits and
 //!    `tail` is the 256 sacrificial bits. As a matrix `H = [X | I_256]`.
@@ -4525,33 +4525,32 @@ fn compute_ot_ext_transcript_bind(
 ///
 /// The hash of a bit column `x` (`payload_words` words, then the 4 sacrificial words) is
 /// `(P_x(s_0) + tail_0, P_x(s_1) + tail_1)` with `P_x(s) = sum_k block_k s^(k+1)` over
-/// `Tower128`; `block_k` is the `k`-th pair of payload words and `tail` the two pairs of
-/// sacrificial words. It is the `GF(2)`-linear map `[X | I_256]`.
+/// `GF(2)[z]/(z^128 + z^7 + z^2 + z + 1)`; `block_k` is the `k`-th pair of payload words and
+/// `tail` the two pairs of sacrificial words. It is the `GF(2)`-linear map `[X | I_256]`.
 ///
 /// Public so that an extension outside this module can run the same check: hash the choice
 /// bits and every column on the receiver's side, every column on the sender's side, and
 /// compare per column `H(q_c) = H(t_c) + delta_c H(x)` in constant time.
 pub struct OtExtCheckKey {
     payload_words: usize,
-    powers: Vec<[u128; 2]>,
+    powers: [Vec<u128>; 2],
 }
 
 impl OtExtCheckKey {
     /// `chi_seed` must be the checking party's fresh randomness, revealed to the other party
     /// only after that party's correction columns are fixed.
     pub fn new(chi_seed: &[u8; 32], payload_words: usize) -> Self {
-        let point = |lane: usize| {
-            Tower128(u128::from_le_bytes(core::array::from_fn(|i| {
-                chi_seed[16 * lane + i]
-            })))
-        };
-        let points = [point(0), point(1)];
-        let mut cur = points;
-        let mut powers = Vec::with_capacity(payload_words.div_ceil(2));
-        for _ in 0..payload_words.div_ceil(2) {
-            powers.push([cur[0].0, cur[1].0]);
-            cur = [cur[0].mul(points[0]), cur[1].mul(points[1])];
-        }
+        let blocks = payload_words.div_ceil(2);
+        let powers = core::array::from_fn(|lane| {
+            let point = u128::from_le_bytes(core::array::from_fn(|i| chi_seed[16 * lane + i]));
+            let mut cur = point;
+            let mut powers = Vec::with_capacity(blocks);
+            for _ in 0..blocks {
+                powers.push(cur);
+                cur = dregg_sig_asm::gf2_128_dot(&[cur], &[point]);
+            }
+            powers
+        });
         Self {
             payload_words,
             powers,
@@ -4570,20 +4569,21 @@ impl OtExtCheckKey {
             join(col[payload], col[payload + 1]),
             join(col[payload + 2], col[payload + 3]),
         ];
-        let mut lhs = [[0u128; 2]; 64];
-        for (chunk, weights) in self.powers.chunks(64).enumerate() {
-            for (i, slot) in lhs[..weights.len()].iter_mut().enumerate() {
-                let w = 2 * (64 * chunk + i);
+        let mut blocks = [0u128; 128];
+        for (chunk, (w0, w1)) in self.powers[0]
+            .chunks(128)
+            .zip(self.powers[1].chunks(128))
+            .enumerate()
+        {
+            for (i, slot) in blocks[..w0.len()].iter_mut().enumerate() {
+                let w = 2 * (128 * chunk + i);
                 let hi = if w + 1 < payload { col[w + 1] } else { 0 };
-                let block = join(col[w], hi);
-                *slot = [block, block];
+                *slot = join(col[w], hi);
             }
-            let mut part = dregg_sig_asm::tower128_bdoz_2lane_mac(&lhs[..weights.len()], weights);
-            out[0] ^= part[0];
-            out[1] ^= part[1];
-            crate::wipe::wipe_u128s(&mut part);
+            out[0] ^= dregg_sig_asm::gf2_128_dot(&blocks[..w0.len()], w0);
+            out[1] ^= dregg_sig_asm::gf2_128_dot(&blocks[..w0.len()], w1);
         }
-        crate::wipe::wipe_u128s(lhs.as_flattened_mut());
+        crate::wipe::wipe_u128s(&mut blocks);
         out
     }
 }
@@ -13540,28 +13540,29 @@ mod tests {
     fn ot_ext_check_hash_matches_scalar_polynomial_and_is_linear() {
         let mut rng = PartyPrivateRng::from_seed([0x73; 32], b"ot-ext-hash");
         let seed = rng.next_bytes32();
-        let points: [Tower128; 2] = core::array::from_fn(|lane| {
-            Tower128(u128::from_le_bytes(core::array::from_fn(|i| {
-                seed[16 * lane + i]
-            })))
+        let split = |v: u128| [v as u64, (v >> 64) as u64];
+        let mul = |a: u128, b: u128| {
+            let p = dregg_sig_asm::bitslice::gf2_128_mul_portable(split(a), split(b));
+            u128::from(p[0]) | (u128::from(p[1]) << 64)
+        };
+        let points: [u128; 2] = core::array::from_fn(|lane| {
+            u128::from_le_bytes(core::array::from_fn(|i| seed[16 * lane + i]))
         });
-        for payload in [0usize, 1, 2, 3, 127, 128, 129, 300] {
+        for payload in [0usize, 1, 2, 3, 127, 128, 129, 255, 256, 257, 600] {
             let key = OtExtCheckKey::new(&seed, payload);
             let col: Vec<u64> = (0..payload + 4).map(|_| rng.next_u64()).collect();
             let other: Vec<u64> = (0..payload + 4).map(|_| rng.next_u64()).collect();
             let word = |w: usize| if w < payload { col[w] } else { 0 };
             let expected: [u128; 2] = core::array::from_fn(|lane| {
-                let mut acc = Tower128(
-                    u128::from(col[payload + 2 * lane])
-                        | (u128::from(col[payload + 2 * lane + 1]) << 64),
-                );
+                let mut acc = u128::from(col[payload + 2 * lane])
+                    | (u128::from(col[payload + 2 * lane + 1]) << 64);
                 let mut power = points[lane];
                 for k in 0..payload.div_ceil(2) {
                     let block = u128::from(word(2 * k)) | (u128::from(word(2 * k + 1)) << 64);
-                    acc = acc.add(Tower128(block).mul(power));
-                    power = power.mul(points[lane]);
+                    acc ^= mul(block, power);
+                    power = mul(power, points[lane]);
                 }
-                acc.0
+                acc
             });
             assert_eq!(key.hash(&col), expected, "payload {payload}");
             let sum: Vec<u64> = col.iter().zip(&other).map(|(a, b)| a ^ b).collect();
