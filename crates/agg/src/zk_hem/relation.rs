@@ -10,6 +10,16 @@
 //! of the [`Shape`] and of its digest. Twelve masking rows over twelve masking variables are
 //! appended by [`ConstraintSystem::finish`]; the prover fills those variables with fresh
 //! uniform values (see [`MASK_ROWS`]).
+//!
+//! # Definitions
+//!
+//! A prover that holds the witness in shares cannot run a gadget's native arithmetic. A
+//! builder made by [`ConstraintSystem::new_recording`] therefore keeps, for every
+//! variable, how its value follows from earlier variables ([`Def`]); gadgets state it
+//! with [`ConstraintSystem::alloc_defined`]. A variable from plain
+//! [`ConstraintSystem::alloc`] is [`Def::Undefined`], and
+//! [`Definitions::undefined`] lists those: a relation is usable by a threshold prover
+//! only when that list is empty. Recording changes neither the rows nor the assignment.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -209,6 +219,120 @@ impl Csr {
 /// the assignment.
 pub const MASK_ROWS: usize = 12;
 
+// ============================================================================
+// Definitions of variables
+// ============================================================================
+
+/// Index of a [`Source`] in [`Definitions::sources`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceId(u32);
+
+impl SourceId {
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// One coefficient of an integer written in base `2^8`: a linear form whose value under
+/// any satisfying assignment is an integer in `[lo, hi]` (taken modulo the field prime to
+/// its representative of least absolute value).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntCoef {
+    pub lc: Lc,
+    pub lo: i128,
+    pub hi: i128,
+}
+
+/// A value several variables are read from. Integers `sum_k c_k 2^(8k)` are given by
+/// their coefficients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Supplied from outside the relation (a secret the prover is given) as an integer
+    /// of `bits` bits.
+    Input { bits: u32 },
+    /// The coefficients of the product of two polynomials given by their coefficients.
+    PolyProduct { a: Vec<Lc>, b: Vec<Lc> },
+    /// The canonical value of a linear form, which lies in `[0, 2^bits)`.
+    Form { lc: Lc, bits: u32 },
+    /// The integer `sum_j a_j b_j + c`, which lies in `[0, 2^bits)`; each `(a_j, b_j)`
+    /// is a pair of integers multiplied as polynomials.
+    Integer {
+        products: Vec<(Vec<IntCoef>, Vec<IntCoef>)>,
+        linear: Vec<IntCoef>,
+        bits: u32,
+    },
+    /// The canonical residue of `(sum_j a_j b_j + c) / den` modulo the prime `modulus`
+    /// (little-endian bytes). An empty `den` is one. A denominator that is zero modulo
+    /// the prime has no value.
+    Residue {
+        products: Vec<(Vec<IntCoef>, Vec<IntCoef>)>,
+        linear: Vec<IntCoef>,
+        den: Vec<IntCoef>,
+        modulus: Vec<u8>,
+    },
+    /// The integer `num / divisor`, where the odd `divisor` (little-endian bytes) divides
+    /// `num` exactly and the quotient lies in `[0, 2^bits)`.
+    Quotient {
+        num: Vec<IntCoef>,
+        divisor: Vec<u8>,
+        bits: u32,
+    },
+}
+
+/// How the value of a variable follows from earlier variables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Def {
+    /// Allocated without a definition.
+    Undefined,
+    /// The constant one.
+    One,
+    /// A public input.
+    Public,
+    /// A masking variable appended by [`ConstraintSystem::finish`].
+    Mask,
+    /// `a b`.
+    Product(Lc, Lc),
+    /// `a^7`.
+    Power7(Lc),
+    /// `base + sum_j a_j b_j`.
+    SumOfProducts { base: Lc, products: Vec<(Lc, Lc)> },
+    /// `scale (num / den - minus)` in the field. The gadget guarantees `den != 0`.
+    Ratio {
+        num: Lc,
+        den: Lc,
+        minus: Lc,
+        scale: F,
+    },
+    /// The inverse of `of`, or zero when `of` is zero; `of` lies in `[0, max]`.
+    InverseOrZero { of: Lc, max: u32 },
+    /// Coefficient `index` of a [`Source::PolyProduct`].
+    Coefficient { product: SourceId, index: u32 },
+    /// Bits `lo..lo + width` of an integer source, as one value.
+    Bits {
+        source: SourceId,
+        lo: u32,
+        width: u32,
+    },
+}
+
+/// The definitions recorded by a [`ConstraintSystem::new_recording`] builder: one
+/// [`Def`] per variable of the finished shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Definitions {
+    pub vars: Vec<Def>,
+    pub sources: Vec<Source>,
+}
+
+impl Definitions {
+    /// Variables allocated without a definition.
+    pub fn undefined(&self) -> Vec<usize> {
+        (0..self.vars.len())
+            .filter(|&i| self.vars[i] == Def::Undefined)
+            .collect()
+    }
+}
+
 /// Tag marking a variable allocated inside the 128-stride Poseidon2 S-box arena of a
 /// hologram-aligned [`ConstraintSystem`].
 const P2_VAR_TAG: u32 = 1u32 << 31;
@@ -365,6 +489,7 @@ pub struct ConstraintSystem {
     p2_sbox: Vec<(Lc, Lc)>,
     sbox: Vec<(Lc, Lc)>,
     mul: Vec<(Lc, Lc, Lc)>,
+    defs: Option<Definitions>,
 }
 
 impl Default for ConstraintSystem {
@@ -385,7 +510,59 @@ impl ConstraintSystem {
             p2_sbox: Vec::new(),
             sbox: Vec::new(),
             mul: Vec::new(),
+            defs: None,
         }
+    }
+
+    /// A builder that records a [`Def`] for every variable; close it with
+    /// [`Self::finish_recorded`].
+    pub fn new_recording() -> Self {
+        let mut cs = Self::new();
+        cs.defs = Some(Definitions {
+            vars: vec![Def::One],
+            sources: Vec::new(),
+        });
+        cs
+    }
+
+    /// Whether definitions are recorded.
+    #[inline]
+    pub fn is_recording(&self) -> bool {
+        self.defs.is_some()
+    }
+
+    /// Register a [`Source`]. `make` runs only when recording; otherwise the returned
+    /// index is a placeholder.
+    pub fn source(&mut self, make: impl FnOnce() -> Source) -> SourceId {
+        match &mut self.defs {
+            Some(defs) => {
+                defs.sources.push(make());
+                SourceId(defs.sources.len() as u32 - 1)
+            }
+            None => SourceId(u32::MAX),
+        }
+    }
+
+    /// Allocate a variable with the given assigned value and its definition. `def` runs
+    /// only when recording.
+    pub fn alloc_defined(&mut self, value: F, def: impl FnOnce() -> Def) -> Var {
+        let var = self.alloc(value);
+        if let Some(defs) = &mut self.defs {
+            *defs.vars.last_mut().expect("just allocated") = def();
+        }
+        var
+    }
+
+    /// [`Self::finish`] with the recorded definitions.
+    pub fn finish_recorded(mut self) -> (Shape, Vec<F>, Definitions) {
+        assert!(
+            !self.hologram_aligned,
+            "recording a hologram-aligned relation"
+        );
+        let mut defs = self.defs.take().expect("a recording builder");
+        let (shape, z) = self.finish();
+        defs.vars.resize(shape.num_vars, Def::Mask);
+        (shape, z, defs)
     }
 
     /// Relation builder that places [`poseidon2_perm`] S-box rows and S-box output variables on
@@ -419,6 +596,7 @@ impl ConstraintSystem {
     pub(crate) fn fork_public_inputs(&self) -> Self {
         assert_eq!(self.values.len(), self.num_public + 1);
         assert!(self.p2_values.is_empty());
+        assert!(self.defs.is_none(), "a recording builder is not forked");
         Self {
             values: self.values.clone(),
             record_rows: self.record_rows,
@@ -429,6 +607,7 @@ impl ConstraintSystem {
             p2_sbox: Vec::new(),
             sbox: Vec::new(),
             mul: Vec::new(),
+            defs: None,
         }
     }
 
@@ -498,7 +677,7 @@ impl ConstraintSystem {
             "public inputs are allocated first"
         );
         self.num_public += 1;
-        self.alloc(value)
+        self.alloc_defined(value, || Def::Public)
     }
 
     /// Allocate a free variable with the given assigned value.
@@ -507,6 +686,9 @@ impl ConstraintSystem {
         dregg_sig_core::wipe::secret_vec_push(&mut self.values, value);
         let idx = self.values.len() - 1;
         assert!(idx < P2_VAR_TAG as usize, "relation variable limit");
+        if let Some(defs) = &mut self.defs {
+            defs.vars.push(Def::Undefined);
+        }
         Var(idx as u32)
     }
 
@@ -523,7 +705,7 @@ impl ConstraintSystem {
 
     /// Fresh variable `y` with the row `a^7 = y`.
     pub fn sbox7(&mut self, a: &Lc) -> Var {
-        let y = self.alloc(poseidon2_sbox7(self.eval(a)));
+        let y = self.alloc_defined(poseidon2_sbox7(self.eval(a)), || Def::Power7(a.clone()));
         if self.record_rows {
             self.sbox.push((a.clone(), y.into()));
         }
@@ -561,7 +743,9 @@ impl ConstraintSystem {
 
     /// Fresh variable `y` with the row `a * b = y`.
     pub fn mul(&mut self, a: &Lc, b: &Lc) -> Var {
-        let y = self.alloc(self.eval(a).const_mul(self.eval(b)));
+        let y = self.alloc_defined(self.eval(a).const_mul(self.eval(b)), || {
+            Def::Product(a.clone(), b.clone())
+        });
         if self.record_rows {
             self.mul.push((a.clone(), b.clone(), y.into()));
         }
@@ -698,11 +882,10 @@ impl ConstraintSystem {
             }
         };
         let remap_lc = |lc: Lc| -> Lc {
-            let mut terms: Vec<(u32, F)> = lc
-                .0
-                .into_iter()
-                .map(|(v, coeff)| (remap_var(v), coeff))
-                .collect();
+            let mut terms: Vec<(u32, F)> =
+                lc.0.into_iter()
+                    .map(|(v, coeff)| (remap_var(v), coeff))
+                    .collect();
             terms.sort_unstable_by_key(|&(v, _)| v);
             Lc(terms)
         };
@@ -1049,6 +1232,46 @@ mod tests {
             let (shape, z) = cs.finish();
             assert!(shape.is_satisfied(&z));
         }
+    }
+
+    #[test]
+    fn recording_keeps_the_relation_and_names_every_definition() {
+        let build = |mut cs: ConstraintSystem| {
+            let public: Lc = cs.public_input(f(6)).into();
+            let x: Lc = cs
+                .alloc_defined(f(2), || Def::Bits {
+                    source: SourceId(0),
+                    lo: 0,
+                    width: 2,
+                })
+                .into();
+            let y: Lc = cs.mul(&x, &x.plus_const(f(1))).into();
+            cs.enforce_equal(&y, &public);
+            let loose = cs.alloc(f(9));
+            (cs, loose)
+        };
+        let (plain, _) = build(ConstraintSystem::new());
+        let (shape, z) = plain.finish();
+        let (mut recording, loose) = build(ConstraintSystem::new_recording());
+        let source = recording.source(|| Source::Input { bits: 2 });
+        assert_eq!(source.index(), 0);
+        let (shape2, z2, defs) = recording.finish_recorded();
+        assert_eq!((shape.digest(), &z), (shape2.digest(), &z2));
+        assert_eq!(defs.vars.len(), shape.num_vars);
+        assert_eq!(defs.vars[0], Def::One);
+        assert_eq!(defs.vars[1], Def::Public);
+        assert!(matches!(defs.vars[2], Def::Bits { width: 2, .. }));
+        assert!(matches!(defs.vars[3], Def::Product(..)));
+        assert_eq!(defs.undefined(), vec![loose.index()]);
+        assert!(
+            defs.vars[shape.mask_var_base..]
+                .iter()
+                .all(|d| *d == Def::Mask)
+        );
+        // A builder that does not record never runs the closures.
+        let mut cs = ConstraintSystem::new();
+        cs.alloc_defined(f(1), || unreachable!());
+        cs.source(|| unreachable!());
     }
 
     #[test]
