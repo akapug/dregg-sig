@@ -19,7 +19,7 @@
 //!      256-bit shares `y_i^(0)` (`0` communication for `y^(0)`) and evaluate the three tweaked
 //!      `SHAKE256` steps `y^(0) -> y^(1) -> y^(2) -> y^(3)` across all `128 * leaves_per_committee`
 //!      chains via authenticated binary `GF(2)` Subfield-SPDZ MPC (post-quantum Ring-LWE Base OTs
-//!      via [`OtMesh`], KOS15 correlated OT extension for inputs, Beaver triples from
+//!      via [`OtMesh`], consistency-checked correlated OT extension for inputs, Beaver triples from
 //!      dregg-sig-core's `Π_triple_f2` in its additive output mode, and committed SPDZ `MacCheck`).
 //!    - Secret chain states `y^(0), y^(1), y^(2)` remain strictly `t`-of-`t` XOR-shared inside `C`
 //!      and are never reconstructed by staging; **only** `y^(3)` is released after `MacCheck`
@@ -59,8 +59,8 @@ use dregg_sig_core::field::tower::{
 };
 use dregg_sig_core::field::tower::{Tower128, wipe_tower128};
 use dregg_sig_core::preprocessing::{
-    OtMesh, PartyPrivateRng, PreprocessError, blind_open_additive_gf128_poly,
-    run_dealerless_pi_triple_f2_additive_with_fault,
+    OT_EXT_SACRIFICIAL_OTS, OtExtCheckKey, OtMesh, PartyPrivateRng, PreprocessError,
+    blind_open_additive_gf128_poly, run_dealerless_pi_triple_f2_additive_with_fault,
 };
 use dregg_sig_core::sponge::keccak::{Cshake256Xof, KECCAK_ROUND_CONSTANTS};
 use dregg_sig_core::wipe::{
@@ -84,7 +84,6 @@ const TAG_COIN_FINAL: &[u8] = b"QSAG.QUORUM.STAGE.COIN.FINAL/v1";
 const TAG_PAIR_COMMIT: &[u8] = b"QSAG.QUORUM.STAGE.PAIR.COMMIT/v1";
 const TAG_ROOT_CONFIRM: &[u8] = b"QSAG.QUORUM.STAGE.ROOT.CONFIRM/v1";
 const TAG_ABIT_COL: &[u8] = b"QSAG.QUORUM.STAGE.ABIT.COL/v1";
-const TAG_ABIT_CHI: &[u8] = b"QSAG.QUORUM.STAGE.ABIT.CHI/v1";
 const TAG_SAC_CHI: &[u8] = b"QSAG.QUORUM.STAGE.SAC.CHI/v1";
 const TAG_TRIPLE_REFILL: &[u8] = b"QSAG.QUORUM.STAGE.TRIPLE.REFILL/v1";
 const TAG_SHAMIR_COMMIT: &[u8] = b"QSAG.QUORUM.STAGE.SHAMIR.COMMIT/v1";
@@ -113,7 +112,7 @@ pub enum DealerlessStagingError {
     OutputRejected,
     /// Underlying quorum parameter or custodian error.
     Quorum(QuorumError),
-    /// Underlying Ring-LWE Base-OT or KOS15 preprocessing error.
+    /// Underlying Ring-LWE Base-OT or OT-extension preprocessing error.
     Preprocess(PreprocessError),
     /// Caller supplied the wrong number of custodian RNGs or custodians.
     PartyCountMismatch { expected: usize, got: usize },
@@ -121,8 +120,8 @@ pub enum DealerlessStagingError {
     CommitmentMismatch { phase: &'static str, party: usize },
     /// Pairwise symmetric MAC key agreement failed consistency.
     PairwiseKeyMismatch { party_a: usize, party_b: usize },
-    /// KOS15 correlated-OT consistency check failed inside a committee.
-    KosOtCheckFailed {
+    /// Correlated-OT extension consistency check failed inside a committee.
+    OtExtCheckFailed {
         committee: usize,
         sender: usize,
         receiver: usize,
@@ -170,13 +169,13 @@ impl fmt::Display for DealerlessStagingError {
             Self::PairwiseKeyMismatch { party_a, party_b } => {
                 write!(f, "pairwise key mismatch between {party_a} and {party_b}")
             }
-            Self::KosOtCheckFailed {
+            Self::OtExtCheckFailed {
                 committee,
                 sender,
                 receiver,
             } => write!(
                 f,
-                "KOS15 OT check failed in committee {committee} ({sender} -> {receiver})"
+                "OT extension check failed in committee {committee} ({sender} -> {receiver})"
             ),
             Self::TripleSacrificeFailed { committee } => {
                 write!(f, "Beaver triple sacrifice failed in committee {committee}")
@@ -544,11 +543,6 @@ fn unpack_256_planes_to_nodes(planes: &[u64; 256], count: usize) -> Vec<Node> {
 // =============================================================================================
 
 #[inline]
-fn word_bit(words: &[u64], bit_idx: usize) -> u64 {
-    (black_box(words[bit_idx / 64]) >> (bit_idx % 64)) & 1
-}
-
-#[inline]
 fn bit_mask128(bit: u64) -> u128 {
     0u128.wrapping_sub((black_box(bit) & 1) as u128)
 }
@@ -685,7 +679,7 @@ fn transpose_128_cols_to_u128_rows(cols: &[Vec<u64>], words: usize) -> Vec<u128>
     rows
 }
 
-/// Pairwise KOS15 Subfield-VOLE channel seeded from `128` active Ring-LWE Base-OT correlations.
+/// Pairwise consistency-checked Subfield-VOLE channel seeded from `128` active Ring-LWE Base-OT correlations.
 struct PairwiseSubfieldVole {
     holder: usize,
     owner: usize,
@@ -759,7 +753,7 @@ fn run_pairs<T: Send>(
 
 impl PairwiseSubfieldVole {
     /// Authenticate `payload_words` `u64` words owned by `self.owner` under `self.holder`'s
-    /// 128-bit `delta_holder` key via KOS15 correlated OT extension (`+256` sacrificial bits).
+    /// 128-bit `delta_holder` key via consistency-checked correlated OT extension (`+256` sacrificial bits).
     /// Returns `(t_rows_for_owner, q_rows_for_holder)` satisfying `q_rows[k] ^ t_rows[k] = bit_k * delta_holder`.
     fn extend_authenticated_bits(
         &mut self,
@@ -770,7 +764,7 @@ impl PairwiseSubfieldVole {
         holder_rng: &mut PartyPrivateRng,
     ) -> Result<AuthBitRowsPair, DealerlessStagingError> {
         let payload_words = owner_words.len();
-        let total_words = payload_words + 4; // +256 sacrificial bits masking KOS linear combination
+        let total_words = payload_words + OT_EXT_SACRIFICIAL_OTS / 64;
         let ext_ctr = self.ext_ctr;
         self.ext_ctr = self.ext_ctr.wrapping_add(1);
 
@@ -834,54 +828,44 @@ impl PairwiseSubfieldVole {
             wipe_u64s(col);
         }
 
-        let mut t_rows = SecretBuffer(transpose_128_cols_to_u128_rows(&t0_cols, total_words));
-        let mut q_rows = SecretBuffer(transpose_128_cols_to_u128_rows(&q_cols, total_words));
+        // Consistency check: Roy, SoftSpokenOT (ePrint 2022/192), Fig. 9 for the length-128
+        // repetition code, proven as Theorem 4.5; the construction, bound and leakage are in
+        // the module doc of `dregg_sig_core::preprocessing`. The holder samples the hash key
+        // strictly after the owner's `u` columns are fixed, and compares per column
+        // `H(q_c) = H(t_c) + delta_c H(x)`. The 256 sacrificial rows are the identity block of
+        // the hash and are dropped below.
+        let chi_seed = holder_rng.next_bytes32();
+        let key = OtExtCheckKey::new(&chi_seed, payload_words);
+        let mut x_hash = key.hash(&full_owner);
+        wipe_u64s(&mut full_owner);
+        let mut diff = 0u128;
+        for col in 0..128 {
+            let mut t_hash = key.hash(&t0_cols[col]);
+            let mut q_hash = key.hash(&q_cols[col]);
+            let mask = bit_mask128(((black_box(self.delta_holder) >> col) & 1) as u64);
+            for lane in 0..2 {
+                diff |= q_hash[lane] ^ t_hash[lane] ^ (mask & x_hash[lane]);
+            }
+            wipe_u128s(&mut t_hash);
+            wipe_u128s(&mut q_hash);
+        }
+        wipe_u128s(&mut x_hash);
+
+        let t_rows = SecretBuffer(transpose_128_cols_to_u128_rows(&t0_cols, payload_words));
+        let q_rows = SecretBuffer(transpose_128_cols_to_u128_rows(&q_cols, payload_words));
         for col in t0_cols.iter_mut() {
             wipe_u64s(col);
         }
         for col in q_cols.iter_mut() {
             wipe_u64s(col);
         }
-
-        // Holder samples `chi_seed` strictly after `u_cols` is locked.
-        let chi_seed = holder_rng.next_bytes32();
-        let total_rows = 64 * total_words;
-        let mut chi_words = vec![0u64; 2 * total_rows];
-        expand_u64_stream(
-            TAG_ABIT_CHI,
-            &[session_id, &holder_le, &owner_le, &ctr_le, &chi_seed],
-            &mut chi_words,
-        );
-        let chis: Vec<u128> = chi_words
-            .chunks_exact(2)
-            .map(|w| (w[0] as u128) | ((w[1] as u128) << 64))
-            .collect();
-        wipe_u64s(&mut chi_words);
-
-        let mut x_bar = 0u128;
-        for (k, &chi_k) in chis.iter().enumerate() {
-            x_bar ^= chi_k & bit_mask128(word_bit(&full_owner, k));
-        }
-        wipe_u64s(&mut full_owner);
-
-        let t_bar = dregg_sig_asm::gf2_128_dot(&t_rows, &chis);
-        let q_bar = dregg_sig_asm::gf2_128_dot(&q_rows, &chis);
-        let check = q_bar ^ t_bar ^ gf128_mul(x_bar, self.delta_holder);
-        if black_box(check) != 0 {
-            wipe_u128s(&mut t_rows);
-            wipe_u128s(&mut q_rows);
-            return Err(DealerlessStagingError::KosOtCheckFailed {
+        if black_box(diff) != 0 {
+            return Err(DealerlessStagingError::OtExtCheckFailed {
                 committee,
                 sender: self.holder,
                 receiver: self.owner,
             });
         }
-
-        let keep_rows = 64 * payload_words;
-        wipe_u128s(&mut t_rows[keep_rows..]);
-        wipe_u128s(&mut q_rows[keep_rows..]);
-        t_rows.truncate(keep_rows);
-        q_rows.truncate(keep_rows);
         Ok((t_rows, q_rows))
     }
 }
@@ -3110,6 +3094,72 @@ pub fn refresh_staged_bft_shamir_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An owner whose `u` column is inconsistent in one column (a wrong `t1` stream) gets its
+    /// authenticated bits exactly when the holder's key bit of that column is 0, where the lie
+    /// has no effect on the correlation; otherwise the extension is refused.
+    #[test]
+    fn inconsistent_owner_column_passes_exactly_when_the_holder_key_bit_is_zero() {
+        const DELTA: u128 = 0x8000_0000_0000_0001_0000_0000_0000_0005;
+        let mut rng = PartyPrivateRng::from_seed([0x3c; 32], b"abit-lie");
+        let seeds: [([u8; 32], [u8; 32]); 128] =
+            core::array::from_fn(|_| (rng.next_bytes32(), rng.next_bytes32()));
+        let owner_words = [0xDEAD_BEEF_0123_4567u64, 0x0F0F_F0F0_AAAA_5555, 7];
+        let mut outcomes = [0usize; 2];
+        for lie in [None, Some(0), Some(1), Some(2), Some(3), Some(64), Some(126), Some(127)] {
+            let mut pv = PairwiseSubfieldVole {
+                holder: 2,
+                owner: 1,
+                seeds0: SecretBuffer(core::array::from_fn(|c| seeds[c].0)),
+                seeds1: SecretBuffer(core::array::from_fn(|c| seeds[c].1)),
+                chosen: SecretBuffer(core::array::from_fn(|c| {
+                    if (DELTA >> c) & 1 == 1 {
+                        seeds[c].1
+                    } else {
+                        seeds[c].0
+                    }
+                })),
+                delta_holder: DELTA,
+                ext_ctr: 0,
+            };
+            if let Some(col) = lie {
+                pv.seeds1[col][5] ^= 0x40;
+            }
+            let key_bit = lie.is_some_and(|col| (DELTA >> col) & 1 == 1);
+            let mut owner_rng = PartyPrivateRng::from_seed([0x3d; 32], b"abit-owner");
+            let mut holder_rng = PartyPrivateRng::from_seed([0x3e; 32], b"abit-holder");
+            let res = pv.extend_authenticated_bits(
+                9,
+                &[0x77; 32],
+                &owner_words,
+                &mut owner_rng,
+                &mut holder_rng,
+            );
+            match res {
+                Ok((t_rows, q_rows)) => {
+                    assert!(!key_bit, "lie {lie:?}");
+                    assert_eq!((t_rows.len(), q_rows.len()), (192, 192));
+                    for k in 0..192 {
+                        let want = DELTA & bit_mask128((owner_words[k / 64] >> (k % 64)) & 1);
+                        assert_eq!(t_rows[k] ^ q_rows[k], want, "lie {lie:?} row {k}");
+                    }
+                }
+                Err(err) => {
+                    assert!(key_bit, "lie {lie:?}");
+                    assert!(matches!(
+                        err,
+                        DealerlessStagingError::OtExtCheckFailed {
+                            committee: 9,
+                            sender: 2,
+                            receiver: 1
+                        }
+                    ));
+                }
+            }
+            outcomes[usize::from(key_bit)] += 1;
+        }
+        assert_eq!(outcomes, [4, 4]);
+    }
 
     #[test]
     fn eight_way_stream_expansion_equals_the_scalar_stream() {

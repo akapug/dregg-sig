@@ -27,7 +27,6 @@
 use dregg_sig_accel::keccak::cshake256_framed_32;
 use dregg_sig_addr::QsagAddress;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::protocol::{COL_DEGREE, Layout, ROW_DEGREE};
 use dregg_sig_migrate::hem::registry::{
     BindingStatus, NullifierRegistry, Receipt, RegisteredBinding, RegistryError, pq_commitment,
 };
@@ -1050,39 +1049,12 @@ fn from_base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// An upper bound on the encoding of an ownership proof for `statement`, from the cell
-/// layout and the query schedule of its relation: every transcript element the argument
-/// sends, every opened symbol, and one authentication path per query with no sharing.
-/// `None` for a malformed statement.
+/// An upper bound on the encoding of an ownership proof for `statement`: the bound the
+/// proof system states for the statement's relation, plus the magic and regime byte of
+/// the ownership envelope. `None` for a malformed statement.
 fn max_proof_bytes(statement: &OwnershipStatement) -> Option<usize> {
-    const EXT: usize = 32;
-    const BASE: usize = 8;
-    const DIGEST: usize = 32;
-    // The masked assignment table and its four companions share the Stage-0 commitment.
-    const STAGE0_TABLES: usize = 5;
     let shape = ownership_shape(statement)?;
-    let layout = Layout::new(&shape, REGIME)?;
-    let schedule = &layout.schedule;
-    // Magic, claim kind, regime, commitment; the two masked sumchecks with their mask
-    // sums, the three row values and the four companion claims.
-    let mut bytes = 8 + 2 + (DIGEST + 1);
-    bytes += EXT
-        * (1 + shape.log_rows * (ROW_DEGREE + 1) + 3 + 1 + layout.var_bits * (COL_DEGREE + 1) + 4);
-    // Opening: out-of-domain values, one bridge polynomial and proof-of-work nonce per
-    // folded variable, the terminal coefficients, and the length prefixes.
-    bytes += 2 * EXT + 8 + layout.log_cells * (5 * EXT + 8) + 8;
-    bytes += 4 + ((1usize << schedule.early_stop_vars) + 2) * EXT + 4;
-    for (index, stage) in schedule.stages.iter().enumerate() {
-        let arity = 1usize << stage.step_vars;
-        let depth = layout.log_cells + stage.blowup.next_power_of_two().trailing_zeros() as usize;
-        let leaf = if index == 0 {
-            16 + arity * STAGE0_TABLES * BASE
-        } else {
-            arity * EXT
-        };
-        bytes += (DIGEST + 1) + 2 * EXT + 8 + 3 * 4 + stage.num_queries * (leaf + depth * DIGEST);
-    }
-    Some(bytes)
+    dregg_sig_agg::zk_hem::protocol::max_proof_bytes(&shape, REGIME).map(|n| n + 9)
 }
 
 fn map_ownership_error(err: OwnershipError) -> CliError {

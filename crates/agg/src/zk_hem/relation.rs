@@ -183,11 +183,17 @@ impl From<Var> for Lc {
 }
 
 /// Sparse matrix in compressed-row form.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Csr {
     ptr: Vec<u32>,
     col: Vec<u32>,
     val: Vec<F>,
+}
+
+impl Default for Csr {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Csr {
@@ -200,11 +206,63 @@ impl Csr {
     }
 
     fn push_row(&mut self, lc: &Lc) {
-        for &(v, c) in lc.terms() {
+        self.push_terms(lc.terms());
+    }
+
+    fn push_terms(&mut self, terms: &[(u32, F)]) {
+        for &(v, c) in terms {
             self.col.push(v);
             self.val.push(c);
         }
         self.ptr.push(self.col.len() as u32);
+    }
+
+    /// `count` rows without entries.
+    fn push_empty_rows(&mut self, count: usize) {
+        let end = self.col.len() as u32;
+        self.ptr.resize(self.ptr.len() + count, end);
+    }
+
+    /// The rows of `other` after the rows of `self`.
+    fn append(&mut self, other: Csr) {
+        if self.num_rows() == 0 {
+            *self = other;
+            return;
+        }
+        let base = self.col.len() as u32;
+        self.ptr.extend(other.ptr[1..].iter().map(|&p| base + p));
+        self.col.extend_from_slice(&other.col);
+        self.val.extend_from_slice(&other.val);
+    }
+
+    /// Rename every column.
+    fn map_cols(&mut self, map: impl Fn(u32) -> u32) {
+        for col in &mut self.col {
+            *col = map(*col);
+        }
+    }
+
+    /// Order the entries of every row by column. Columns of a row are distinct.
+    fn sort_rows(&mut self) {
+        let mut row: Vec<(u32, F)> = Vec::new();
+        for bounds in self.ptr.windows(2) {
+            let (lo, hi) = (bounds[0] as usize, bounds[1] as usize);
+            if self.col[lo..hi].is_sorted() {
+                continue;
+            }
+            row.clear();
+            row.extend(
+                self.col[lo..hi]
+                    .iter()
+                    .copied()
+                    .zip(self.val[lo..hi].iter().copied()),
+            );
+            row.sort_unstable_by_key(|&(v, _)| v);
+            for (k, &(v, c)) in row.iter().enumerate() {
+                self.col[lo + k] = v;
+                self.val[lo + k] = c;
+            }
+        }
     }
 
     #[inline]
@@ -233,15 +291,120 @@ impl Csr {
             .fold(F::ZERO, |acc, (c, v)| acc + v.const_mul(z[c]))
     }
 
-    fn stream_into(&self, mut push: impl FnMut(&[u8])) {
-        push(&(self.ptr.len() as u64).to_le_bytes());
+    fn stream_into(&self, sponge: &mut ShapeSponge) {
+        sponge.u64(self.ptr.len() as u64);
         for &p in &self.ptr {
-            push(&p.to_le_bytes());
+            sponge.u32(p);
         }
         for (&c, &v) in self.col.iter().zip(&self.val) {
-            push(&c.to_le_bytes());
-            push(&v.to_le_bytes());
+            sponge.u32(c);
+            sponge.u64(v.to_canonical_u64());
         }
+    }
+}
+
+/// The cSHAKE256 sponge of [`Shape::digest`], absorbing little-endian words straight into
+/// the rate lanes. Absorbing `u32(x)` or `u64(x)` is absorbing the little-endian bytes of
+/// `x`; the digest is that of the concatenated bytes.
+struct ShapeSponge {
+    state: [u64; 25],
+    /// Bytes absorbed into the current rate block, below [`ShapeSponge::RATE`].
+    pos: usize,
+}
+
+impl ShapeSponge {
+    const RATE: usize = 136;
+
+    fn new(midstate: [u64; 25]) -> Self {
+        Self {
+            state: midstate,
+            pos: 0,
+        }
+    }
+
+    /// Absorb the low `bytes <= 8` bytes of `v`, whose other bytes are zero.
+    #[inline(always)]
+    fn word(&mut self, v: u64, bytes: usize) {
+        let lane = self.pos / 8;
+        let at = self.pos % 8;
+        self.state[lane] ^= v << (8 * at);
+        let room = 8 - at;
+        if bytes < room {
+            self.pos += bytes;
+            return;
+        }
+        let next = if lane == Self::RATE / 8 - 1 {
+            keccak_f1600(&mut self.state);
+            0
+        } else {
+            lane + 1
+        };
+        if bytes > room {
+            self.state[next] ^= v >> (8 * room);
+        }
+        self.pos = (self.pos + bytes) % Self::RATE;
+    }
+
+    #[inline(always)]
+    fn u32(&mut self, v: u32) {
+        self.word(u64::from(v), 4);
+    }
+
+    #[inline(always)]
+    fn u64(&mut self, v: u64) {
+        self.word(v, 8);
+    }
+
+    fn bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.word(u64::from(b), 1);
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        self.state[self.pos / 8] ^= 0x04 << (8 * (self.pos % 8));
+        self.state[Self::RATE / 8 - 1] ^= 0x80 << 56;
+        keccak_f1600(&mut self.state);
+        let mut out = [0u8; 32];
+        for (lane, dst) in self.state.iter().take(4).zip(out.as_chunks_mut::<8>().0) {
+            *dst = lane.to_le_bytes();
+        }
+        out
+    }
+}
+
+/// Rows of one kind, `(a, b, c)` each, in the order they were recorded. A row is written
+/// into the three compressed matrices when it is recorded; its linear forms are not kept.
+#[derive(Default)]
+struct Rows {
+    a: Csr,
+    b: Csr,
+    c: Csr,
+}
+
+impl Rows {
+    #[inline]
+    fn len(&self) -> usize {
+        self.a.num_rows()
+    }
+
+    #[inline]
+    fn push(&mut self, a: &[(u32, F)], b: &[(u32, F)], c: &[(u32, F)]) {
+        self.a.push_terms(a);
+        self.b.push_terms(b);
+        self.c.push_terms(c);
+    }
+
+    /// The rows of `other` after these, one matrix at a time.
+    fn append(&mut self, other: Rows) {
+        let Rows { a, b, c } = other;
+        self.a.append(a);
+        self.b.append(b);
+        self.c.append(c);
+    }
+
+    fn matrices(&mut self) -> [&mut Csr; 3] {
+        [&mut self.a, &mut self.b, &mut self.c]
     }
 }
 
@@ -309,6 +472,18 @@ pub enum Source {
         den: Vec<IntCoef>,
         modulus: Vec<u8>,
     },
+    /// The slope of an affine addition that may be a doubling, as a canonical residue
+    /// modulo the prime `modulus`: `num / den` where `den` is not zero modulo the prime
+    /// (the chord), and `(sum_j a_j b_j + c) / tangent_den` where it is (the tangent).
+    /// The gadget guarantees that `tangent_den` is not zero in that case.
+    Slope {
+        num: Vec<IntCoef>,
+        den: Vec<IntCoef>,
+        tangent_products: Vec<(Vec<IntCoef>, Vec<IntCoef>)>,
+        tangent_linear: Vec<IntCoef>,
+        tangent_den: Vec<IntCoef>,
+        modulus: Vec<u8>,
+    },
     /// The integer `num / divisor`, where the odd `divisor` (little-endian bytes) divides
     /// `num` exactly and the quotient lies in `[0, 2^bits)`.
     Quotient {
@@ -329,6 +504,9 @@ pub enum Def {
     Public,
     /// A masking variable appended by [`ConstraintSystem::finish`].
     Mask,
+    /// The multiplicity of a table row: how many of the relation's lookups
+    /// ([`Shape::lookups`]) have that row as their tuple.
+    Multiplicity,
     /// `a b`.
     Product(Lc, Lc),
     /// `a^7`.
@@ -436,8 +614,8 @@ impl Lookups {
         sums.values().all(|s| s.is_zero())
     }
 
-    fn stream_into(&self, mut push: impl FnMut(&[u8])) {
-        push(b"QSAG.ZKHEM.SHAPE.LOOKUP/v1");
+    fn stream_into(&self, sponge: &mut ShapeSponge) {
+        sponge.bytes(b"QSAG.ZKHEM.SHAPE.LOOKUP/v1");
         for n in [
             self.log_entries,
             self.num_lookups,
@@ -445,11 +623,11 @@ impl Lookups {
             self.mult_var_base,
             self.den.len(),
         ] {
-            push(&(n as u64).to_le_bytes());
+            sponge.u64(n as u64);
         }
-        self.num.stream_into(&mut push);
+        self.num.stream_into(sponge);
         for m in &self.den {
-            m.stream_into(&mut push);
+            m.stream_into(sponge);
         }
     }
 }
@@ -547,29 +725,8 @@ impl Shape {
 
     fn compute_digest(&self) -> [u8; 32] {
         const SHAPE_MIDSTATE: [u64; 25] = cshake256_static_midstate(b"QSAG.ZKHEM.SHAPE/v1");
-        const RATE: usize = 136;
-
-        let mut state = SHAPE_MIDSTATE;
-        let mut buf = [0u8; RATE];
-        let mut filled = 0usize;
-        let xor_rate = |st: &mut [u64; 25], blk: &[u8; RATE]| {
-            for (lane, chunk) in st.iter_mut().take(17).zip(blk.as_chunks::<8>().0) {
-                *lane ^= u64::from_le_bytes(*chunk);
-            }
-        };
-        let mut push = |mut data: &[u8]| {
-            while !data.is_empty() {
-                let take = (RATE - filled).min(data.len());
-                buf[filled..filled + take].copy_from_slice(&data[..take]);
-                filled += take;
-                data = &data[take..];
-                if filled == RATE {
-                    xor_rate(&mut state, &buf);
-                    keccak_f1600(&mut state);
-                    filled = 0;
-                }
-            }
-        };
+        let _phase = crate::profile::span("hem_shape_digest");
+        let mut sponge = ShapeSponge::new(SHAPE_MIDSTATE);
         for n in [
             self.log_rows,
             self.num_sbox,
@@ -577,25 +734,15 @@ impl Shape {
             self.num_public,
             self.mask_var_base,
         ] {
-            push(&(n as u64).to_le_bytes());
+            sponge.u64(n as u64);
         }
-        self.a.stream_into(&mut push);
-        self.b.stream_into(&mut push);
-        self.c.stream_into(&mut push);
+        self.a.stream_into(&mut sponge);
+        self.b.stream_into(&mut sponge);
+        self.c.stream_into(&mut sponge);
         if let Some(lookups) = &self.lookups {
-            lookups.stream_into(&mut push);
+            lookups.stream_into(&mut sponge);
         }
-
-        buf[filled..].fill(0);
-        buf[filled] ^= 0x04;
-        buf[RATE - 1] ^= 0x80;
-        xor_rate(&mut state, &buf);
-        keccak_f1600(&mut state);
-        let mut out = [0u8; 32];
-        for (lane, dst) in state.iter().take(4).zip(out.as_chunks_mut::<8>().0) {
-            *dst = lane.to_le_bytes();
-        }
-        out
+        sponge.finish()
     }
 
     /// Whether `z` (with `z[0] = 1`) satisfies every row.
@@ -619,6 +766,10 @@ impl Shape {
 ///
 /// The row structure must not depend on assigned values: the verifier rebuilds the [`Shape`]
 /// by running the same synthesis on a placeholder assignment.
+///
+/// A row is written into compressed matrices as it is recorded, one group per kind of
+/// row so that [`Self::finish`] only concatenates the groups; the builder holds about
+/// twelve bytes per matrix entry and no linear form of a recorded row.
 pub struct ConstraintSystem {
     values: Vec<F>,
     record_rows: bool,
@@ -626,13 +777,18 @@ pub struct ConstraintSystem {
     hologram_aligned: bool,
     p2_perms: usize,
     p2_values: Vec<F>,
-    p2_sbox: Vec<(Lc, Lc)>,
-    sbox: Vec<(Lc, Lc)>,
-    mul: Vec<(Lc, Lc, Lc)>,
+    /// S-box rows of aligned Poseidon2 blocks, then the other S-box rows, then the
+    /// multiplication rows: the row order of the relation. S-box rows have an empty `b`.
+    p2_sbox: Rows,
+    sbox: Rows,
+    mul: Rows,
     defs: Option<Definitions>,
     tables: Vec<LookupTable>,
     range_tables: Vec<(usize, TableId)>,
-    lookups: Vec<(u32, Vec<Lc>)>,
+    /// Table of each recorded lookup, and column `k` of the looked-up tuples as a matrix
+    /// with one row per lookup (empty where the tuple is narrower).
+    lookup_tables: Vec<u32>,
+    lookup_columns: Vec<Csr>,
     num_lookups: usize,
 }
 
@@ -651,13 +807,14 @@ impl ConstraintSystem {
             hologram_aligned: false,
             p2_perms: 0,
             p2_values: Vec::new(),
-            p2_sbox: Vec::new(),
-            sbox: Vec::new(),
-            mul: Vec::new(),
+            p2_sbox: Rows::default(),
+            sbox: Rows::default(),
+            mul: Rows::default(),
             defs: None,
             tables: Vec::new(),
             range_tables: Vec::new(),
-            lookups: Vec::new(),
+            lookup_tables: Vec::new(),
+            lookup_columns: Vec::new(),
             num_lookups: 0,
         }
     }
@@ -707,12 +864,12 @@ impl ConstraintSystem {
             !self.hologram_aligned,
             "recording a hologram-aligned relation"
         );
-        // A multiplicity is a count over the whole witness, not a function of earlier
-        // variables; no definition kind states it.
-        assert!(self.num_lookups == 0, "recording a relation with lookups");
         let mut defs = self.defs.take().expect("a recording builder");
         let (shape, z) = self.finish();
         defs.vars.resize(shape.num_vars, Def::Mask);
+        if let Some(lookups) = shape.lookups() {
+            defs.vars[lookups.mult_var_base..shape.mask_var_base].fill(Def::Multiplicity);
+        }
         (shape, z, defs)
     }
 
@@ -725,15 +882,20 @@ impl ConstraintSystem {
         cs
     }
 
-    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices.
-    /// The resulting assignment must still be checked against the compiled shape.
-    pub(crate) fn witness_only() -> Self {
+    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices: run
+    /// the synthesis that produced a [`Shape`] on this builder and close it with
+    /// [`Self::finish_assignment`]. The resulting assignment must still be checked against
+    /// the compiled shape (the prover's row check does).
+    pub fn witness_only() -> Self {
         let mut cs = Self::new();
         cs.record_rows = false;
         cs
     }
 
-    pub(crate) fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
+    /// The assignment of a [`Self::witness_only`] builder, laid out for `shape` (masking
+    /// variables zero). `None` when the synthesis allocated a different number of public
+    /// inputs or variables than `shape` has.
+    pub fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
         assert!(!self.record_rows && !self.hologram_aligned);
         self.push_multiplicities();
         if self.num_public != shape.num_public || self.values.len() != shape.mask_var_base {
@@ -756,9 +918,9 @@ impl ConstraintSystem {
             hologram_aligned: self.hologram_aligned,
             p2_perms: 0,
             p2_values: Vec::new(),
-            p2_sbox: Vec::new(),
-            sbox: Vec::new(),
-            mul: Vec::new(),
+            p2_sbox: Rows::default(),
+            sbox: Rows::default(),
+            mul: Rows::default(),
             defs: None,
             tables: self
                 .tables
@@ -770,7 +932,8 @@ impl ConstraintSystem {
                 })
                 .collect(),
             range_tables: self.range_tables.clone(),
-            lookups: Vec::new(),
+            lookup_tables: Vec::new(),
+            lookup_columns: Vec::new(),
             num_lookups: 0,
         }
     }
@@ -788,47 +951,51 @@ impl ConstraintSystem {
         let offset = u32::try_from(self.values.len() - self.num_public - 1)
             .expect("relation variable limit");
         let p2_offset = u32::try_from(self.p2_values.len()).expect("poseidon2 variable limit");
-        let relocate = |mut lc: Lc| {
-            for (v, _) in &mut lc.0 {
-                if *v & P2_VAR_TAG != 0 {
-                    let raw = (*v & !P2_VAR_TAG)
-                        .checked_add(p2_offset)
-                        .expect("poseidon2 variable limit");
-                    assert!(raw < P2_VAR_TAG, "poseidon2 variable limit");
-                    *v = P2_VAR_TAG | raw;
-                } else if *v as usize > self.num_public {
-                    let next = v.checked_add(offset).expect("relation variable limit");
-                    assert!(next < P2_VAR_TAG, "relation variable limit");
-                    *v = next;
-                }
+        let num_public = self.num_public;
+        let relocate = |v: u32| -> u32 {
+            if v & P2_VAR_TAG != 0 {
+                let raw = (v & !P2_VAR_TAG)
+                    .checked_add(p2_offset)
+                    .expect("poseidon2 variable limit");
+                assert!(raw < P2_VAR_TAG, "poseidon2 variable limit");
+                P2_VAR_TAG | raw
+            } else if v as usize > num_public {
+                let next = v.checked_add(offset).expect("relation variable limit");
+                assert!(next < P2_VAR_TAG, "relation variable limit");
+                next
+            } else {
+                v
             }
-            lc
         };
-        self.p2_sbox.extend(
-            core::mem::take(&mut other.p2_sbox)
-                .into_iter()
-                .map(|(a, c)| (relocate(a), relocate(c))),
-        );
-        self.sbox.extend(
-            core::mem::take(&mut other.sbox)
-                .into_iter()
-                .map(|(a, c)| (relocate(a), relocate(c))),
-        );
-        self.mul.extend(
-            core::mem::take(&mut other.mul)
-                .into_iter()
-                .map(|(a, b, c)| (relocate(a), relocate(b), relocate(c))),
-        );
+        for (mine, theirs) in [
+            (&mut self.p2_sbox, &mut other.p2_sbox),
+            (&mut self.sbox, &mut other.sbox),
+            (&mut self.mul, &mut other.mul),
+        ] {
+            let mut theirs = core::mem::take(theirs);
+            for matrix in theirs.matrices() {
+                matrix.map_cols(relocate);
+            }
+            mine.append(theirs);
+        }
         assert_eq!(
             self.tables.len(),
             other.tables.len(),
             "lookup tables are registered before a fork"
         );
-        self.lookups.extend(
-            core::mem::take(&mut other.lookups)
-                .into_iter()
-                .map(|(t, tuple)| (t, tuple.into_iter().map(relocate).collect())),
-        );
+        let width = self.lookup_columns.len().max(other.lookup_columns.len());
+        self.widen_lookup_columns(width);
+        other.widen_lookup_columns(width);
+        self.lookup_tables.append(&mut other.lookup_tables);
+        for (mine, theirs) in self
+            .lookup_columns
+            .iter_mut()
+            .zip(core::mem::take(&mut other.lookup_columns))
+        {
+            let mut theirs = theirs;
+            theirs.map_cols(relocate);
+            mine.append(theirs);
+        }
         self.num_lookups += other.num_lookups;
         for (mine, theirs) in self.tables.iter_mut().zip(&mut other.tables) {
             for (m, o) in mine.mult.iter_mut().zip(&theirs.mult) {
@@ -888,7 +1055,7 @@ impl ConstraintSystem {
     pub fn sbox7(&mut self, a: &Lc) -> Var {
         let y = self.alloc_defined(poseidon2_sbox7(self.eval(a)), || Def::Power7(a.clone()));
         if self.record_rows {
-            self.sbox.push((a.clone(), y.into()));
+            self.sbox.push(a.terms(), &[], &[(y.0, F::ONE)]);
         }
         y
     }
@@ -903,7 +1070,7 @@ impl ConstraintSystem {
         assert!(idx < P2_VAR_TAG as usize, "poseidon2 variable limit");
         let y = Var(P2_VAR_TAG | (idx as u32));
         if self.record_rows {
-            self.p2_sbox.push((a.clone(), y.into()));
+            self.p2_sbox.push(a.terms(), &[], &[(y.0, F::ONE)]);
         }
         y
     }
@@ -915,7 +1082,7 @@ impl ConstraintSystem {
         for _ in 0..10 {
             dregg_sig_core::wipe::secret_vec_push(&mut self.p2_values, F::ZERO);
             if self.record_rows {
-                self.p2_sbox.push((Lc::zero(), Lc::zero()));
+                self.p2_sbox.push(&[], &[], &[]);
             }
         }
         self.p2_perms += 1;
@@ -928,21 +1095,21 @@ impl ConstraintSystem {
             Def::Product(a.clone(), b.clone())
         });
         if self.record_rows {
-            self.mul.push((a.clone(), b.clone(), y.into()));
+            self.mul.push(a.terms(), b.terms(), &[(y.0, F::ONE)]);
         }
         y
     }
 
     pub fn enforce_mul(&mut self, a: Lc, b: Lc, c: Lc) {
         if self.record_rows {
-            self.mul.push((a, b, c));
+            self.mul.push(a.terms(), b.terms(), c.terms());
         }
     }
 
     /// Row `lc * 1 = 0`.
     pub fn enforce_zero(&mut self, lc: Lc) {
         if self.record_rows {
-            self.mul.push((lc, Lc::constant(F::ONE), Lc::zero()));
+            self.mul.push(lc.terms(), &[(Var::ONE.0, F::ONE)], &[]);
         }
     }
 
@@ -954,7 +1121,7 @@ impl ConstraintSystem {
     pub fn enforce_boolean(&mut self, v: &Lc) {
         if self.record_rows {
             self.mul
-                .push((v.clone(), Lc::constant(F::ONE).minus(v), Lc::zero()));
+                .push(v.terms(), Lc::constant(F::ONE).minus(v).terms(), &[]);
         }
     }
 
@@ -1019,7 +1186,20 @@ impl ConstraintSystem {
         dregg_sig_asm::volatile_fill(&mut tuple, 0u64);
         self.num_lookups += 1;
         if self.record_rows {
-            self.lookups.push((table.0, values.to_vec()));
+            self.widen_lookup_columns(values.len());
+            self.lookup_tables.push(table.0);
+            for (k, column) in self.lookup_columns.iter_mut().enumerate() {
+                column.push_terms(values.get(k).map_or(&[], Lc::terms));
+            }
+        }
+    }
+
+    /// At least `width` tuple columns, each with one row per recorded lookup.
+    fn widen_lookup_columns(&mut self, width: usize) {
+        while self.lookup_columns.len() < width {
+            let mut column = Csr::new();
+            column.push_empty_rows(self.lookup_tables.len());
+            self.lookup_columns.push(column);
         }
     }
 
@@ -1050,9 +1230,11 @@ impl ConstraintSystem {
 
     /// The fraction list of the recorded lookups, with masking variables from `mask_base`.
     fn take_lookups(&mut self, mult_var_base: usize, mask_base: usize) -> Lookups {
-        let lookups = core::mem::take(&mut self.lookups);
         let num_table_rows: usize = self.tables.iter().map(|t| t.mult.len()).sum();
         let width = 1 + self.tables.iter().map(|t| t.width).max().unwrap_or(0);
+        // A tuple is as wide as its table, so the recorded columns fit.
+        self.widen_lookup_columns(width - 1);
+        let lookups = core::mem::take(&mut self.lookup_tables);
         let used = lookups.len() + num_table_rows;
         let log_entries = (used + LOOKUP_MASK_ENTRIES)
             .next_power_of_two()
@@ -1060,14 +1242,13 @@ impl ConstraintSystem {
             .max(2) as usize;
         let empty = Lc::zero();
         let mut num = Csr::new();
-        let mut den: Vec<Csr> = (0..width).map(|_| Csr::new()).collect();
+        let mut den: Vec<Csr> = vec![Csr::new()];
+        den.append(&mut self.lookup_columns);
+        debug_assert_eq!(den.len(), width);
         let tag = |t: usize| Lc::constant(F::from_u64_reduced(t as u64));
-        for (t, tuple) in &lookups {
+        for &t in &lookups {
             num.push_row(&Lc::constant(F::ONE));
-            den[0].push_row(&tag(*t as usize));
-            for (c, col) in den[1..].iter_mut().enumerate() {
-                col.push_row(tuple.get(c).unwrap_or(&empty));
-            }
+            den[0].push_row(&tag(t as usize));
         }
         let mut var = mult_var_base;
         for (t, table) in self.tables.iter().enumerate() {
@@ -1109,6 +1290,18 @@ impl ConstraintSystem {
         self.p2_sbox.len() + self.sbox.len() + self.mul.len()
     }
 
+    /// The recorded rows in relation order, with `total - MASK_ROWS` rows after padding.
+    fn take_rows(&mut self, total: usize) -> Rows {
+        let used = self.num_rows();
+        let mut rows = core::mem::take(&mut self.p2_sbox);
+        rows.append(core::mem::take(&mut self.sbox));
+        rows.append(core::mem::take(&mut self.mul));
+        for matrix in rows.matrices() {
+            matrix.push_empty_rows(total - MASK_ROWS - used);
+        }
+        rows
+    }
+
     /// Close the relation: append the masking variables and rows, pad the row count to a
     /// power of two. Returns the shape and the assignment, whose masking variables are zero
     /// until the prover overwrites them.
@@ -1116,7 +1309,6 @@ impl ConstraintSystem {
         assert!(self.record_rows);
         let one = Lc::constant(F::ONE);
         let two = Lc::constant(F::TWO);
-        let empty = Lc::zero();
 
         if !self.hologram_aligned {
             let mult_var_base = self.push_multiplicities();
@@ -1130,32 +1322,18 @@ impl ConstraintSystem {
                 }
                 self.take_lookups(mult_var_base, mask_var_base + MASK_ROWS)
             });
-            let used = self.num_rows();
-            let log_rows = (used + MASK_ROWS)
+            let log_rows = (self.num_rows() + MASK_ROWS)
                 .next_power_of_two()
                 .trailing_zeros()
                 .max(4) as usize;
             let total = 1usize << log_rows;
 
             let num_sbox = self.sbox.len();
-            let sbox = core::mem::take(&mut self.sbox);
-            let mul = core::mem::take(&mut self.mul);
-            let (mut a, mut b, mut c) = (Csr::new(), Csr::new(), Csr::new());
-            for (ra, rc) in sbox {
-                a.push_row(&ra);
-                b.push_row(&empty);
-                c.push_row(&rc);
-            }
-            for (ra, rb, rc) in mul {
-                a.push_row(&ra);
-                b.push_row(&rb);
-                c.push_row(&rc);
-            }
-            for _ in used..total - MASK_ROWS {
-                a.push_row(&empty);
-                b.push_row(&empty);
-                c.push_row(&empty);
-            }
+            let Rows {
+                mut a,
+                mut b,
+                mut c,
+            } = self.take_rows(total);
             for (k, &p) in mask.iter().enumerate() {
                 let p: Lc = p.into();
                 match k / 4 {
@@ -1211,42 +1389,24 @@ impl ConstraintSystem {
                 (misc_var_base as u32) + (v - (pub_prefix as u32))
             }
         };
-        let remap_lc = |lc: Lc| -> Lc {
-            let mut terms: Vec<(u32, F)> =
-                lc.0.into_iter()
-                    .map(|(v, coeff)| (remap_var(v), coeff))
-                    .collect();
-            terms.sort_unstable_by_key(|&(v, _)| v);
-            Lc(terms)
-        };
 
-        let used = self.num_rows();
         let num_sbox = self.p2_sbox.len() + self.sbox.len();
-        let log_rows = (used + MASK_ROWS)
+        let log_rows = (self.num_rows() + MASK_ROWS)
             .next_power_of_two()
             .trailing_zeros()
             .max(4) as usize;
         let total = 1usize << log_rows;
 
-        let p2_sbox = core::mem::take(&mut self.p2_sbox);
-        let sbox = core::mem::take(&mut self.sbox);
-        let mul = core::mem::take(&mut self.mul);
-        let (mut a, mut b, mut c) = (Csr::new(), Csr::new(), Csr::new());
-        for (ra, rc) in p2_sbox.into_iter().chain(sbox) {
-            a.push_row(&remap_lc(ra));
-            b.push_row(&empty);
-            c.push_row(&remap_lc(rc));
+        let mut rows = self.take_rows(total);
+        for matrix in rows.matrices() {
+            matrix.map_cols(remap_var);
+            matrix.sort_rows();
         }
-        for (ra, rb, rc) in mul {
-            a.push_row(&remap_lc(ra));
-            b.push_row(&remap_lc(rb));
-            c.push_row(&remap_lc(rc));
-        }
-        for _ in used..total - MASK_ROWS {
-            a.push_row(&empty);
-            b.push_row(&empty);
-            c.push_row(&empty);
-        }
+        let Rows {
+            mut a,
+            mut b,
+            mut c,
+        } = rows;
         for k in 0..MASK_ROWS {
             let p = Lc::term(Var((mask_var_base + k) as u32), F::ONE);
             match k / 4 {
@@ -1423,11 +1583,11 @@ impl Poseidon2InteriorTemplate {
         assert_eq!(cs.sbox.len(), 118);
         let mut rows_a = Vec::with_capacity(106);
         let mut const_a = [F::ZERO; 106];
-        for (r_off, (ra, rc)) in cs.sbox[12..118].iter().enumerate() {
+        for (r_off, constant) in const_a.iter_mut().enumerate() {
             let mut terms = Vec::new();
-            for &(v, coeff) in ra.terms() {
+            for (v, coeff) in cs.sbox.a.row(12 + r_off) {
                 if v == 0 {
-                    const_a[r_off] = coeff;
+                    *constant = coeff;
                 } else {
                     assert!(
                         (13..13 + 118).contains(&v),
@@ -1436,7 +1596,7 @@ impl Poseidon2InteriorTemplate {
                     terms.push(((v - 13) as u8, coeff));
                 }
             }
-            assert_eq!(rc.terms(), &[((13 + 12 + r_off) as u32, F::ONE)]);
+            assert!(cs.sbox.c.row(12 + r_off).eq([(13 + 12 + r_off, F::ONE)]));
             rows_a.push(terms);
         }
         Self { rows_a, const_a }
@@ -1505,6 +1665,121 @@ mod tests {
     fn f(x: u64) -> F {
         F::from_u64_reduced(x)
     }
+
+    fn hex32(bytes: [u8; 32]) -> alloc::string::String {
+        bytes.iter().map(|b| alloc::format!("{b:02x}")).collect()
+    }
+
+    /// A relation that uses every kind of row and every way of recording one: public
+    /// inputs, S-box and multiplication rows, Poseidon2 permutations, forked parts
+    /// appended in order and, when not hologram-aligned, lookups into tables of widths
+    /// one, two and three: one part looks up bytes only, and the widest table is
+    /// registered after every other lookup.
+    fn every_kind_of_row(aligned: bool) -> (Shape, Vec<F>) {
+        let mut cs = if aligned {
+            ConstraintSystem::new_hologram_aligned()
+        } else {
+            ConstraintSystem::new()
+        };
+        let p: Lc = cs.public_input(f(5)).into();
+        let q: Lc = cs.public_input(f(9)).into();
+        let pairs = (!aligned).then(|| {
+            cs.range_table(8);
+            cs.table(2, [1, 2, 3, 4, 5, 6].map(f).to_vec())
+        });
+        let part = |cs: &mut ConstraintSystem, k: u64| {
+            let x: Lc = cs.alloc(f(k + 2)).into();
+            let y: Lc = cs.mul(&x, &p).into();
+            let s: Lc = cs.sbox7(&y.plus(&q)).into();
+            cs.enforce_boolean(&Lc::constant(f(1)));
+            cs.enforce_equal(&s.minus(&s), &Lc::zero());
+            let out = sponge12(cs, &[x.clone(), y.clone(), s.scaled(f(3)).plus_const(f(k))]);
+            cs.enforce_mul(out[0].clone(), x.clone(), out[0].scaled(f(k + 2)));
+            let sel = cs.select(&Lc::constant(f(1)), &out[1], &y);
+            cs.enforce_equal(&sel, &out[1]);
+            if let Some(pairs) = pairs {
+                cs.enforce_byte(&x);
+                if k != 1 {
+                    cs.enforce_in_table(pairs, &[Lc::constant(f(3)), x.plus_const(f(4)).minus(&x)]);
+                }
+                cs.enforce_byte(&x.plus_const(f(200)));
+            }
+        };
+        // Forks are taken before the parent allocates anything of its own.
+        let mut forks: Vec<ConstraintSystem> = Vec::new();
+        for k in 1..4 {
+            let mut child = cs.fork_public_inputs();
+            part(&mut child, k);
+            forks.push(child);
+        }
+        for child in forks {
+            cs.append(child);
+        }
+        part(&mut cs, 0);
+        let last: Lc = cs.alloc(f(77)).into();
+        cs.enforce_zero(last.plus_const(F::ZERO - f(77)));
+        if !aligned {
+            let triples = cs.table(3, [7, 8, 9, 77, 78, 79].map(f).to_vec());
+            cs.enforce_in_table(
+                triples,
+                &[last.clone(), last.plus_const(f(1)), Lc::constant(f(79))],
+            );
+            cs.enforce_byte(&last);
+        }
+        cs.finish()
+    }
+
+    /// The digest binds the exact matrices. These values were computed by the builder
+    /// that kept every row as a list of linear forms until `finish` (commit `f303896`).
+    #[test]
+    fn shape_digests_of_every_kind_of_row_are_pinned() {
+        let got: Vec<_> = [false, true]
+            .into_iter()
+            .map(|aligned| {
+                let (shape, z) = every_kind_of_row(aligned);
+                assert!(shape.is_satisfied(&z), "aligned={aligned}");
+                assert_eq!(shape.lookups().is_some(), !aligned);
+                (
+                    aligned,
+                    shape.log_rows,
+                    shape.num_sbox,
+                    shape.num_vars,
+                    hex32(shape.digest()),
+                )
+            })
+            .collect();
+        let want = [
+            (
+                false,
+                PIN_PLAIN.0,
+                PIN_PLAIN.1,
+                PIN_PLAIN.2,
+                PIN_PLAIN.3.into(),
+            ),
+            (
+                true,
+                PIN_ALIGNED.0,
+                PIN_ALIGNED.1,
+                PIN_ALIGNED.2,
+                PIN_ALIGNED.3.into(),
+            ),
+        ];
+        assert_eq!(got, want);
+    }
+
+    /// `(log_rows, num_sbox, num_vars, digest)`.
+    const PIN_PLAIN: (usize, usize, usize, &str) = (
+        10,
+        476,
+        773,
+        "6f6caabadf32cee9148be7c7cd23740992dc24db88335e14f2cad915695adff5",
+    );
+    const PIN_ALIGNED: (usize, usize, usize, &str) = (
+        10,
+        516,
+        669,
+        "8bb1b9cfa74638c39783b86973cf53faff986a166b45109f13ef8da04e492345",
+    );
 
     #[test]
     fn canonical_rate6_sponge_matches_accelerator_at_boundaries() {

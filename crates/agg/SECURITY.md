@@ -61,6 +61,13 @@ What holds:
    `2 t sqrt(P / 2^128)` against quantum queries (`P` proofs, `t` hash queries). The
    quantum figure is weak (`2^-23` at `t = 2^40`); 256-bit salts make it `2^-87`.
    Section 4.4. [ours], using [cited] one-way to hiding.
+5. **Lookups.** A relation with lookups adds three kinds of rounds, which sit at 232 bits
+   or more at `2^20` lookups, and a second hiding opening, of the helper table. That
+   opening has the rounds of the first at the helper table's size (`2^20` cells for
+   `2^16` lookups, `2^24` for `2^20`), so its blend is the weakest round whenever the
+   helper table is the larger one: 179 to 195 bits. The levels of item 1 do not move.
+   The oracle proof stays perfect zero knowledge with one blinder per opened helper
+   symbol; a proof has two salted trees. Sections 2.4, 4.6 and 5.4. [cited] + [ours]
 
 ## 1. The protocol as analysed
 
@@ -244,6 +251,104 @@ certifies `2^81`: it charges the first collision in full, because extraction fro
 Merkle commitment fails there, and [CDHZ25] shows that bound on the commitment property
 is tight. Leaf-index and node-index binding do not help against collisions in a tree the
 adversary builds itself.
+
+### 2.4 Lookups
+
+A relation with lookups (`relation::Lookups`) is a list of `2^d` fractions
+`n_i / (alpha - v_i)`: `L` lookups with numerator `1`, `T` table rows over all tables
+with numerator minus a multiplicity variable, padding with numerator `0`, and four
+masking entries outside the sum. Value tuples have `w` columns, the first the table tag.
+The prover commits a second batch after `alpha`: the helper table `H` (the four limb
+tables of `h_i = n_i / (alpha - v_i)`, the mask `g3`, blinders) and four uniform
+companions, `N' = 2^{l'}` cells each (`LookupLayout::new`). The verifier rounds it adds,
+in the order `lookup_replay`, `replay_front` and `verify` replay them:
+
+| Where | Prover message | Challenge | Grinding |
+| --- | --- | --- | --- |
+| after the Stage-0 root, before `tau` | none | `gamma`, `alpha` | no |
+| | helper root | `tau'` in `E^d`, batching challenge | no |
+| | `G3 = sum g3` | `rho3 != 0` | no |
+| | lookup round polynomial, degree 4 (`d` rounds) | `rl_i` | no |
+| | `(n, v, h)(rl)` | `tau` (the rounds of section 1 follow, with five column weights) | no |
+| after `lambda` | none | `lambda'` | no |
+| after the opening of `U` | `sigma'_j = <C'_j, K'>` | `beta'` outside `F_{p^2}` | no |
+| | the opening of `U' = H + sum_j beta'^{j+1} C'_j` at `K'` | as for `U` | regime |
+
+That is `7 + d` rounds and those of a second opening.
+
+**Theorem 5 [ours, from cited lemmas].** Under the hypotheses of Theorem 1 for both
+batches, with `l_0` and `l_0'` their Stage-0 list bounds, the oracle proof has
+round-by-round knowledge soundness for "the rows hold and `Lookups::holds`" with the
+errors of Theorem 1 for the assignment batch, the rows of Theorem 1 from `beta` down for
+the helper batch at `N'` cells, and
+
+| Round | Error | Source |
+| --- | --- | --- |
+| `gamma` | `(w - 1)(L + T - 1) l_0 / |E|` | [ours] |
+| `alpha` | `(L + 2 T) l_0 / |E|` | [Hab22] Lemma 4 and step (22) for `L + T - 1` of it; `T + 1` [ours] |
+| `tau'`, batching challenge, `rho3`, lookup rounds, `lambda'` | `max(d, 4) l_0 l_0' / |E|` | Schwartz-Zippel per pair of list members; [Hab22] Theorem 2 |
+
+[Hab22] is `logup-2022-1530`. `bounds::LookupTerms` computes the three rows and
+`bounds::security_report` takes the weakest of them, of Theorem 1 and of the helper
+batch.
+
+*The statement* [cited]. `holds` says that for every tuple value the numerators of the
+fractions with that value add up to zero in `F_p`. By [Hab22] Lemma 5 (one column; tuples
+by its Section 3.4) this is: every looked-up tuple is a row of its table and every
+multiplicity variable is the count of its row, provided the number of lookups is below
+the characteristic. The tag column makes inclusion in the union of the
+tagged tables inclusion in the named table. *Where the code enforces the bound:*
+`LookupLayout::new` has no layout unless `4 * 2^d <= 2^28` cells, so
+`L + T + 4 <= 2^25 < p` (`bounds::lookup_layout`;
+`lookup_layout_matches_the_protocol` checks `d = 25` and `d = 26`). A multiplicity is an
+assignment variable and may be any field element; Lemma 5 quantifies over all of them.
+
+*`gamma`* [ours]. Fix a list member of the assignment batch whose fractions do not
+cancel, and a tuple value `u` whose numerators sum to `c != 0`. If no other tuple value
+with a nonzero numerator is compressed to `v(u) = sum_c gamma^c u_c`, the compressed
+fractions at `v(u)` still sum to `c`. There are at most `L + T - 1` other values and two
+distinct tuples agree on at most `w - 1` values of `gamma`. [Hab22] Section 3.4 draws
+one challenge per column in the function field and has no such term; the powers of one
+challenge are what the code does.
+
+*`alpha`*. After a good `gamma` the sum of the fractions is a nonzero rational function
+with at most `L + T` poles ([Hab22] Lemma 4), so the numerator over the common
+denominator has at most `L + T - 1` roots. [Hab22] step (22) and
+`logup-gkr-2023-1284` Proposition 2 state this as `((M + 1) |H| - 1) / (|F| - |H|)`
+for a challenge drawn outside the table values. Here `alpha` is uniform in `E` and the
+verifier does not test for a pole, which adds [ours]: if `alpha = v_i` for an entry
+with `n_i = 0` (a table row of multiplicity zero, or the padding value `0`), the
+constraint `h_i (alpha - v_i) = n_i` leaves `h_i` free and the helper sum can be
+set to zero. Those are at most `T + 1` values. If `alpha = v_i` with `n_i != 0` no helper
+satisfies the constraint. Outside both sets every `h_i` is its fraction and their sum is
+the rational function at `alpha`.
+
+*Lookup sumcheck* [ours, with the cited sumcheck bound]. The summand
+`sel (h + mu eq(tau', .) (h (alpha - v) - n))` reads `n, v` from the assignment and `h`
+from `H`, so the union bound is over pairs of list members. A helper that is not the
+fraction somewhere on the constrained entries survives `tau'` with probability
+`d / |E|` (a multilinear polynomial in `d` variables); the helper sum and the zero check
+cancel for at most one batching challenge `mu`; a false sum survives the mask challenge
+`rho3` with `1 / |E|` and each round with `4 / |E|` (`LOOKUP_DEGREE`). The values `n(rl)`, `v(rl)` are linear in `Z`
+and join the column sumcheck with two more weights, which is the weight row of
+Theorem 1 (a linear identity per list member, whatever the number of weights). `h(rl)`,
+`g3(rl)` and `G3` are three linear claims on `H` batched by `lambda'`: a quadratic
+identity per member of the helper list, `2 l_0' / |E|`, below the row above.
+
+*State function* [ours]. After the helper root the state is the list of pairs of list
+members of the two batches, at most `l_0 l_0'`; a transcript is doomed when no pair is
+consistent with every claim. A round on a claim about `Z` alone can revive only through
+a list member of `Z`, hence `l_0` in the first two rows and in Theorem 1.
+
+*Not used.* `logup-gkr-2023-1284` replaces the committed helpers by a GKR fractional
+sumcheck; the module comment of protocol.rs says why this protocol does not. Its
+Proposition 2 has the same first term.
+
+*Against the module comment of protocol.rs*, which states looser forms of the three
+rows: `(w - 1) L T` for `gamma`, `L + 2 T + 1` for `alpha` and `max(d, 5)` for the
+sumcheck, and puts `l_0 l_0'` on the weight row. The forms above are what is derived
+here and what the calculator uses. The differences are a fraction of a bit except for
+`gamma`, and all favour the forms above.
 
 ## 3. Batching proximity loss
 
@@ -445,8 +550,76 @@ different relation tag. For the verifier's side:
 - The size model of `bounds.rs` covers single-root proofs. A split proof adds, per extra
   committer, the Stage-0 part: `q_0 (16 + 40 * 2^{s_0})` bytes and one multiproof.
 
+- A split proof of a relation with lookups has one helper root and one helper Stage-0
+  opening per committer (`SplitLookupProof`); the three points above apply to the helper
+  batch with section 4.6 in place of Theorem 4. `protocol::max_proof_bytes` and
+  `max_split_proof_bytes` bound the encodings of both kinds of proof, with or without
+  lookups, exactly up to shared authentication siblings.
+
 Privacy of the committers against each other is the collaborative protocol's own
 property (`crates/migrate/SECURITY.md`) and is not analysed here.
+
+### 4.6 The helper batch of a relation with lookups
+
+What the verifier sees besides section 4.1: the helper root; `G3`, the lookup rounds and
+`(n, v, h)(rl)`; `sigma'_0..sigma'_3`; from WHIR on `U'` the messages of item 3; and at
+the `q_0'` queried Stage-0 fibers of the helper tree every symbol of `H` and of the
+`C'_j`, the leaf salt and the siblings. The multiplicities are assignment variables and
+are seen as little as any other variable. The numbers of lookups and of table rows, and
+the tables, are part of the relation.
+
+**Blinders against opened symbols.** `H` holds `4 * 2^d` limb cells, `32 d` mask cells
+(four limbs of five coefficients in eight cells, per round), zeros, and
+`b' = q_0' 2^{s_0'}` uniform cells at the top, where `q_0'` and `s_0'` are those of the
+helper table's own schedule (`LookupLayout::new`). The opened symbols of `H` number
+exactly `b'`: 8,256 for a helper table of `2^20` cells and 16,512 for `2^24` under
+tag 4. `K'` reads limb and mask cells only. So Lemma 4.1 applies to `H` as it stands.
+`SecurityReport::lookup` carries the count (`LookupBound::zk`);
+`protocol::tests::lookup_layout_reserves_a_blinder_for_every_opened_stage0_symbol` and
+`bounds::tests::lookup_layout_matches_the_protocol` compare it with a real proof, and
+`lookup_reports_are_pinned` asserts equality at the sizes of section 5.4. As for `Z`,
+there is no slack.
+
+**Theorem 4 with lookups [ours].** The oracle proof is perfect honest-verifier zero
+knowledge conditioned on three public events: `mask_rows_full_rank(rx)`,
+`lookup_masks_full_rank(rl)`, and `alpha` not being a compressed table row or the
+padding value. The prover aborts outside them (`MaskRankDeficient`). The third event is
+public because the prover holds a satisfying assignment, whose looked-up tuples are table
+rows: the set `alpha` must avoid is a function of the relation and `gamma`.
+
+*Simulator.* In front of step 1 of section 4.3: sample `G3` uniformly, each lookup round
+uniformly among degree-4 polynomials consistent with the running claim (which starts at
+`rho3 G3`), and `(n, v, h)(rl)` uniformly in `E^3`. The column claim of step 1 uses the
+sampled `n(rl)`, `v(rl)`. After step 4: compute the value `V'` of `K'`, pick any
+base-field `H'` with `<H', K'> = V'` and uniform top `b'` cells, sample `C'_j`, and run
+steps 3 and 4 on the helper batch with `beta'`.
+
+*Why it is exact.*
+
+- *Lookup sumcheck.* `g3` is separable with uniform coefficients of degree 4
+  (`Mask::sample`), `rho3 != 0`: the argument for the row sumcheck with `d` rounds.
+  Only `G3` and `g3(rl)` enter `K'`.
+- *Revealed values.* The four masking entries have `sel = 0`, so they are in no claim.
+  Each has a numerator variable and a value variable of `Z` used nowhere else, and an
+  `E`-valued helper cell. They add `k sum_j e_j x_j` to each of `n(rl)`, `v(rl)`,
+  `h(rl)`, where `k` is the corner weight of the four entries and `e_j` their weights in
+  the two low variables: an `F_p`-basis of `E` and `k != 0` exactly when
+  `lookup_masks_full_rank` holds. So the triple is uniform in `E^3`
+  (`masking_entries_make_the_revealed_lookup_values_witness_independent`).
+- *The helper blend, the opened symbols of `H` and the rest of WHIR*: as for `Z`, with
+  `beta'`, Lemma 4.1 for `b'` and `U'`.
+- *`H'` exists.* Changing the constant, the linear and the quadratic coefficient of `g3`
+  in the first variable by `delta` changes `<H, K'>` by `delta (2^d + lambda')`,
+  `delta (2^{d-1} + lambda' rl_0)` and `delta (2^{d-1} + lambda' rl_0^2)`, which cannot
+  all vanish.
+
+The Lean statements cover the three ingredients for one batch; their use for the second
+batch and the masking entries are [ours], as for the first.
+
+**Hiding of unopened leaves.** The helper tree's Stage-0 leaves carry their own 128-bit
+salts from a second `salt_seed` of the coin stream. Section 4.4 holds with `P` counting
+salted trees, two per proof: one bit less classically, half a bit less against quantum
+queries.
 
 ## 5. Numbers
 
@@ -516,6 +689,44 @@ The public paths reveal the assignment and claim no zero knowledge (section 9.1)
 `is_accepted_aggregate_profile()` therefore accepts profiles that are equivalent today:
 127 bits classical, 81 bits QROM. Acceptance does not need to change. Its documentation
 does (R5).
+
+### 5.4 Relations with lookups
+
+Lookups into the 8-bit range table (`T = 256`, `w = 2`), from
+`bounds::tests::lookup_reports_are_pinned` and the table printer. "Helper" marks a round
+of the helper batch. The lookup column is the weakest row of Theorem 5 without grinding.
+
+| Tags | Rows | Lookups | Helper cells | rbr, classical (round) | rbr, no grinding (round) | Lookup rounds | QROM level: digest / round term | QROM error at `t = 2^40`, `2^64` | Proof bytes (bound) |
+| --- | ---: | ---: | ---: | --- | --- | ---: | --- | --- | ---: |
+| 4, 9 | 2^17 | 2^16 | 2^20 | 194.9 (helper blend) | 194.9 (helper blend) | 238.4 | **81.1** / 93.3 | 2^-105.6, 2^-50.3 | 1,088,951 |
+| 4, 9 | 2^20 | 2^16 | 2^20 | 192.9 (blend) | 192.9 (blend) | 238.4 | **81.1** / 92.3 | 2^-103.6, 2^-50.3 | 1,457,215 |
+| 4, 9 | 2^20 | 2^20 | 2^24 | 186.9 (helper blend) | 186.9 (helper blend) | 234.4 | **81.1** / 89.3 | 2^-97.6, 2^-49.6 | 1,879,184 |
+| 4, 9 | 2^22 | 2^20 | 2^24 | 186.9 (helper blend) | 186.9 (helper blend) | 234.4 | **81.1** / 89.3 | 2^-97.6, 2^-49.6 | 1,949,497 |
+| 5, 7, 10 | 2^17 | 2^16 | 2^20 | 189.4 (helper Stage-0 queries) | 184.8 (helper blend) | 236.7 | **81.1** / 88.2 | 2^-95.5, 2^-47.5 | 879,415 |
+| 5, 7, 10 | 2^20 | 2^16 | 2^20 | 188.4 (blend) | 183.5 (Stage-0 queries) | 237.0 | **81.1** / 87.6 | 2^-94.2, 2^-46.2 | 1,169,471 |
+| 5, 7, 10 | 2^20 | 2^20 | 2^24 | 182.7 (helper Stage-0 queries) | 179.2 (helper blend) | 233.0 | **81.1** / 85.4 | 2^-89.9, 2^-41.9 | 1,501,904 |
+| 5, 7, 10 | 2^22 | 2^20 | 2^24 | 182.7 (helper Stage-0 queries) | 179.2 (helper blend) | 233.2 | **81.1** / 85.4 | 2^-89.9, 2^-41.9 | 1,558,073 |
+| 6, 8 | 2^17 | 2^16 | 2^20 | 188.7 (helper blend) | 188.7 (helper blend) | 237.2 | **81.1** / 90.2 | 2^-99.3, 2^-50.3 | 937,271 |
+| 6, 8 | 2^20 | 2^16 | 2^20 | 186.7 (blend) | 186.7 (blend) | 237.4 | **81.1** / 89.2 | 2^-97.3, 2^-49.3 | 1,246,847 |
+| 6, 8 | 2^20 | 2^20 | 2^24 | 182.4 (helper blend) | 182.4 (helper blend) | 233.4 | **81.1** / 87.0 | 2^-93.0, 2^-45.0 | 1,602,576 |
+| 6, 8 | 2^22 | 2^20 | 2^24 | 182.4 (helper blend) | 182.4 (helper blend) | 233.7 | **81.1** / 87.0 | 2^-93.0, 2^-45.0 | 1,663,193 |
+
+Classical level 127.0 in every row. Against section 5.1: the rows of the relation alone
+are unchanged; the report is the weaker of them and of the hiding opening of a table of
+the helper's size, which loses two bits per doubling. A helper table holds four cells per
+fraction, so `2^16` byte lookups cost the rounds of a relation of `2^19` rows and `2^20`
+lookups those of `2^23` rows. The rounds that are specific to lookups have 43 bits or
+more of margin over the weakest round and never bind as implemented.
+
+They do bind once the blend is affine in both batches (R4): every other round is then a
+list size over the field, and the pole of `2^20` lookups, `(2^20 + 512) l_0 / |E|` at
+`l_0 = 66`, is the weakest at 230.0 bits. The QROM round term of R3 + R4 at `2^17` rows
+becomes 110.8 bits instead of 116.3 (`bounds::tests::every_lookup_term_binds_somewhere`, which also
+has parameter sets where `gamma`, and for the classical bound the lookup sumcheck, is
+the weakest round).
+
+Zero knowledge: perfect for the oracle proof; hiding `2 t P / 2^128` classical,
+`2 t sqrt(2 P) / 2^64` quantum.
 
 ## 6. Required parameter changes
 
@@ -644,7 +855,9 @@ runs `logarithms_bracket_the_true_value`,
 `reports_are_pinned_at_the_project_sizes`,
 `no_regime_reaches_its_nominal_level_as_implemented`, `required_changes_are_costed`,
 `proof_size_model_brackets_the_measured_full_shard_proof`,
-`layout_matches_the_protocol` and `coins_do_not_repeat_across_regimes`.
+`layout_matches_the_protocol`, `coins_do_not_repeat_across_regimes`, and for relations
+with lookups `lookup_layout_matches_the_protocol`, `lookup_reports_are_pinned` and
+`every_lookup_term_binds_somewhere`.
 
 ## 9. Inventory of the earlier audit
 

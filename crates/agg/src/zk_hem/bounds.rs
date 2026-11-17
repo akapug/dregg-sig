@@ -23,14 +23,26 @@
 //!   post-quantum state-restoration soundness with error
 //!   `80 (t + k + 1)(w + k) eps_rbr + (t + k + 1) k / 2^r_min`), Theorem 8.3 (Merkle
 //!   commitments, `O(t^3 / 2^sigma)`) and Theorem A.1 / 11.3 (their composition). Proven.
+//! * `[Hab22]` `logup-2022-1530`: Lemma 5 (a sequence is contained in another exactly when
+//!   the fractions `1 / (X + a_i)` and `m_i / (X + b_i)` have equal sums, for sequences
+//!   shorter than the characteristic), Lemma 4 (fractional decompositions are unique),
+//!   Theorem 2 (sumcheck soundness, the sum of the individual degrees over `|F|`) and the
+//!   pole-challenge step (22) of its Protocol 2, `((M + 1) |H| - 1) / (|F| - |H|)`, restated
+//!   as Proposition 2 of `logup-gkr-2023-1284`. Lemmas 4 and 5 are proven; the soundness
+//!   analysis of Protocol 2 is given there as a sketch.
 //!
 //! What is this project's own argument and not a cited theorem: the per-round application of
 //! `[CWYZ26]` Theorem 5.1 to domain-halving folds (one fiber of agreement lost per fold), the
-//! state function of the composed protocol, and the simulator of SECURITY.md section 4.
+//! state function of the composed protocol, the simulator of SECURITY.md section 4, and the
+//! lookup rounds in the form they are implemented ([`LookupTerms`]).
 
 use alloc::vec::Vec;
 
-use super::protocol::{COL_DEGREE, COL_MASK_BITS, COMPANIONS, ROW_DEGREE, ROW_MASK_BITS};
+use super::protocol::{
+    COL_DEGREE, COL_MASK_BITS, COMPANIONS, LOOKUP_DEGREE, LOOKUP_MASK_BITS, ROW_DEGREE,
+    ROW_MASK_BITS,
+};
+use super::relation::{LOOKUP_MASK_ENTRIES, Lookups};
 use crate::pcs::{MAX_PCS_NUM_VARS, WhirSecurityRegime};
 
 /// A lower bound on `-log2` of a probability, in thousandths of a bit.
@@ -242,12 +254,124 @@ impl Params {
 }
 
 /// Size of a relation: [`super::relation::Shape::log_rows`], `log2` of the variable subcube
-/// and the number of public inputs.
+/// (which holds the multiplicity and masking variables of a relation with lookups), the
+/// number of public inputs and the size of its lookups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShapeSize {
     pub log_rows: usize,
     pub var_bits: usize,
     pub num_public: usize,
+    pub lookup: Option<LookupSize>,
+}
+
+/// Size of the lookups of a relation ([`Lookups`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupSize {
+    /// Lookups, `L` ([`Lookups::num_lookups`]).
+    pub lookups: usize,
+    /// Table rows over all tables, `T` ([`Lookups::num_table_rows`]).
+    pub table_rows: usize,
+    /// Columns of a value tuple, the table tag included, `w` ([`Lookups::width`]).
+    pub width: usize,
+}
+
+impl LookupSize {
+    pub fn of(lookups: &Lookups) -> Self {
+        Self {
+            lookups: lookups.num_lookups,
+            table_rows: lookups.num_table_rows,
+            width: lookups.width(),
+        }
+    }
+
+    /// [`Lookups::log_entries`]: the fractions and the masking entries, padded to a power of
+    /// two.
+    pub fn log_entries(&self) -> usize {
+        (self.lookups + self.table_rows + LOOKUP_MASK_ENTRIES)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(2) as usize
+    }
+}
+
+/// `(log_cells, blind_cells)` of [`super::protocol::LookupLayout::new`] under a regime that
+/// [`zk_layout`] accepts.
+///
+/// This is where the characteristic condition of `[Hab22]` Lemma 5 is enforced: a helper
+/// table has `4 * 2^log_entries` cells besides its mask and blinders and at most
+/// `2^MAX_PCS_NUM_VARS` cells in all, so a relation with a layout has
+/// `L + T + 4 <= 2^(MAX_PCS_NUM_VARS - 3) = 2^25` fractions, below the characteristic
+/// `p > 2^63`. A multiplicity is a count of at most `L` lookups, so it is nonzero in `F_p`
+/// whenever it is nonzero as an integer.
+pub fn lookup_layout(regime: WhirSecurityRegime, log_entries: usize) -> Option<(usize, usize)> {
+    const _: () = assert!(1u64 << (MAX_PCS_NUM_VARS - 3) < crate::field::GOLDILOCKS_PRIME);
+    let d = log_entries;
+    if !regime.is_accepted_aggregate_profile() || d + 3 > MAX_PCS_NUM_VARS {
+        return None;
+    }
+    let used = (4usize << d) + ((d * 4) << LOOKUP_MASK_BITS);
+    (d + 3..=MAX_PCS_NUM_VARS).find_map(|log_cells| {
+        let cells = 1usize << log_cells;
+        let st0 = regime.schedule(log_cells).stages[0];
+        let arity = 1usize << st0.step_vars;
+        let blind = st0.num_queries.min(cells * st0.blowup / arity) * arity;
+        (used + blind <= cells).then_some((log_cells, blind))
+    })
+}
+
+/// Round-by-round errors of the lookup rounds of [`super::protocol`] (steps L1 to L3 of its
+/// module comment), as `-log2`, before any credit for grinding. `l0` and `l0'` are the
+/// Stage-0 list sizes of the assignment batch and of the helper batch, `|E| = p^4`.
+///
+/// The statement of a relation with lookups is [`Lookups::holds`]: for every tuple value the
+/// numerators of the fractions with that value add up to zero in `F_p`. With `L < p` that
+/// is set inclusion with the true multiplicities (`[Hab22]` Lemma 5, cited; for tuples with
+/// a table tag by its Section 3.4). The rounds below reduce `holds` to claims on the two
+/// committed batches. They are this project's derivation; the cited statements used in it
+/// are named per term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupTerms {
+    /// `gamma`, the tuple compression `v_i = sum_c gamma^c tuple_(i,c)`:
+    /// `(w - 1)(L + T - 1) l0 / |E|`. Own derivation: fix a member of the assignment list
+    /// and a tuple value whose numerators do not cancel. The compressed fractions can only
+    /// cancel if another of the at most `L + T` distinct tuple values with a nonzero
+    /// numerator is compressed to the same element, and two distinct tuples of `w` columns
+    /// agree on at most `w - 1` values of `gamma`. `[Hab22]` Section 3.4 instead draws one
+    /// challenge per column inside the function field and has no such term.
+    pub compression: MilliBits,
+    /// `alpha`, the pole: `(L + 2 T) l0 / |E|`. After a good `gamma` the sum of the
+    /// fractions is a nonzero rational function with at most `L + T` poles (`[Hab22]`
+    /// Lemma 4, cited), so its numerator has at most `L + T - 1` roots: step (22) of
+    /// `[Hab22]`, `((M + 1) |H| - 1) / (|F| - |H|)`, cited. That step draws the challenge
+    /// outside the table values. Here `alpha` is drawn from all of `E` and the verifier
+    /// does not exclude a pole, so the count has a second part of our own: when `alpha`
+    /// equals the value of a fraction with numerator zero (a table row of multiplicity
+    /// zero, or the padding value), `h (alpha - v) = n` leaves that helper free. Those are
+    /// at most `T + 1` values. A pole of a fraction with a nonzero numerator has no helper.
+    pub poles: MilliBits,
+    /// `tau'`, the batching challenge, `rho3` and each of the `d` rounds of the lookup
+    /// sumcheck: `max(d, LOOKUP_DEGREE) l0 l0' / |E|`. Schwartz-Zippel per pair of list
+    /// members (the summand reads `n`, `v` from the assignment and `h` from the helper
+    /// table): the zero check at `tau'` is multilinear in `d` variables, the batching
+    /// challenge and `rho3` enter linearly, and a round polynomial has degree
+    /// `LOOKUP_DEGREE` (`[Hab22]` Theorem 2 is the sum of these over the rounds). The
+    /// challenge batching the three claims on the helper table is a quadratic identity per
+    /// member of the helper list, `2 l0' / |E|`, and is covered by this term.
+    pub sumcheck: MilliBits,
+}
+
+/// [`LookupTerms`] at the given list sizes.
+pub fn lookup_terms(size: LookupSize, list: u128, helper_list: u128) -> LookupTerms {
+    let (lookups, rows) = (size.lookups as u128, size.table_rows as u128);
+    let bits = |numerator: u128| CHALLENGE_SET_MILLIBITS - log2_hi(numerator.max(1));
+    let degree = size.log_entries().max(LOOKUP_DEGREE) as u128;
+    LookupTerms {
+        compression: bits(
+            (size.width as u128).saturating_sub(1) * (lookups + rows).saturating_sub(1) * list,
+        ),
+        poles: bits((lookups + 2 * rows) * list),
+        sumcheck: bits(degree * list * helper_list),
+    }
 }
 
 /// `(log_cells, blind_cells)` of [`super::protocol::Layout::new`].
@@ -281,6 +405,13 @@ pub enum Round {
     /// Fiber queries of a stage together with the weights that batch the resulting shift
     /// claims and the next stage's out-of-domain claims; preceded by the regime's grinding.
     Query(usize),
+    /// The tuple-compression challenge `gamma` of a relation with lookups.
+    LookupCompression,
+    /// The pole `alpha` of the lookup fractions.
+    LookupPoles,
+    /// Lookup sumcheck: zero-check point, batching and mask challenges, rounds, and the
+    /// batching of the claims on the helper table.
+    LookupSumcheck,
 }
 
 /// Bounds for one WHIR stage.
@@ -425,8 +556,34 @@ pub struct RbrBound {
     pub blend_m: Option<u128>,
     /// Stage-0 agreement threshold in fibers at which the analysis is run.
     pub stage0_agreement: u128,
+    /// Johnson list bound of the Stage-0 word at that threshold.
+    pub stage0_list: u128,
     /// Error of the blend round.
     pub blend_bits: Option<MilliBits>,
+    /// Whether `round` is a round of the helper batch of a relation with lookups (its blend
+    /// or its opening); the four fields above then describe that batch.
+    pub helper: bool,
+}
+
+/// The helper batch of a relation with lookups, and its lookup rounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupBound {
+    pub size: LookupSize,
+    pub log_entries: usize,
+    /// Variables of the helper table and its companions.
+    pub log_cells: usize,
+    /// Stage bounds of the helper opening at the thresholds of [`Self::classical`].
+    pub stages: Vec<StageBound>,
+    /// The helper batch alone, blend and opening, with grinding credited.
+    pub classical: RbrBound,
+    /// The same without any credit for grinding.
+    pub ungrounded: RbrBound,
+    /// The lookup rounds at the list sizes of the classical analysis of both batches.
+    pub classical_terms: LookupTerms,
+    /// The lookup rounds at the list sizes of the analysis without grinding.
+    pub ungrounded_terms: LookupTerms,
+    /// Blinders of the helper table against its opened Stage-0 symbols.
+    pub zk: ZkBound,
 }
 
 /// Zero-knowledge accounting (SECURITY.md section 4).
@@ -445,6 +602,7 @@ pub struct ZkBound {
 impl ZkBound {
     /// Classical ROM: `-log2` of the distance between real and simulated proofs of
     /// `2^log_proofs` statements against `2^log_queries` hash queries, `t P / 2^salt`.
+    /// `P` counts salted Stage-0 trees: a proof for a relation with lookups has two.
     pub fn classical_hiding_bits(&self, log_queries: u32, log_proofs: u32) -> MilliBits {
         1000 * (i64::from(self.salt_bits) - i64::from(log_queries) - i64::from(log_proofs))
     }
@@ -462,10 +620,14 @@ impl ZkBound {
 pub struct SecurityReport {
     pub regime: WhirSecurityRegime,
     pub params: Params,
-    /// Variables of the committed tables.
+    /// Variables of the committed tables (of the assignment batch).
     pub log_cells: usize,
-    /// Stage bounds at the thresholds of [`Self::classical`].
+    /// Stage bounds of the assignment batch at the thresholds of its classical analysis.
     pub stages: Vec<StageBound>,
+    /// The helper batch and the lookup rounds of a relation with lookups. The fields
+    /// `rounds`, `classical`, `ungrounded`, `proof_bytes`, `digests`, `merkle_hashes` and
+    /// `grinding_hashes` cover both batches.
+    pub lookup: Option<LookupBound>,
     /// Verifier rounds `k`.
     pub rounds: usize,
     /// Round-by-round error with grinding credited as a factor `2^-bits` on the rounds it
@@ -554,7 +716,12 @@ fn siblings(queries: usize, log_leaves: usize) -> usize {
     queries * (log_leaves - queries.ilog2() as usize)
 }
 
-/// The report for the committed-mask protocol on a relation of `size`.
+/// The report for the committed-mask protocol on a relation of `size`. With
+/// [`ShapeSize::lookup`] it covers the lookup rounds and the helper batch: the weakest round
+/// is the weakest of the rounds without lookups, of [`LookupTerms`] and of the helper
+/// batch's blend and opening at [`lookup_layout`]'s size, which are the rounds of the
+/// assignment batch's blend and opening at another size. `None` when the relation has no
+/// layout.
 pub fn security_report(
     regime: WhirSecurityRegime,
     size: ShapeSize,
@@ -574,11 +741,77 @@ pub fn security_report(
         salt_bits: params.salt_bits,
     });
     report.proof_bytes += front;
+    if let Some(lookup) = size.lookup {
+        let d = lookup.log_entries();
+        let (helper_cells, helper_blind) = lookup_layout(regime, d)?;
+        let helper = pcs_report(regime, helper_cells, params, None)?;
+        // The weakest of: the rounds without lookups, the lookup rounds, the helper batch.
+        let merge = |main: RbrBound, helper: RbrBound, credit: MilliBits| {
+            let terms = lookup_terms(lookup, main.stage0_list, helper.stage0_list);
+            let mut worst = main;
+            for (bits, round) in [
+                (terms.compression, Round::LookupCompression),
+                (terms.poles, Round::LookupPoles),
+                (terms.sumcheck, Round::LookupSumcheck),
+            ] {
+                if bits + credit < worst.bits {
+                    worst = RbrBound {
+                        bits: bits + credit,
+                        round,
+                        ..main
+                    };
+                }
+            }
+            if helper.bits < worst.bits {
+                worst = RbrBound {
+                    helper: true,
+                    ..helper
+                };
+            }
+            (worst, terms)
+        };
+        let algebraic = 1000 * i64::from(params.algebraic_pow_bits);
+        let (classical, classical_terms) = merge(report.classical, helper.classical, algebraic);
+        let (ungrounded, ungrounded_terms) = merge(report.ungrounded, helper.ungrounded, 0);
+        report.classical = classical;
+        report.ungrounded = ungrounded;
+        // gamma, alpha, tau', the batching challenge, rho3, the rounds, the batching of the
+        // helper claims and the helper blend, in front of the helper opening.
+        let lookup_rounds = 7 + d;
+        report.rounds += lookup_rounds + helper.rounds;
+        report.proof_bytes +=
+            32 * (1 + (LOOKUP_DEGREE + 1) * d + 3 + COMPANIONS) + helper.proof_bytes;
+        report.digests += helper.digests;
+        report.merkle_hashes += helper.merkle_hashes;
+        report.grinding_hashes += helper.grinding_hashes;
+        if params.algebraic_pow_bits != 0 {
+            report.grinding_hashes += (lookup_rounds as u128) << params.algebraic_pow_bits;
+        }
+        let st0 = &helper.stages[0];
+        let opened_symbols = st0.queries.min(st0.fibers as usize) << st0.step_vars;
+        report.lookup = Some(LookupBound {
+            size: lookup,
+            log_entries: d,
+            log_cells: helper_cells,
+            zk: ZkBound {
+                blind_cells: helper_blind,
+                opened_symbols,
+                view_perfectly_simulated: helper_blind >= opened_symbols,
+                salt_bits: params.salt_bits,
+            },
+            stages: helper.stages,
+            classical: helper.classical,
+            ungrounded: helper.ungrounded,
+            classical_terms,
+            ungrounded_terms,
+        });
+    }
     Some(report)
 }
 
 /// The report for an opening of a `log_cells`-variable commitment. With `size`, the rounds of
-/// the committed-mask protocol in front of the opening are included.
+/// the committed-mask protocol in front of the opening are included; [`ShapeSize::lookup`] is
+/// not read here ([`security_report`] adds it).
 pub fn pcs_report(
     regime: WhirSecurityRegime,
     log_cells: usize,
@@ -684,7 +917,9 @@ pub fn pcs_report(
                 round,
                 blend_m: m,
                 stage0_agreement: stages[0].agreement,
+                stage0_list: stages[0].word_list,
                 blend_bits: blend,
+                helper: false,
             };
             (bound, stages)
         };
@@ -763,6 +998,7 @@ pub fn pcs_report(
         params,
         log_cells,
         stages,
+        lookup: None,
         rounds,
         classical,
         ungrounded,
@@ -812,6 +1048,19 @@ mod tests {
             log_rows: rows,
             var_bits: rows,
             num_public: 8,
+            lookup: None,
+        }
+    }
+
+    /// [`square`] with `2^log_lookups` lookups into the byte table.
+    fn with_bytes(rows: usize, log_lookups: usize) -> ShapeSize {
+        ShapeSize {
+            lookup: Some(LookupSize {
+                lookups: 1 << log_lookups,
+                table_rows: 256,
+                width: 2,
+            }),
+            ..square(rows)
         }
     }
 
@@ -1157,6 +1406,7 @@ mod tests {
             log_rows: shape.log_rows,
             var_bits: shape.num_vars.next_power_of_two().trailing_zeros().max(1) as usize,
             num_public: shape.num_public,
+            lookup: None,
         };
         for regime in ZK_REGIMES {
             let layout = Layout::new(&shape, regime).unwrap();
@@ -1168,6 +1418,354 @@ mod tests {
         assert_eq!(
             zk_layout(WhirSecurityRegime::BciksJohnsonClassical128, size),
             None
+        );
+    }
+
+    /// `bytes` range-checked bytes, the first also looked up with its square in a two-column
+    /// table.
+    fn lookup_relation(bytes: usize) -> (crate::zk_hem::relation::Shape, Vec<F>) {
+        let f = F::from_u64_reduced;
+        let mut cs = ConstraintSystem::new();
+        let squares: Vec<F> = (0..20u64).flat_map(|t| [f(t), f(t * t)]).collect();
+        let table = cs.table(2, squares);
+        let vars: Vec<Lc> = (0..bytes)
+            .map(|i| cs.alloc(f(3 + (i as u64 * 131) % 250)).into())
+            .collect();
+        for v in &vars {
+            cs.enforce_byte(v);
+        }
+        let square: Lc = cs.alloc(f(9)).into();
+        cs.enforce_in_table(table, &[vars[0].clone(), square]);
+        cs.finish()
+    }
+
+    #[test]
+    fn lookup_layout_matches_the_protocol() {
+        for bytes in [7usize, 3000] {
+            let (shape, witness) = lookup_relation(bytes);
+            let lookups = shape.lookups().unwrap();
+            let lookup = LookupSize::of(lookups);
+            assert_eq!(
+                lookup,
+                LookupSize {
+                    lookups: bytes + 1,
+                    table_rows: 20 + 256,
+                    width: 3
+                }
+            );
+            assert_eq!(lookup.log_entries(), lookups.log_entries);
+            let size = ShapeSize {
+                log_rows: shape.log_rows,
+                var_bits: shape.num_vars.next_power_of_two().trailing_zeros().max(1) as usize,
+                num_public: shape.num_public,
+                lookup: Some(lookup),
+            };
+            for regime in ZK_REGIMES {
+                let layout = Layout::new(&shape, regime).unwrap();
+                let ll = layout.lookup.as_ref().unwrap();
+                assert_eq!(
+                    lookup_layout(regime, lookups.log_entries),
+                    Some((ll.log_cells, ll.blind_cells))
+                );
+                assert_eq!(
+                    zk_layout(regime, size),
+                    Some((layout.log_cells, layout.blind_cells))
+                );
+            }
+            // The report against a real proof: opened helper symbols, blinders and bytes.
+            let regime = WhirSecurityRegime::BciksJohnsonQrom128;
+            let report = security_report(regime, size, Params::IMPLEMENTED).unwrap();
+            let helper = report.lookup.as_ref().unwrap();
+            let proof = prove(&shape, witness, b"s", regime, &[4; 32]).unwrap();
+            let opened = proof.lookup.as_ref().unwrap().opening.round0_vals.len() / TABLES;
+            assert_eq!(opened, helper.zk.opened_symbols);
+            assert_eq!(helper.zk.blind_cells, opened);
+            assert!(helper.zk.view_perfectly_simulated);
+            let len = proof.to_bytes().len();
+            assert!(
+                len <= report.proof_bytes && report.proof_bytes <= len * 106 / 100,
+                "{len} against {}",
+                report.proof_bytes
+            );
+        }
+        // The characteristic condition: no layout holds `2^26` fractions, and `2^25 < p`.
+        let regime = WhirSecurityRegime::BciksJohnsonQrom128;
+        assert!(lookup_layout(regime, 25).is_some());
+        assert_eq!(lookup_layout(regime, 26), None);
+        let most = LookupSize {
+            lookups: (1 << 25) - 4 - 256,
+            table_rows: 256,
+            width: 2,
+        };
+        assert_eq!(most.log_entries(), 25);
+        assert_eq!(
+            lookup_layout(WhirSecurityRegime::BciksJohnsonClassical128, 9),
+            None
+        );
+    }
+
+    /// The numbers of SECURITY.md, section 5.4.
+    #[test]
+    fn lookup_reports_are_pinned() {
+        use WhirSecurityRegime as R;
+        // (regime, rows, log2 lookups): entries, helper cells, classical RBR with its round
+        // and whether it is a helper round, the same without grinding, rounds, proof bytes.
+        let pins = [
+            (
+                (R::BciksJohnsonQrom128, 17, 16),
+                (
+                    17,
+                    20,
+                    (194_919, Round::Blend, true),
+                    (194_919, Round::Blend, true),
+                    126,
+                    1_088_951,
+                ),
+            ),
+            (
+                (R::BciksJohnsonQrom128, 20, 16),
+                (
+                    17,
+                    20,
+                    (192_919, Round::Blend, false),
+                    (192_919, Round::Blend, false),
+                    134,
+                    1_457_215,
+                ),
+            ),
+            (
+                (R::BciksJohnsonQrom128, 20, 20),
+                (
+                    21,
+                    24,
+                    (186_919, Round::Blend, true),
+                    (186_919, Round::Blend, true),
+                    148,
+                    1_879_184,
+                ),
+            ),
+            (
+                (R::Cdhz25JohnsonQrom128, 20, 16),
+                (
+                    17,
+                    20,
+                    (188_355, Round::Blend, false),
+                    (183_499, Round::Query(0), false),
+                    134,
+                    1_169_471,
+                ),
+            ),
+            (
+                (R::Cdhz25JohnsonQrom128, 20, 20),
+                (
+                    21,
+                    24,
+                    (182_692, Round::Query(0), true),
+                    (179_226, Round::Blend, true),
+                    148,
+                    1_501_904,
+                ),
+            ),
+            (
+                (R::Poseidon2Cdhz25ZeroPowQrom128, 20, 20),
+                (
+                    21,
+                    24,
+                    (182_355, Round::Blend, true),
+                    (182_355, Round::Blend, true),
+                    148,
+                    1_602_576,
+                ),
+            ),
+        ];
+        for ((regime, rows, log_lookups), want) in pins {
+            let size = with_bytes(rows, log_lookups);
+            let r = security_report(regime, size, Params::IMPLEMENTED).unwrap();
+            let lk = r.lookup.as_ref().unwrap();
+            let rbr = |b: &RbrBound| (b.bits, b.round, b.helper);
+            let got = (
+                lk.log_entries,
+                lk.log_cells,
+                rbr(&r.classical),
+                rbr(&r.ungrounded),
+                r.rounds,
+                r.proof_bytes,
+            );
+            assert_eq!(got, want, "{regime:?} {rows} {log_lookups}");
+
+            // The helper batch is the hiding opening of a table of its size, and the report
+            // is the weakest of it and of the same relation without lookups.
+            let plain = security_report(regime, square(rows), Params::IMPLEMENTED).unwrap();
+            let alone = pcs_report(regime, lk.log_cells, Params::IMPLEMENTED, None).unwrap();
+            assert_eq!(
+                (lk.classical, lk.ungrounded),
+                (alone.classical, alone.ungrounded)
+            );
+            assert_eq!(
+                r.classical.bits,
+                plain.classical.bits.min(alone.classical.bits)
+            );
+            assert_eq!(
+                r.ungrounded.bits,
+                plain.ungrounded.bits.min(alone.ungrounded.bits)
+            );
+            assert_eq!(r.stages, plain.stages);
+            assert_eq!(r.zk, plain.zk);
+            assert!(lk.zk.view_perfectly_simulated && lk.zk.blind_cells == lk.zk.opened_symbols);
+            // The lookup rounds have more than 30 bits of margin over the blend, and the
+            // levels are those of a relation without lookups: digest-bound.
+            let terms = [lk.classical_terms, lk.ungrounded_terms];
+            for t in terms {
+                let least = t.compression.min(t.poles).min(t.sumcheck);
+                assert!((230_000..250_000).contains(&least), "{t:?}");
+                assert!(least > r.ungrounded.bits + 30_000);
+            }
+            assert!((126_999..=127_000).contains(&r.classical_work_bits()));
+            assert_eq!(r.qrom_work_bits(), 81_112);
+            assert!(r.qrom_work_terms().0 <= plain.qrom_work_terms().0);
+        }
+        let r = security_report(
+            R::BciksJohnsonQrom128,
+            with_bytes(20, 20),
+            Params::IMPLEMENTED,
+        )
+        .unwrap();
+        let lk = r.lookup.as_ref().unwrap();
+        assert_eq!(
+            lk.classical_terms,
+            LookupTerms {
+                compression: 234_411,
+                poles: 234_411,
+                sumcheck: 248_434
+            }
+        );
+        assert_eq!((r.classical.stage0_list, lk.classical.stage0_list), (3, 3));
+        assert_eq!(r.qrom_work_terms(), (89_287, 81_112));
+        assert_eq!(
+            (r.qrom_error_bits(40), r.qrom_error_bits(64)),
+            (97_574, 49_574)
+        );
+        // A relation without a helper layout has no report.
+        let too_many = ShapeSize {
+            lookup: Some(LookupSize {
+                lookups: 1 << 25,
+                table_rows: 256,
+                width: 2,
+            }),
+            ..square(20)
+        };
+        assert_eq!(
+            security_report(R::BciksJohnsonQrom128, too_many, Params::IMPLEMENTED),
+            None
+        );
+    }
+
+    /// Each lookup term, and the helper batch, is the weakest round of some parameter set
+    /// (the lookup sumcheck of the classical bound only): dropping any of them from
+    /// `security_report` changes a number below.
+    #[test]
+    fn every_lookup_term_binds_somewhere() {
+        let regime = WhirSecurityRegime::BciksJohnsonQrom128;
+        let sized = |lookups: usize, table_rows: usize, width: usize| ShapeSize {
+            lookup: Some(LookupSize {
+                lookups,
+                table_rows,
+                width,
+            }),
+            ..square(17)
+        };
+        // The formulas at list sizes one.
+        let terms = lookup_terms(sized(1 << 20, 256, 2).lookup.unwrap(), 1, 1);
+        assert_eq!(
+            terms.compression,
+            CHALLENGE_SET_MILLIBITS - log2_hi((1 << 20) + 255)
+        );
+        assert_eq!(
+            terms.poles,
+            CHALLENGE_SET_MILLIBITS - log2_hi((1 << 20) + 512)
+        );
+        assert_eq!(terms.sumcheck, CHALLENGE_SET_MILLIBITS - log2_hi(21));
+        let wide = lookup_terms(sized(1 << 20, 256, 5).lookup.unwrap(), 3, 7);
+        assert_eq!(
+            wide.compression,
+            CHALLENGE_SET_MILLIBITS - log2_hi(4 * ((1 << 20) + 255) * 3)
+        );
+        assert_eq!(
+            wide.poles,
+            CHALLENGE_SET_MILLIBITS - log2_hi(((1 << 20) + 512) * 3)
+        );
+        assert_eq!(wide.sumcheck, CHALLENGE_SET_MILLIBITS - log2_hi(21 * 3 * 7));
+        // Fewer entries than the degree of a round: the degree counts.
+        let small = lookup_terms(sized(1, 2, 2).lookup.unwrap(), 1, 1);
+        assert_eq!(
+            small.sumcheck,
+            CHALLENGE_SET_MILLIBITS - log2_hi(LOOKUP_DEGREE as u128)
+        );
+
+        // As implemented, the helper batch binds whenever its table is the larger one.
+        let plain = security_report(regime, square(17), Params::IMPLEMENTED).unwrap();
+        let r = security_report(regime, with_bytes(17, 20), Params::IMPLEMENTED).unwrap();
+        assert_eq!(plain.classical.bits, 198_919);
+        assert_eq!(
+            (r.classical.bits, r.classical.round, r.classical.helper),
+            (186_919, Round::Blend, true)
+        );
+        assert_eq!(r.qrom_work_terms(), (89_287, 81_112));
+
+        // With an affine blend (R4) every round is a list size over the field and the
+        // lookup rounds are the weakest.
+        let cascade = Params {
+            blend: Blend::AffineCascade,
+            ..Params::IMPLEMENTED
+        };
+        let plain = security_report(regime, square(17), cascade).unwrap();
+        for (size, classical, ungrounded) in [
+            (
+                with_bytes(17, 20),
+                (229_951, Round::LookupPoles),
+                (229_951, Round::LookupPoles),
+            ),
+            (
+                sized(1 << 20, 1 << 16, 5),
+                (227_865, Round::LookupCompression),
+                (227_865, Round::LookupCompression),
+            ),
+            (
+                sized(1, 2, 2),
+                (243_865, Round::LookupSumcheck),
+                // Without grinding the assignment batch's shift batching is weaker.
+                (241_043, Round::Query(0)),
+            ),
+        ] {
+            let r = security_report(regime, size, cascade).unwrap();
+            assert!(!r.classical.helper && !r.ungrounded.helper);
+            assert_eq!((r.classical.bits, r.classical.round), classical, "{size:?}");
+            assert_eq!(
+                (r.ungrounded.bits, r.ungrounded.round),
+                ungrounded,
+                "{size:?}"
+            );
+            assert!(r.classical.bits < plain.classical.bits);
+        }
+        // With R3 and R4 the pole of `2^20` lookups, not the shift batching, sets the QROM
+        // round term at `2^17` rows: 110.8 bits instead of 116.3.
+        let r = security_report(regime, with_bytes(17, 20), cascade).unwrap();
+        assert_eq!(
+            (plain.qrom_work_terms().0, r.qrom_work_terms().0),
+            (116_349, 110_803)
+        );
+        // Grinding in front of the algebraic challenges is credited to the lookup rounds.
+        let ground = Params {
+            algebraic_pow_bits: 24,
+            ..cascade
+        };
+        let r = security_report(regime, with_bytes(17, 20), ground).unwrap();
+        let lk = r.lookup.as_ref().unwrap();
+        assert_eq!(lk.classical_terms.poles, 229_951);
+        assert!(r.classical.bits > 229_951 + 10_000);
+        assert_eq!(
+            (r.ungrounded.bits, r.ungrounded.round),
+            (229_951, Round::LookupPoles)
         );
     }
 
@@ -1252,6 +1850,62 @@ mod tests {
                     );
                 }
             }
+        }
+        let cascade = Params {
+            blend: Blend::AffineCascade,
+            ..Params::IMPLEMENTED
+        };
+        let wide = |lookups: usize, table_rows: usize, width: usize, rows: usize| ShapeSize {
+            lookup: Some(LookupSize {
+                lookups,
+                table_rows,
+                width,
+            }),
+            ..square(rows)
+        };
+        let lookup_cases = ZK_REGIMES
+            .into_iter()
+            .flat_map(|regime| {
+                [(17, 16), (20, 16), (17, 20), (20, 20), (22, 20)]
+                    .map(|(rows, lk)| (regime, with_bytes(rows, lk), Params::IMPLEMENTED))
+            })
+            .chain([
+                (ZK_REGIMES[0], with_bytes(17, 20), cascade),
+                (ZK_REGIMES[0], wide(1 << 20, 1 << 16, 5, 17), cascade),
+                (ZK_REGIMES[0], wide(8, 276, 3, 17), cascade),
+            ]);
+        for (regime, size, params) in lookup_cases {
+            let r = security_report(regime, size, params).unwrap();
+            let lk = r.lookup.as_ref().unwrap();
+            row(
+                &r,
+                &alloc::format!(
+                    "lookup rows 2^{} {:?} {:?} helper-binds {}/{}",
+                    size.log_rows,
+                    lk.size,
+                    params.blend,
+                    r.classical.helper,
+                    r.ungrounded.helper
+                ),
+            );
+            std::println!(
+                "    entries 2^{} helper cells 2^{} | helper classical {} {:?} m {:?} l0' {} | helper no-grind {} {:?} m {:?} l0' {} | l0 {} / {} | terms classical {:?} no-grind {:?} | zk {:?}",
+                lk.log_entries,
+                lk.log_cells,
+                lk.classical.bits,
+                lk.classical.round,
+                lk.classical.blend_m,
+                lk.classical.stage0_list,
+                lk.ungrounded.bits,
+                lk.ungrounded.round,
+                lk.ungrounded.blend_m,
+                lk.ungrounded.stage0_list,
+                r.stages[0].word_list,
+                r.ungrounded.stage0_list,
+                lk.classical_terms,
+                lk.ungrounded_terms,
+                lk.zk,
+            );
         }
         for regime in WhirSecurityRegime::ALL {
             for log_cells in [18, 21, 23] {

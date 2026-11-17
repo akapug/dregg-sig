@@ -2374,7 +2374,7 @@ pub trait PolicyAuthenticatedOt {
     ) -> Result<Vec<u128>, PolicyViolation>;
 }
 
-/// Production adapter using the interactive KOS check and committed Ring-LWE base OT.
+/// Production adapter using the interactive OT-extension consistency check and committed Ring-LWE base OT.
 /// The two directions run one after the other, never concurrently: for every chunk of at
 /// most 65,536 choices the party with the lower ID sends its pairs and then receives, and
 /// the party with the higher ID receives and then sends. The opposite orders at the two

@@ -948,7 +948,7 @@ impl Drop for OneTimeVole128Mask {
 }
 
 /// Generate a 1-element $\mathbb{F}_{2^{128}}$ VOLE mask `mac_R ^ key_S == x_R * alpha_S` via
-/// 256 active-secure KOS OTs compressed through `[I_128 | R_{128x128}]` Leftover-Hash combiner.
+/// 256 active-secure extended OTs compressed through `[I_128 | R_{128x128}]` Leftover-Hash combiner.
 /// Each check repetition `rep` runs its own 256 OTs and its own combiner coin.
 fn run_lhl_vole128_mask(
     session_id: &[u8; 32],
@@ -2525,7 +2525,7 @@ fn setup_dense_pcg_seeds_inner(
         }
     }
 
-    // For `n >= 3`, use authenticated KOS/MASCOT multiplication with batch sacrifice so multi-party
+    // For `n >= 3`, use authenticated OT-extension/MASCOT multiplication with batch sacrifice so multi-party
     // `(\bigoplus a_p) & (\bigoplus b_p) == \bigoplus c_p` holds with 0 cleartext leakage (`0` bytes for `n == 2`!).
     let c_fixes = if n >= 3 {
         compute_multiparty_beaver_c_fixes(&directed, ot_mesh, party_rngs)?
@@ -2687,7 +2687,7 @@ fn run_directed_spcot_setup(
     wipe_u64s(&mut choice_words);
 
     // 2. Sender expands its 64 full GGM trees (`4-way Keccak`), encrypts `(R_xor, L_xor)` under
-    // KOS OT pads, and forms `corr_offsets[j] = leaf_xor_sum[j] ^ alpha_sender`.
+    // extended-OT pads, and forms `corr_offsets[j] = leaf_xor_sum[j] ^ alpha_sender`.
     let sender_master_seed = SecretBuffer(party_rngs[sender_id].next_bytes32());
     let roots = SecretBuffer(derive_sender_tree_roots(
         session_id,
