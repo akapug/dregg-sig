@@ -3876,6 +3876,7 @@ fn passphrase_biscuit_authority_survives_multiple_anchored_mints() {
         let token = dir.path(&format!("token-{mint}"));
         let step = dir.path(&format!("step-{mint}"));
         let sealed = dir.path(&format!("sealed-{mint}"));
+        let seal_store = dir.path(&format!("seal-store-{mint}"));
         let args = [
             "policy",
             "biscuit",
@@ -3966,6 +3967,9 @@ fn passphrase_biscuit_authority_survives_multiple_anchored_mints() {
                 &audience,
                 "--resource-hex",
                 &resource,
+                "--seal-store",
+                &seal_store,
+                "--create-seal-store",
             ],
             0,
         );

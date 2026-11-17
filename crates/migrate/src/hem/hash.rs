@@ -701,7 +701,7 @@ impl Sha2 {
         }
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state.clone();
-        for t in 0..self.rounds {
+        for (t, wt) in w.iter().enumerate() {
             let s1 = self.sigma(cs, &e, self.big1, false);
             let choose = bitwise3(cs, &e, &f, &g, ch);
             let s0 = self.sigma(cs, &a, self.big0, false);
@@ -712,10 +712,10 @@ impl Sha2 {
                 // they are never decomposed on their own.
                 let out_a = add_mod(
                     cs,
-                    &[&state[0], &h, &s1, &choose, &k, &w[t], &s0, &major],
+                    &[&state[0], &h, &s1, &choose, &k, wt, &s0, &major],
                     &[],
                 );
-                let out_e = add_mod(cs, &[&state[4], &d, &h, &s1, &choose, &k, &w[t]], &[]);
+                let out_e = add_mod(cs, &[&state[4], &d, &h, &s1, &choose, &k, wt], &[]);
                 return [
                     out_a,
                     add_mod(cs, &[&state[1], &a], &[]),
@@ -727,7 +727,7 @@ impl Sha2 {
                     add_mod(cs, &[&state[7], &g], &[]),
                 ];
             }
-            let new_e = add_mod(cs, &[&d, &h, &s1, &choose, &k, &w[t]], &[]);
+            let new_e = add_mod(cs, &[&d, &h, &s1, &choose, &k, wt], &[]);
             // `T1 + T2 = new_e - d + T2`: four addends instead of seven.
             let new_a = add_mod(cs, &[&new_e, &s0, &major], &[&d]);
             h = g;
@@ -742,17 +742,29 @@ impl Sha2 {
         unreachable!("the last round returns")
     }
 
-    fn hash(&self, cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
+    /// The hash of `prefix || message`, where `state` is the chaining value after the
+    /// `absorbed` prefix bytes (a whole number of blocks).
+    fn hash_from(
+        &self,
+        cs: &mut ConstraintSystem,
+        mut state: [Word; 8],
+        absorbed: usize,
+        message: &[Lc],
+    ) -> Vec<Lc> {
         let wbytes = self.width / 8;
-        let bit_len = (message.len() as u128).to_be_bytes();
+        assert!(absorbed % (16 * wbytes) == 0, "prefix of whole blocks");
+        let bit_len = ((8 * absorbed + message.len()) as u128).to_be_bytes();
         let padded = md_pad(message, 16 * wbytes, 0x80, &bit_len[16 - 2 * wbytes..]);
         let words = be_words(&padded, wbytes);
-        let mut state = self.iv();
         for block in words.chunks(16) {
             let block: &[Word; 16] = block.try_into().expect("padded to whole blocks");
             state = self.compress(cs, &state, block);
         }
         be_bits(&state)
+    }
+
+    fn hash(&self, cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
+        self.hash_from(cs, self.iv(), 0, message)
     }
 }
 
@@ -773,6 +785,30 @@ pub fn sha256_compress(
 /// SHA-256 of a byte string; 256 output bits.
 pub fn sha256(cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
     SHA256.hash(cs, message)
+}
+
+/// The SHA-256 chaining value after `prefix`, a whole number of 64-byte blocks.
+pub fn sha256_midstate(prefix: &[u8]) -> [u32; 8] {
+    assert!(prefix.len() % 64 == 0, "prefix of whole blocks");
+    // On constants every gadget folds, so this adds no row and reads no assignment.
+    let mut cs = ConstraintSystem::new();
+    let mut state = SHA256.iv();
+    for block in be_words(&const_bits(prefix), 4).chunks(16) {
+        let block: &[Word; 16] = block.try_into().expect("whole blocks");
+        state = SHA256.compress(&mut cs, &state, block);
+    }
+    state.map(|word| word.const_value().expect("constants fold") as u32)
+}
+
+/// SHA-256 of `prefix || message` given the chaining value `midstate` after the
+/// `absorbed` bytes of `prefix` (see [`sha256_midstate`]); 256 output bits.
+pub fn sha256_from_midstate(
+    cs: &mut ConstraintSystem,
+    midstate: &[Word; 8],
+    absorbed: usize,
+    message: &[Lc],
+) -> Vec<Lc> {
+    SHA256.hash_from(cs, midstate.clone(), absorbed, message)
 }
 
 /// SHA-512 initial state.
@@ -1242,7 +1278,8 @@ mod tests {
     #[test]
     fn bit_gadgets_match_truth_tables_with_constant_folding() {
         type Gadget = fn(&mut ConstraintSystem, &Lc, &Lc, &Lc) -> Lc;
-        let gadgets: [(&str, Gadget, fn(u64, u64, u64) -> u64); 7] = [
+        type Truth = fn(u64, u64, u64) -> u64;
+        let gadgets: [(&str, Gadget, Truth); 7] = [
             ("xor3", xor3, |a, b, c| a ^ b ^ c),
             ("maj", maj, |a, b, c| (a & b) | (a & c) | (b & c)),
             ("ch", ch, |e, f, g| (e & f) | ((1 ^ e) & g)),
@@ -1484,6 +1521,31 @@ mod tests {
             |cs, i| sha256(cs, &i[0]),
         );
         check_hash(sha256, reference, &[1, 55, 56, 63, 64, 65, 119, 120]);
+    }
+
+    #[test]
+    fn sha256_from_midstate_matches_native() {
+        for (prefix_len, len) in [(64usize, 32usize), (64, 0), (128, 56), (0, 3)] {
+            let (prefix, msg) = (bytes(prefix_len, 41), bytes(len, 42));
+            let mid = sha256_midstate(&prefix);
+            let whole = [prefix.as_slice(), msg.as_slice()].concat();
+            let want = native::sha256(&whole).to_vec();
+            let build = |cs: &mut ConstraintSystem, i: &[Vec<Lc>]| {
+                let state = mid.map(|w| Word::constant(u64::from(w), 32));
+                sha256_from_midstate(cs, &state, prefix_len, &i[0])
+            };
+            check(&[&msg], &want, build);
+            // The same message under another prefix of the same length hashes differently.
+            if prefix_len > 0 {
+                let mut other = prefix.clone();
+                other[prefix_len / 2] ^= 1;
+                assert_ne!(sha256_midstate(&other), mid);
+            }
+        }
+        assert_eq!(
+            sha256_midstate(&[]),
+            sha256_iv().map(|w| w.const_value().unwrap() as u32)
+        );
     }
 
     #[test]
