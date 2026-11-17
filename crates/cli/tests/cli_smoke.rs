@@ -4028,16 +4028,16 @@ fn migrate_every_statement_kind_claims_proves_and_verifies() {
             "bip32-secp256k1",
             &seed,
             Some("m/0'/1"),
-            "legacy_public_key",
-            "03501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c",
+            "legacy_hash160",
+            "bef5a2f9a56a94aab12459f72ad9cf8cf19c7bbe",
         ),
         (
             "bip32",
             "bip32-secp256k1",
             &seed,
             Some("m/0h"),
-            "legacy_public_key",
-            "035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56",
+            "legacy_hash160",
+            "5c1bd648ed23aa5fd50ba52b2457c11e9e80a6a7",
         ),
     ];
     for (index, (kind, canonical, secret, path, member, value)) in cases.into_iter().enumerate() {
@@ -4120,14 +4120,16 @@ fn migrate_every_statement_kind_claims_proves_and_verifies() {
         assert_eq!(json_member(&verified, "valid"), "true");
         assert_eq!(json_member(&verified, member), value, "{kind}");
     }
-    // The two hidden-key statements of one secp256k1 key share its nullifier.
+    // The nullifier is per on-chain credential: the two spellings of the HASH160 kind
+    // agree, and the Ethereum address of the same key has its own.
     let nullifier = |index: usize| {
         json_member(
             &std::fs::read_to_string(dir.path(&format!("claim-{index}.json"))).unwrap(),
             "nullifier",
         )
     };
-    assert_eq!(nullifier(0), nullifier(2));
+    assert_eq!(nullifier(0), nullifier(1));
+    assert_ne!(nullifier(0), nullifier(2));
     assert_ne!(nullifier(0), nullifier(3));
     assert_ne!(nullifier(4), nullifier(5));
 
@@ -4146,7 +4148,7 @@ fn migrate_every_statement_kind_claims_proves_and_verifies() {
     refused(
         &[
             "--kind",
-            "btc-taproot",
+            "btc-p2wsh",
             "--legacy-secret",
             &secp,
             "--target",
@@ -4569,13 +4571,14 @@ fn migrate_registry_records_each_credential_once() {
         );
     }
 
-    // The same key to another target, at another epoch, through another statement kind,
-    // or in another domain: each proof is valid and each is refused with exit code 4.
+    // The same credential to another target, at another epoch or in another domain: each
+    // proof is valid and each is refused with exit code 4. (Another statement kind for the
+    // same credential is refused the same way; `hem::registry` tests that. Another
+    // credential of the same key, such as its Ethereum address, is a separate migration.)
     let domain = "42".repeat(32);
     for (name, kind, target, epoch, extra) in [
         ("retarget.json", "btc-p2wpkh", &other_target, "7", &[][..]),
         ("later.json", "btc-p2wpkh", &target, "8", &[][..]),
-        ("as-eth.json", "eth-eoa", &target, "7", &[][..]),
         (
             "domain.json",
             "btc-p2wpkh",

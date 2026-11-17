@@ -32,9 +32,9 @@ use dregg_sig_migrate::hem::registry::{
     BindingStatus, NullifierRegistry, Receipt, RegisteredBinding, RegistryError, pq_commitment,
 };
 use dregg_sig_migrate::hem::relations::{
-    BIP32_HARDENED, BIP32_SEED_BYTES, ClaimKind, LegacyClaim, MAX_BIP32_DEPTH, OwnershipError,
-    OwnershipProof, OwnershipStatement, OwnershipWitness, ownership_shape, prove_ownership,
-    verify_ownership,
+    Bip32Root, HARDENED as BIP32_HARDENED, KeySource, Lock, MAX_PATH_DEPTH as MAX_BIP32_DEPTH,
+    OwnershipError, OwnershipProof, OwnershipStatement, OwnershipWitness, PathSpec,
+    SEED_BYTES as BIP32_SEED_BYTES, ownership_shape, prove_ownership, verify_ownership,
 };
 
 use crate::anchor::{AnchorConfig, AnchorRequirementError, FsExternalMountAnchor};
@@ -84,102 +84,228 @@ enum SecretForm {
     HexSeed,
 }
 
-/// One statement kind of the command line. To offer a new [`LegacyClaim`] variant, add one
-/// of these to [`KINDS`] and name it in [`kind_of`].
+/// One statement kind of the command line: a lock (how the chain holds the credential)
+/// and a key source (what the secret file holds). To offer another combination, add one
+/// of these to [`KINDS`].
 struct KindSpec {
     name: &'static str,
     aliases: &'static [&'static str],
     summary: &'static str,
     secret: SecretForm,
+    lock: Lock,
+    source: Source,
+    /// The member the on-chain credential renders to.
+    member: &'static str,
+}
+
+/// The key sources the command line offers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The signing key itself (hidden-key mode).
+    Key,
+    /// The RFC 8032 seed of an Ed25519 key.
+    Ed25519Seed,
+    /// A BIP-32 master seed and a public `--path`.
+    Bip32,
+    /// A SLIP-0010 master seed and a public, all-hardened `--path`.
+    Slip10,
+}
+
+impl KindSpec {
     /// Whether the kind takes `--path`.
-    derivation_path: bool,
-    claim: fn(Vec<u32>) -> ClaimKind,
-    /// The witness for secret bytes of the length `secret` admits.
-    witness: fn(&[u8]) -> Option<OwnershipWitness>,
-    /// The public members a claim of this kind renders to.
-    render: fn(&LegacyClaim) -> Vec<(&'static str, Json)>,
-}
-
-fn secp256k1_key(bytes: &[u8]) -> Option<OwnershipWitness> {
-    Some(OwnershipWitness::Secp256k1Key(bytes.try_into().ok()?))
-}
-
-static BTC_HASH160: KindSpec = KindSpec {
-    name: "btc-hash160",
-    aliases: &["btc-p2wpkh", "btc-p2pkh"],
-    summary: "Bitcoin P2WPKH / P2PKH: HASH160 of the compressed public key (hidden key)",
-    secret: SecretForm::Key32,
-    derivation_path: false,
-    claim: |_| ClaimKind::BitcoinHash160,
-    witness: secp256k1_key,
-    render: |claim| match claim {
-        LegacyClaim::BitcoinHash160(hash) => vec![("legacy_hash160", Json::hex(hash))],
-        _ => Vec::new(),
-    },
-};
-
-static ETH_EOA: KindSpec = KindSpec {
-    name: "eth-eoa",
-    aliases: &["ethereum"],
-    summary: "Ethereum externally owned account address (hidden key)",
-    secret: SecretForm::Key32,
-    derivation_path: false,
-    claim: |_| ClaimKind::EthereumAddress,
-    witness: secp256k1_key,
-    render: |claim| match claim {
-        LegacyClaim::EthereumAddress(address) => vec![("legacy_address", Json::hex(address))],
-        _ => Vec::new(),
-    },
-};
-
-static ED25519_SEED: KindSpec = KindSpec {
-    name: "ed25519",
-    aliases: &["ed25519-seed"],
-    summary: "Ed25519 public key, by knowledge of its RFC 8032 seed (revealed key)",
-    secret: SecretForm::Key32,
-    derivation_path: false,
-    claim: |_| ClaimKind::Ed25519Seed,
-    witness: |bytes| Some(OwnershipWitness::Ed25519Seed(bytes.try_into().ok()?)),
-    render: |claim| match claim {
-        LegacyClaim::Ed25519Seed { public_key } => {
-            vec![("legacy_public_key", Json::hex(public_key))]
-        }
-        _ => Vec::new(),
-    },
-};
-
-static BIP32_SECP256K1: KindSpec = KindSpec {
-    name: "bip32-secp256k1",
-    aliases: &["bip32"],
-    summary: "secp256k1 public key at --path of a BIP-32 master seed (revealed key)",
-    secret: SecretForm::HexSeed,
-    derivation_path: true,
-    claim: |path| ClaimKind::Bip32Secp256k1 { path },
-    witness: |bytes| Some(OwnershipWitness::Bip32Seed(bytes.to_vec())),
-    render: |claim| match claim {
-        LegacyClaim::Bip32Secp256k1 {
-            public_key,
-            seed_len,
-            path,
-        } => vec![
-            ("legacy_public_key", Json::hex(public_key)),
-            ("derivation_path", Json::str(format_path(path))),
-            ("seed_bytes", Json::num(seed_len)),
-        ],
-        _ => Vec::new(),
-    },
-};
-
-const KINDS: &[&KindSpec] = &[&BTC_HASH160, &ETH_EOA, &ED25519_SEED, &BIP32_SECP256K1];
-
-/// The table entry of a claim. Exhaustive on purpose.
-fn kind_of(claim: &LegacyClaim) -> &'static KindSpec {
-    match claim {
-        LegacyClaim::BitcoinHash160(_) => &BTC_HASH160,
-        LegacyClaim::EthereumAddress(_) => &ETH_EOA,
-        LegacyClaim::Ed25519Seed { .. } => &ED25519_SEED,
-        LegacyClaim::Bip32Secp256k1 { .. } => &BIP32_SECP256K1,
+    fn derivation_path(&self) -> bool {
+        matches!(self.source, Source::Bip32 | Source::Slip10)
     }
+
+    fn key_source(&self, path: Vec<u32>) -> KeySource {
+        match (self.source, self.lock) {
+            (Source::Key, Lock::BlsWithdrawal) => KeySource::Bls12381Key,
+            (Source::Key, _) => KeySource::Secp256k1Key,
+            (Source::Ed25519Seed, _) => KeySource::Ed25519Seed,
+            (Source::Bip32, _) => KeySource::Bip32 {
+                root: Bip32Root::Seed,
+                path: PathSpec::Public(path),
+            },
+            (Source::Slip10, _) => KeySource::Slip10 {
+                path: PathSpec::Public(path),
+            },
+        }
+    }
+
+    /// The witness for secret bytes of the length `secret` admits.
+    fn witness(&self, bytes: &[u8]) -> Option<OwnershipWitness> {
+        Some(match (self.source, self.lock) {
+            (Source::Key, Lock::BlsWithdrawal) => {
+                OwnershipWitness::bls12_381_key(bytes.try_into().ok()?)
+            }
+            (Source::Key, _) => OwnershipWitness::secp256k1_key(bytes.try_into().ok()?),
+            (Source::Ed25519Seed, _) => OwnershipWitness::ed25519_seed(bytes.try_into().ok()?),
+            (Source::Bip32 | Source::Slip10, _) => OwnershipWitness::seed(bytes),
+        })
+    }
+
+    /// The public members a statement of this kind renders to.
+    fn render(&self, statement: &OwnershipStatement) -> Vec<(&'static str, Json)> {
+        let mut out = vec![(self.member, Json::hex(statement.credential.value()))];
+        if let Some(path) = public_path(&statement.source) {
+            out.push(("derivation_path", Json::str(format_path(path))));
+        }
+        out
+    }
+}
+
+/// The public derivation path of a source, if it has one.
+fn public_path(source: &KeySource) -> Option<&[u32]> {
+    match source {
+        KeySource::Bip32 {
+            path: PathSpec::Public(path),
+            ..
+        }
+        | KeySource::Slip10 {
+            path: PathSpec::Public(path),
+        } => Some(path),
+        _ => None,
+    }
+}
+
+const fn kind(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    summary: &'static str,
+    lock: Lock,
+    source: Source,
+    member: &'static str,
+) -> KindSpec {
+    KindSpec {
+        name,
+        aliases,
+        summary,
+        secret: match source {
+            Source::Key | Source::Ed25519Seed => SecretForm::Key32,
+            Source::Bip32 | Source::Slip10 => SecretForm::HexSeed,
+        },
+        lock,
+        source,
+        member,
+    }
+}
+
+static KIND_TABLE: [KindSpec; 12] = [
+    kind(
+        "btc-hash160",
+        &["btc-p2wpkh", "btc-p2pkh"],
+        "Bitcoin P2WPKH / P2PKH: HASH160 of the compressed public key (hidden key)",
+        Lock::P2pkh,
+        Source::Key,
+        "legacy_hash160",
+    ),
+    kind(
+        "btc-p2pkh-uncompressed",
+        &[],
+        "Bitcoin P2PKH of an uncompressed public key (hidden key)",
+        Lock::P2pkhUncompressed,
+        Source::Key,
+        "legacy_hash160",
+    ),
+    kind(
+        "btc-p2sh-p2wpkh",
+        &[],
+        "Bitcoin P2SH-wrapped P2WPKH script hash (hidden key)",
+        Lock::P2shP2wpkh,
+        Source::Key,
+        "legacy_script_hash",
+    ),
+    kind(
+        "btc-taproot",
+        &[],
+        "Bitcoin Taproot output key without a script tree (hidden internal key)",
+        Lock::TaprootKeyPath,
+        Source::Key,
+        "legacy_output_key",
+    ),
+    kind(
+        "eth-eoa",
+        &["ethereum"],
+        "Ethereum externally owned account address (hidden key)",
+        Lock::Ethereum,
+        Source::Key,
+        "legacy_address",
+    ),
+    kind(
+        "bls-withdrawal",
+        &[],
+        "Ethereum 0x00 withdrawal credential of a BLS12-381 key (hidden key)",
+        Lock::BlsWithdrawal,
+        Source::Key,
+        "legacy_withdrawal_credential",
+    ),
+    kind(
+        "ed25519",
+        &["ed25519-seed"],
+        "Ed25519 public key, by knowledge of its RFC 8032 seed (revealed key)",
+        Lock::Ed25519,
+        Source::Ed25519Seed,
+        "legacy_public_key",
+    ),
+    kind(
+        "slip10-ed25519",
+        &["slip10"],
+        "Ed25519 public key at a hardened --path of a SLIP-0010 master seed (revealed key)",
+        Lock::Ed25519,
+        Source::Slip10,
+        "legacy_public_key",
+    ),
+    kind(
+        "bip32-secp256k1",
+        &["bip32"],
+        "Bitcoin P2WPKH / P2PKH of the key at --path of a BIP-32 master seed (revealed key)",
+        Lock::P2pkh,
+        Source::Bip32,
+        "legacy_hash160",
+    ),
+    kind(
+        "bip32-p2sh-p2wpkh",
+        &[],
+        "Bitcoin P2SH-wrapped P2WPKH of the key at --path of a BIP-32 master seed (revealed key)",
+        Lock::P2shP2wpkh,
+        Source::Bip32,
+        "legacy_script_hash",
+    ),
+    kind(
+        "bip32-taproot",
+        &[],
+        "Bitcoin Taproot output key (no script tree) for the key at --path of a BIP-32 master seed",
+        Lock::TaprootKeyPath,
+        Source::Bip32,
+        "legacy_output_key",
+    ),
+    kind(
+        "bip32-eth",
+        &[],
+        "Ethereum address of the key at --path of a BIP-32 master seed (revealed key)",
+        Lock::Ethereum,
+        Source::Bip32,
+        "legacy_address",
+    ),
+];
+
+const KINDS: &[&KindSpec] = &{
+    let mut out = [&KIND_TABLE[0]; 12];
+    let mut i = 0;
+    while i < 12 {
+        out[i] = &KIND_TABLE[i];
+        i += 1;
+    }
+    out
+};
+
+/// The table entry of a statement; `None` for a combination this command does not offer
+/// (hidden paths, extended-key roots, script trees, BIP32-Ed25519).
+fn kind_of(statement: &OwnershipStatement) -> Option<&'static KindSpec> {
+    KINDS.iter().copied().find(|kind| {
+        let path = public_path(&statement.source).unwrap_or(&[]).to_vec();
+        kind.lock == statement.lock && kind.key_source(path) == statement.source
+    })
 }
 
 fn kind_by_name(name: &str) -> Result<&'static KindSpec, CliError> {
@@ -412,14 +538,15 @@ fn parse_target(text: &str) -> Result<(QsagAddress, String), CliError> {
 /// The members a statement renders to, in file order. `target` is the canonical text of
 /// the address `statement.pq_commitment` commits to.
 fn statement_members(statement: &OwnershipStatement, target: &str) -> Vec<(&'static str, Json)> {
-    let kind = kind_of(&statement.claim);
     let binding = statement.binding();
-    let mut members = vec![("kind", Json::str(kind.name))];
-    members.extend((kind.render)(&statement.claim));
+    let mut members = vec![("kind", Json::str(kind_name(statement)))];
+    if let Some(kind) = kind_of(statement) {
+        members.extend(kind.render(statement));
+    }
     members.extend([
         (
             "key_exposure",
-            Json::str(if statement.claim.key_is_revealed() {
+            Json::str(if statement.key_is_revealed() {
                 "revealed"
             } else {
                 "hidden"
@@ -467,6 +594,9 @@ fn load_statement(json: &Json, format: &str, extra: &[&str]) -> Result<LoadedSta
     let bytes = from_hex(field("statement")?).map_err(|e| e.message)?;
     let statement = OwnershipStatement::from_bytes(&bytes.0)
         .ok_or("statement is not a canonical ownership statement")?;
+    if kind_of(&statement).is_none() {
+        return Err("statement is of a kind this command does not offer".into());
+    }
     let target_text = field("target_pq_address")?.to_owned();
     let target = QsagAddress::decode(&target_text)
         .map_err(|e| format!("invalid target_pq_address: {e:?}"))?;
@@ -513,7 +643,7 @@ const STATEMENT_OPTIONS: &[&str] = &[
 /// The statement and witness the options describe.
 fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBuf), CliError> {
     let kind = kind_by_name(args.require("kind")?)?;
-    let path = match (kind.derivation_path, args.get("path")) {
+    let path = match (kind.derivation_path(), args.get("path")) {
         (true, Some(path)) => parse_path(path)?,
         (true, None) => {
             return Err(CliError::usage(format!(
@@ -533,10 +663,12 @@ fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBu
     let epoch = required_epoch(args)?;
     let domain = parse_domain(args)?;
     let secret = read_legacy_secret(args.require("legacy-secret")?, kind.secret)?;
-    let witness = (kind.witness)(&secret.0)
+    let witness = kind
+        .witness(&secret.0)
         .ok_or_else(|| CliError::input("legacy secret has the wrong length for this kind"))?;
     let statement = OwnershipStatement::derive(
-        &(kind.claim)(path),
+        kind.lock,
+        kind.key_source(path),
         &witness,
         pq_commitment(&target),
         domain,
@@ -559,10 +691,14 @@ fn derive(args: &Args) -> Result<(LoadedStatement, OwnershipWitness, ZeroizingBu
     ))
 }
 
+fn kind_name(statement: &OwnershipStatement) -> &'static str {
+    kind_of(statement).map_or("unsupported", |kind| kind.name)
+}
+
 fn summary(loaded: &LoadedStatement) -> String {
     format!(
         "{} -> {} at epoch {} (nullifier {})",
-        kind_of(&loaded.statement.claim).name,
+        kind_name(&loaded.statement),
         loaded.target_text,
         loaded.statement.epoch,
         to_hex(&loaded.statement.nullifier)
@@ -1459,14 +1595,17 @@ mod tests {
                     SecretForm::Key32 => (1..=32).collect(),
                     SecretForm::HexSeed => (1..=16).collect(),
                 };
-                let path = if kind.derivation_path {
+                let path = if kind.source == Source::Slip10 {
+                    parse_path("m/44'/501'").unwrap()
+                } else if kind.derivation_path() {
                     parse_path("m/44'/0'/0'/0/0").unwrap()
                 } else {
                     Vec::new()
                 };
-                let witness = (kind.witness)(&secret).unwrap();
+                let witness = kind.witness(&secret).unwrap();
                 let statement = OwnershipStatement::derive(
-                    &(kind.claim)(path),
+                    kind.lock,
+                    kind.key_source(path),
                     &witness,
                     pq_commitment(&target()),
                     [9; 32],
@@ -1483,23 +1622,28 @@ mod tests {
         let mut names = Vec::new();
         for (kind, statement, _) in statements() {
             assert!(
-                std::ptr::eq(kind_of(&statement.claim), kind),
+                std::ptr::eq(kind_of(&statement).unwrap(), kind),
                 "{}",
                 kind.name
             );
-            assert!(!(kind.render)(&statement.claim).is_empty(), "{}", kind.name);
+            assert_eq!(kind.render(&statement)[0].0, kind.member, "{}", kind.name);
+            assert_eq!(kind.render(&statement).len(), 1 + usize::from(kind.derivation_path()));
             assert!(std::ptr::eq(kind_by_name(kind.name).unwrap(), kind));
             names.push(kind.name);
             for alias in kind.aliases {
                 assert!(std::ptr::eq(kind_by_name(alias).unwrap(), kind));
                 names.push(alias);
             }
-            // A claim of another kind renders to nothing under this entry.
-            for (other, foreign, _) in statements() {
-                if !std::ptr::eq(other, kind) {
-                    assert!((kind.render)(&foreign.claim).is_empty());
-                }
-            }
+            // No other entry claims this statement.
+            let claimed = KINDS
+                .iter()
+                .filter(|other| {
+                    other.lock == statement.lock
+                        && other.key_source(public_path(&statement.source).unwrap_or(&[]).to_vec())
+                            == statement.source
+                })
+                .count();
+            assert_eq!(claimed, 1, "{}", kind.name);
         }
         let count = names.len();
         names.sort_unstable();
@@ -1509,7 +1653,7 @@ mod tests {
             count,
             "kind names and aliases must be distinct"
         );
-        assert!(kind_by_name("btc-taproot").is_err());
+        assert!(kind_by_name("btc-p2wsh").is_err());
     }
 
     #[test]

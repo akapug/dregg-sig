@@ -25,61 +25,110 @@ verifier that only checks proofs and keeps no state has neither property.
 
 ## Statements
 
-A statement (`OwnershipStatement`) is a legacy claim, a commitment to the target
-address (`registry::pq_commitment`: prefix, version, suite, key kind and key
-commitment), a 32-byte migration domain, an epoch and a nullifier. The claim, the
-nullifier and a SHA-256 chaining value carrying the domain are public inputs of the
-relation. The target commitment and the epoch are not inside the relation; they are
-bound through the proof transcript, which absorbs the whole canonical statement
-encoding and the regime. A proof for one target, domain or epoch does not verify for
-another.
+A statement (`OwnershipStatement`) is a lock, a key source, the on-chain credential, a
+commitment to the target address (`registry::pq_commitment`: prefix, version, suite,
+key kind and key commitment), a 32-byte migration domain, an epoch and a nullifier. The
+credential, the nullifier and a SHA-256 chaining value carrying the domain and the
+credential identifier are public inputs of the relation. The target commitment and the
+epoch are not inside the relation; they are bound through the proof transcript, which
+absorbs the whole canonical statement encoding and the regime. A proof for one target,
+domain or epoch does not verify for another.
 
-| Claim | Witness | Relation | Legacy key |
-| --- | --- | --- | --- |
-| Bitcoin `HASH160` (P2WPKH, P2PKH with a compressed key) | secp256k1 key `k` | `1 <= k < n`, `HASH160(compressed([k]G)) = h` | hidden |
-| Ethereum address | secp256k1 key `k` | `1 <= k < n`, `Keccak256(x \|\| y)[12..] = a` | hidden |
-| Ed25519 public key | RFC 8032 seed | `[clamp(SHA512(seed)[..32])]B = A` | revealed |
-| BIP-32 secp256k1 public key | master seed, 16 to 64 bytes | the key at `m / path` has public key `P`; at most 10 levels | revealed |
+The lock says how the chain derives the credential from a public key:
 
-The nullifier is `SHA256(tag || 00 00 || curve || domain || scalar)` with the signing
-scalar of the legacy key, so one legacy key has one nullifier per domain whichever
-statement migrates it.
+| Lock | Credential |
+| --- | --- |
+| `P2pkh` | `HASH160(compressed key)` (P2PKH, P2WPKH) |
+| `P2pkhUncompressed` | `HASH160(04 \|\| x \|\| y)` |
+| `P2shP2wpkh` | `HASH160(00 14 \|\| HASH160(compressed key))` |
+| `Ethereum` | `Keccak256(x \|\| y)[12..]` |
+| `TaprootKeyPath` | x of `lift_x(P) + H_TapTweak(x(P)) G` (BIP-86) |
+| `TaprootScriptTree` | x of `lift_x(P) + H_TapTweak(x(P) \|\| root) G`, the merkle root in the witness |
+| `Ed25519` | the public key |
+| `BlsWithdrawal` | `00 \|\| SHA256(compressed G1 key)[1..]` |
+
+The key source says what the prover knows:
+
+| Source | Witness | Mode |
+| --- | --- | --- |
+| `Secp256k1Key`, `Bls12381Key` | the secret key, in `1..n` | hidden |
+| `Ed25519Seed` | the RFC 8032 seed | revealed |
+| `Bip32`, seed root | master seed of 16 to 64 bytes (length hidden), path of at most 10 steps | revealed |
+| `Bip32`, extended-key root | a private key and its chain code, path | revealed, see below |
+| `Slip10` | SLIP-0010 master seed, all-hardened path | revealed |
+| `Bip32Ed25519` | a Khovratovich-Law extended private key (96 bytes), public path | revealed, see below |
+
+Any lock of a curve combines with any source of that curve. A path is public, or
+hidden up to a public maximum depth (indices, hardened flags and depth in the
+witness). `BatchStatement` proves many credentials below one BIP-32 node in one proof;
+each entry is the same claim as the corresponding single statement.
 
 ### Hidden-key statements
 
-The Bitcoin and Ethereum statements prove knowledge of the signing scalar. They mean
-something only while the public key is not known to an attacker who can compute
-discrete logarithms: once the key has appeared on chain (any spend from the address, or
-address reuse), such an attacker computes `k` and can produce the same proof. These
-statements are for credentials whose public key has never been published.
+The key-source statements prove knowledge of the signing scalar. They mean something
+only while the public key is not known to an attacker who can compute discrete
+logarithms: once the key has appeared on chain (any spend from the address, or address
+reuse), such an attacker computes `k` and can produce the same proof. These statements
+are for credentials whose public key has never been published.
 
-Both commit to a 160-bit value. Finding some key whose public key hashes to a given
-160-bit address is a preimage search of about `2^160` classical and about `2^80`
-quantum (Grover) evaluations of a scalar multiplication and a hash. No proof system
-raises that ceiling: it belongs to the address format. A second key found this way
-satisfies the relation, with a different nullifier.
+A Taproot output key is always public. The hidden-key Taproot statement is knowledge
+of an internal key `k` with `Q = lift_x([k]G) + H_TapTweak(..) G`; the internal key is
+under the hash, so the logarithm of `Q` does not give a witness. That statement fails
+once the internal key has been published (a script-path spend, an exported extended
+public key). With a script tree, the witness also holds the merkle root, which is not
+checked against any script.
 
-The nullifier of a hidden key is a deterministic function of the key and the public
-domain. It lets anyone test a guessed key, exactly as the address does.
+The 20-byte credentials commit to a 160-bit value. Finding some key whose public key
+hashes to a given 160-bit address is a preimage search of about `2^160` classical and
+about `2^80` quantum (Grover) evaluations of a scalar multiplication and a hash. No
+proof system raises that ceiling: it belongs to the address format.
 
 ### Revealed-key statements
 
-The Ed25519 and BIP-32 statements take a hash preimage as the witness: the RFC 8032
-seed, or the BIP-32 master seed. An attacker who computes the signing scalar from the
-public key still has to invert SHA-512, or HMAC-SHA512 along the derivation path, to
-satisfy them. They apply only to keys that were derived this way and whose seed the
-holder still has: an Ed25519 key that was generated as a bare scalar, or a secp256k1
-key that did not come from a BIP-32 seed, has no such witness.
+The other sources take a hash preimage as the witness. An attacker who computes the
+signing scalar from the public key still has to invert SHA-512, or HMAC-SHA512 along
+the derivation path, to satisfy them. They apply only to keys that were derived this
+way and whose seed the holder still has.
 
-What they establish is provenance from a seed, not secrecy of anything public. The
-nullifier of a revealed key is computable by anyone who can compute its discrete
-logarithm; it is an identifier, and registering it still needs a proof.
+A seed-rooted statement is sound whatever has been published. A statement rooted at an
+extended private key (`Bip32Root::ExtendedKey`, and every `Bip32Ed25519` statement) is
+sound only while no extended public key at or above its root node has been exported:
+the chain code from such an export and the discrete logarithm of the node's public key
+are the whole witness. This is the unsoundness of last-step proofs of ePrint 2026/1508
+(Proposition 6.1). For the BIP-32 master node the condition is the usual state of a
+wallet, and the statement is 87,000 rows smaller. BIP32-Ed25519 has no seed-rooted
+form because its deployed root derivations (Cardano Icarus: PBKDF2 with 4096
+iterations) are not provable at a usable size.
 
-BIP-39 is outside the relation. The witness is the BIP-32 master seed, which for a
-BIP-39 wallet is the 64-byte output of PBKDF2 over the mnemonic and passphrase. That
-derivation is not proved: the holder computes the seed first, and anyone who holds the
-seed can prove without knowing the mnemonic. The seed length and the derivation path
-are public; chain codes and every key along the path stay in the witness.
+EIP-2333 seed provenance for BLS keys is not offered: one `derive_child_SK` measures
+30.8 million rows and the EIP-2334 withdrawal path has four (123 million rows), beyond
+the largest supported commitment.
+
+BIP-39 is outside the relation. The witness is the master seed, which for a BIP-39
+wallet is the 64-byte output of PBKDF2 over the mnemonic and passphrase
+(`relations::bip39_seed`). Proving that step (about 180 million rows) would add
+nothing: the seed is already a secret no public value determines, and whoever holds
+the mnemonic holds the seed.
+
+### Nullifier and credential identifier
+
+The registry keeps the credential identifier unique (`Credential::identifier`, a digest
+of the credential type and its on-chain bytes), so one on-chain credential migrates
+once, whichever statement kind proves it. Two credentials of one key (its `HASH160`
+and its Ethereum address) are two identifiers and migrate independently.
+
+The nullifier is `SHA256(tag || kind || 00 00 || domain || identifier || 0^32 ||
+secret)`. The secret is the signing key for a hidden-key statement, and seed material
+for a revealed-key statement: the inner digest of the master HMAC (BIP-32 from a seed),
+the leaf's RFC 8032 seed (Ed25519, SLIP-0010), the leaf's `k_R` (BIP32-Ed25519), the
+root chain code (extended-key root). For a revealed key it is therefore not computable
+from public keys and discrete logarithms, so an attacker cannot predict or pre-register
+it. It cannot also be the same value for a hidden-key statement and a seed statement of
+one key: a hidden-key witness is the scalar alone, so a common nullifier would be a
+function of the scalar. Those two statements of one credential have different
+nullifiers and the same identifier, and the registry refuses the second by the
+identifier. The nullifier of a hidden key lets anyone test a guessed key, exactly as
+the address does.
 
 ## Proof system
 
@@ -107,17 +156,26 @@ not been formally verified or independently reviewed. Proving is not claimed to 
 constant-time; run the prover on a host that is trusted with the secret. The proof
 randomness must be uniform and secret: it determines every mask and blinder.
 
-Measured with `dregg-sig migrate` (Apple M-series laptop, development profile; `prove`
-includes verifying the proof before it is written):
+Measured with `hem::relations::tests::measure_ownership_proofs` (22-core x86-64 Linux
+host, release profile, regime `BciksJohnsonQrom128`; verification with the relation's
+shape cached):
 
-| Statement | Proof bytes | Prove | Verify |
-| --- | ---: | ---: | ---: |
-| Bitcoin `HASH160` | 512,717 | 1.6 s | 0.4 s |
-| Ethereum address | 530,765 | 1.5 s | 0.4 s |
-| Ed25519 seed | 513,197 | 1.2 s | 0.3 s |
-| BIP-32, `m/0'` | 551,245 | 2.7 s | 0.6 s |
-| BIP-32, `m/44'/0'/0'/0/0` | 922,301 | 9.5 s | 1.8 s |
-| BIP-32, ten unhardened levels | 949,726 | 22.6 s | 4.2 s |
+| Statement | Rows | Proof bytes | Prove | Verify |
+| --- | ---: | ---: | ---: | ---: |
+| P2PKH / P2WPKH, key | 82,107 | 514,348 | 0.5 s | 15 ms |
+| P2SH-P2WPKH, key | 114,798 | 514,380 | 0.5 s | 16 ms |
+| Ethereum address, key | 141,040 | 532,492 | 0.9 s | 24 ms |
+| Taproot key path, key | 99,116 | 513,324 | 0.6 s | 19 ms |
+| BLS `0x00` withdrawal credential, key | 87,043 | 512,204 | 0.7 s | 18 ms |
+| Ed25519, RFC 8032 seed | 92,598 | 515,340 | 0.5 s | 15 ms |
+| Ed25519, SLIP-0010 `m/44'/501'/0'/0'` | 874,274 | 881,076 | 3.3 s | 85 ms |
+| Ed25519, BIP32-Ed25519 `m/1852'/1815'/0'/0/0` | 1,423,383 | 925,052 | 6.8 s | 133 ms |
+| P2PKH, BIP-32 seed `m/44'/0'/0'/0/0` | 1,103,291 | 923,548 | 6.5 s | 132 ms |
+| P2PKH, BIP-32 master extended key, same path | 1,016,363 | 881,236 | 3.8 s | 118 ms |
+| P2PKH, BIP-32 seed, hidden path of at most 5 steps | 1,202,820 | 922,652 | 7.2 s | 179 ms |
+| Batch of 10, P2PKH, `m/44'/0'/0'/0/i` | 2,628,926 | 949,949 | 14.6 s | 389 ms |
+
+A batch of 100 such addresses is 17,885,276 rows; proving it needs more than 32 GB.
 
 Proof length varies by a few hundred bytes with the Fiat-Shamir queries.
 
@@ -133,12 +191,11 @@ Guarantees, for one registry and one writer at a time:
 - A nullifier, once recorded, stays bound to exactly that record. A different binding
   under it is refused (`NullifierConflict`).
 - A legacy identifier, once recorded, cannot be recorded under another nullifier, so
-  the same credential in another domain is refused (`LegacyConflict`). A BIP-32 public
-  key is indexed under its `HASH160`, the identifier of the hidden-key Bitcoin statement
-  for that key. Identifiers are per commitment kind: the Ethereum address and the
-  Bitcoin `HASH160` of one secp256k1 key are different identifiers, and it is their
-  common nullifier that stops a second migration in the same domain. In two different
-  domains they are not connected.
+  the same credential in another domain, or through another statement kind, is refused
+  (`LegacyConflict`). The identifier is per on-chain credential: the P2PKH hash, the
+  P2SH script hash, the Ethereum address, the Taproot output key, the Ed25519 key and
+  the BLS withdrawal credential of a key are different identifiers and migrate
+  independently.
 - An identical submission is accepted again and writes nothing. An enrolment reserves
   the binding; the first durable enrolment wins.
 - An accepted submission is on disk when the call returns.

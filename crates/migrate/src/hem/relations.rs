@@ -395,11 +395,35 @@ pub fn secp256k1_credential(
     })
 }
 
+/// The BLS12-381 subgroup order, big-endian.
+const BLS12_381_ORDER_BE: [u8; 32] = [
+    0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8, 0x08, 0x09, 0xa1, 0xd8, 0x05,
+    0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe, 0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01,
+];
+
 /// Compressed G1 public key of a big-endian BLS12-381 secret key; `None` unless
 /// `1 <= k < r`.
+///
+/// The crate has no separate native G1 arithmetic: the value is read off the assignment
+/// that [`bls12_381_g1_fixed_base_mul`] computes, whose encodings `hem::curve` tests
+/// against recorded vectors.
 pub fn bls12_381_public_key(key_be: &[u8; 32]) -> Option<[u8; 48]> {
-    let scalar = crate::bls12_381::FrBls381::from_nonzero_be_bytes(key_be)?;
-    Some(crate::bls12_381::BlsG1Point::generator_mul_ct(&scalar).to_compressed_48())
+    // Lexicographic comparison of big-endian bytes, without an early exit.
+    let (mut below, mut equal, mut nonzero) = (0u8, 1u8, 0u8);
+    for (&k, &r) in key_be.iter().zip(&BLS12_381_ORDER_BE) {
+        below |= equal & u8::from(k < r);
+        equal &= u8::from(k == r);
+        nonzero |= k;
+    }
+    if below == 0 || nonzero == 0 {
+        return None;
+    }
+    let mut cs = ConstraintSystem::new();
+    let bits = reverse_bytes(&alloc_bits(&mut cs, key_be));
+    let public_key = bls12_381_g1_fixed_base_mul(&mut cs, &bits[..255]);
+    super::hash::bits_to_bytes(&cs, &flat(public_key.compressed_bits()))
+        .try_into()
+        .ok()
 }
 
 /// The `0x00` withdrawal credential of a BLS12-381 secret key.
