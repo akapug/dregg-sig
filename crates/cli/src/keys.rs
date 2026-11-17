@@ -597,7 +597,9 @@ The secret file is created with owner-only permissions.
                         validators+1 of them: validator i=base+i, ceremony=base+validators
   --anchor-vmgenid     optional snapshot/clone guard; requires disjoint --anchor-dir or TPM
   --vault-dir <dir>     explicit local custody directory verified disjoint from --anchor-dir
-  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
+  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode);
+                        it then stops a restore of the custody directory only: a volume or VM
+                        snapshot rewinds the anchor with it
   --policy-ledger-dir <dir>  enroll the key against this custody policy ledger: it will then
                         sign only an intent that ledger releases (not for agg-jorts-poseidon2);
                         with --policy-anchor-dir / --policy-passphrase-* as the ledger requires
@@ -974,7 +976,9 @@ Stateful schemes persist their advanced state before the signature is written.
                       (stateful schemes require it unless --ephemeral-unanchored is given)
   --ephemeral-unanchored  sign with a disposable stateful key enrolled without an anchor
   --vault-dir <dir>   explicit local custody directory verified disjoint from --anchor-dir
-  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
+  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode);
+                        it then stops a restore of the custody directory only: a volume or VM
+                        snapshot rewinds the anchor with it
   --policy-id-hex <hex>  32-byte policy identifier committed into CeremonyContext
   --spend-amount <n>  spend amount committed into CeremonyContext (default: 0)
   --json              print the signature file contents to standard output as well

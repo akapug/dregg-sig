@@ -94,7 +94,8 @@ pub const GATE_HELP: &str = "\
   --policy-anchor-tpm-nv <idx> [--policy-anchor-tpm-device <path>] [--policy-anchor-tpm-auth-env <VAR>]
   --policy-vmgenid [--policy-vmgenid-strict]  add the ledger's VM snapshot/clone guard; needs
                               --policy-anchor-dir on a disjoint device or --policy-anchor-tpm-nv
-  --policy-allow-single-disk-anchor  permit that anchor on the ledger's filesystem device
+  --policy-allow-single-disk-anchor  permit that anchor on the ledger's filesystem device (it then
+                              stops a restore of the ledger directory only, not of the volume)
   --policy-passphrase-env <VAR> / --policy-passphrase-file <PATH>  unlock a sealed ledger
 ";
 
@@ -1449,7 +1450,8 @@ other. Set `preprocessing_slots` in the enrollment policy to budget single-use b
 
   --anchor-dir <dir>            ratchet every guard generation in an external monotone anchor,
                                 so restoring an old copy of the ledger directory is refused
-  --allow-single-disk-anchor    permit --anchor-dir on the ledger's filesystem device
+  --allow-single-disk-anchor    permit --anchor-dir on the ledger's filesystem device (it then
+                                stops a restore of the ledger directory only, not of the volume)
   --ephemeral-unanchored        enroll a disposable ledger without rollback protection
                                 (required when --anchor-dir is absent)
   --passphrase-env <VAR> / --passphrase-file <PATH>  seal the provisioning seed
@@ -1635,7 +1637,8 @@ fn open_from_args(args: &Args, access: Access) -> Result<OpenLedger, CliError> {
 
 const LEDGER_HELP: &str = "\
   --anchor-dir <dir>            the ledger's external monotone anchor (required if enrolled with one)
-  --allow-single-disk-anchor    permit --anchor-dir on the ledger's filesystem device
+  --allow-single-disk-anchor    permit --anchor-dir on the ledger's filesystem device (it then
+                                stops a restore of the ledger directory only, not of the volume)
   --passphrase-env <VAR> / --passphrase-file <PATH>  unlock a sealed ledger
 ";
 

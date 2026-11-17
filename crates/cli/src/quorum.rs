@@ -76,7 +76,9 @@ Run a dealerless 2-of-3 RSS key generation ceremony with zero central secret rec
                                 -a \"authread|authwrite|no_da|nt=counter\")
   --ephemeral-unanchored        enroll a disposable quorum without rollback protection
                                 (an anchor or this waiver is required)
-  --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir
+  --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir;
+                                it then stops a restore of the vault directory only: a volume
+                                or VM snapshot rewinds the anchor with it
   --passphrase-env <VAR> / --passphrase-file <PATH>  seal each party secret share
   --policy-ledger-dir <dir>     enroll the quorum against this custody policy ledger: it will
                                 then sign only an intent that ledger releases; with
@@ -95,7 +97,9 @@ Execute a 2-of-3 Jorts Mode 3A threshold signing ceremony gated by FsBeltWal and
   --out <path>                  destination for the quorum signature JSON
   --anchor-dir <dir>            external monotone anchor directory (required if enrolled)
   --anchor-tpm-nv <base>         same six-counter base reserved at enrollment
-  --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir
+  --allow-single-disk-anchor    permit --anchor-dir on the same filesystem device as --vault-dir;
+                                it then stops a restore of the vault directory only: a volume
+                                or VM snapshot rewinds the anchor with it
   --policy-id-hex <64-hex>      32-byte policy digest committed into CeremonyContext
   --spend-amount <u64>          spend amount committed into CeremonyContext
   --retry                       recover an already-latched in-flight epoch with identical context

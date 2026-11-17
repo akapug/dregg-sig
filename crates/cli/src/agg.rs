@@ -435,7 +435,9 @@ Third form: committee-vault demo signing + aggregation backed by per-validator F
                          No signature is made; --epoch, --signers and the message are not needed
   --vault-dir <dir>   explicit local custody directory verified disjoint from --anchor-dir
   --ephemeral-unanchored  allow disposable committee signing without rollback protection
-  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode)
+  --allow-single-disk-anchor  permit --anchor-dir on the same filesystem device (distinct inode);
+                         it then stops a restore of the custody directory only: a volume or VM
+                         snapshot rewinds the anchor with it
   --policy-id-hex <hex>  32-byte policy identifier committed into CeremonyContext
   --spend-amount <n>  spend amount committed into CeremonyContext (default: 0)
   --json              print the proof file contents to standard output as well

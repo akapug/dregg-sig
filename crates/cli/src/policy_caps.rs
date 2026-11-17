@@ -102,12 +102,21 @@ it is not: restoring the file re-admits every seal consumed since. The anchor ke
 Replicas: two verifiers with separate stores each accept a seal once. Nothing local can
 detect that; run one store per audience, or put one linearizable service behind it.
 
+Step keys (--step-key-out) are one-time bearer secrets. `attenuate` and `seal` retire the
+file before signing, so a second use on this host is refused, as is putting back the key file
+alone. That is all local state can do for a file that is meant to be handed on: a copy taken
+before use, or the key file restored together with its .vault.lock companion, is a second
+live key. Never copy or back up a step key. Two hops signed with one step key let anyone who
+sees both forge hops with that step's (already attenuated) authority; acceptance is still
+one-use, because the verifier consumes the seal.
+
 First-party caveat flags:
   --expires-at <secs>  --not-before <secs>  --resource-hex <64-hex>
   --actions <u64>      --max-amount <u128>
   --passphrase-env <VAR> / --passphrase-file <PATH>  seal keygen or unlock mint authority
   --vault-dir <dir>  local custody directory for external anchor isolation
-  --allow-single-disk-anchor  permit a distinct anchor directory on the same filesystem
+  --allow-single-disk-anchor  permit a distinct anchor directory on the same filesystem; it
+                     then stops a restore of the custody directory only, not of the volume
 ";
 
 const CAVEAT_OPTIONS: &[&str] = &[
@@ -597,7 +606,9 @@ fn consume_step_key(path: &str) -> Result<PqBiscuitStepKey, CliError> {
     ]);
     vault.bind(&mut tombstone)?;
     // Advance the companion MAC before replacing the secret. Any interrupted
-    // update fails closed, as does restoring only the old secret file.
+    // update fails closed, as does restoring only the old secret file. Restoring the
+    // file together with its companion reopens the key: see the step key paragraph
+    // of BISCUIT_HELP for why no local state can prevent that for a bearer file.
     vault.seal(&mut tombstone)?;
     replace(Path::new(path), tombstone.to_pretty().as_bytes(), || Ok(()))
         .map_err(|e| CliError::io("retiring one-time biscuit step key", e))?;
@@ -1197,7 +1208,7 @@ mod tests {
         std::fs::write(path, snapshot).unwrap();
         assert!(
             consume_step_key(path).is_err(),
-            "the companion state must reject a restored step key"
+            "the companion state rejects the key file put back on its own"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
