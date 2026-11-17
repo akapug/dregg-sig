@@ -3684,9 +3684,9 @@ mod tests {
             size > 1 << 20 && size < SHAPE_CACHE_ENTRIES / 16,
             "{size} entries"
         );
-        // The budget admits the single statements and a batch of 10, not a batch of 100
-        // (350,554,982 entries measured).
-        assert!(47_846_552 < SHAPE_CACHE_ENTRIES && SHAPE_CACHE_ENTRIES < 350_554_982);
+        // The budget admits a batch of 10 and not a batch of 100 (47,846,552 and
+        // 350,554,982 entries measured).
+        const { assert!(47_846_552 < SHAPE_CACHE_ENTRIES && SHAPE_CACHE_ENTRIES < 350_554_982) };
     }
 
     #[test]
