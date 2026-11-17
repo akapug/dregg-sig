@@ -176,7 +176,7 @@ impl SplitSubtreeRelation {
         if !matches!(child_vk.num_public, SUBTREE_PUBLIC_WORDS | PUBLIC_WORDS)
             || base_merkle_level > 57
             || !child_vk.regime.uses_poseidon2_canopy()
-            || !regime.meets_qrom_128_floor()
+            || !regime.is_accepted_aggregate_profile()
         {
             return Err(FullShardError::InvalidParameters);
         }

@@ -136,6 +136,11 @@ pub struct WhirStageSpec {
 /// `2^-214`, no PoW, stated for `Q + 1 <= 2^40`). The `Poseidon2*` variants use the same query
 /// tables with the width-12 Poseidon2 Merkle-Canopy and Fiat–Shamir transcript in place of
 /// `cSHAKE256`.
+///
+/// The `Qrom128` suffix on the CDHZ25 variants records a historical bounded-query target,
+/// not a 128-bit nominal Grover work factor: the PoW profiles have 108 nominal bits and
+/// require `Q <= 2^38`; the zero-PoW profiles have 107 nominal bits and require
+/// `Q + 1 <= 2^40`. Neither label establishes a composed 128-bit authorization bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WhirSecurityRegime {
@@ -144,18 +149,23 @@ pub enum WhirSecurityRegime {
     #[default]
     BciksJohnsonQrom128 = 4,
     /// `(202, 102, 70, 52)` queries at blowups `(4, 16, 64, 256)` plus 16-bit PoW, `cSHAKE256`.
+    /// 108-bit nominal Grover work; bounded-query accounting assumes `Q <= 2^38`.
     Cdhz25JohnsonQrom128 = 5,
     /// `(216, 109, 74, 56)` queries at blowups `(4, 16, 64, 256)`, no PoW, `cSHAKE256`.
+    /// 107-bit nominal Grover work; bounded-query accounting assumes `Q + 1 <= 2^40`.
     Cdhz25ZeroPowQrom128 = 6,
     /// [`Self::Cdhz25JohnsonQrom128`] query table over the Poseidon2 canopy and transcript.
+    /// 108-bit nominal Grover work; bounded-query accounting assumes `Q <= 2^38`.
     Poseidon2Cdhz25JohnsonQrom128 = 7,
     /// [`Self::Cdhz25ZeroPowQrom128`] query table over the Poseidon2 canopy and transcript.
+    /// 107-bit nominal Grover work; bounded-query accounting assumes `Q + 1 <= 2^40`.
     Poseidon2Cdhz25ZeroPowQrom128 = 8,
     /// Unconditional Johnson-radius QROM budget (`(258, 130, 88, 66)` + 16-bit PoW) over
     /// Role-1 12-round `TurboSHAKE256` Merkle-Canopy & PoW.
     TurboShakeBciksJohnsonQrom128 = 9,
     /// [`Self::Cdhz25JohnsonQrom128`] query table (`(202, 102, 70, 52)` + 16-bit PoW) over
     /// Role-1 12-round `TurboSHAKE256` Merkle-Canopy & PoW.
+    /// 108-bit nominal Grover work; bounded-query accounting assumes `Q <= 2^38`.
     TurboShakeCdhz25JohnsonQrom128 = 10,
 }
 
@@ -193,10 +203,11 @@ impl WhirSecurityRegime {
         self.qrom_grover_round_bits() >= 128
     }
 
-    /// Uses a CDHZ25 bounded-query profile, rather than a 128-bit nominal Grover floor.
-    /// The PoW profile is accounted for at Q <= 2^38, and the zero-PoW profile at
-    /// Q + 1 <= 2^40, as documented on Self. This does not promise security at 2^64 queries.
-    pub fn meets_bounded_qrom_128_profile(self) -> bool {
+    /// Uses a CDHZ25 bounded-query profile.
+    /// The PoW profiles have 108-bit nominal Grover work and assume `Q <= 2^38`;
+    /// the zero-PoW profiles have 107-bit nominal work and assume `Q + 1 <= 2^40`.
+    /// This does not promise security at `2^64` queries or a composed security bound.
+    pub fn is_bounded_query_profile(self) -> bool {
         matches!(
             self,
             Self::Cdhz25JohnsonQrom128
@@ -207,12 +218,15 @@ impl WhirSecurityRegime {
         )
     }
 
-    /// Backwards-compatible aggregate authorization policy: either the nominal Grover
-    /// floor or a bounded-query CDHZ25 profile. Despite the historical name, true does
-    /// NOT imply 128 bits of unconditional Grover work. Use the separate predicates
-    /// above when inspecting security assumptions. Classical tag 2 is never authorized.
-    pub fn meets_qrom_128_floor(self) -> bool {
-        self.meets_unconditional_grover_128_floor() || self.meets_bounded_qrom_128_profile()
+    /// Accepted by the aggregate verifier's profile policy: either at least 128 bits of
+    /// nominal single-round Grover work, or a CDHZ25 bounded-query profile (108 nominal
+    /// bits at `Q <= 2^38`, or 107 at `Q + 1 <= 2^40`). Classical tag 2 is excluded.
+    ///
+    /// This is policy membership, not a security floor or a composed QROM theorem.
+    /// Inspect [`Self::qrom_grover_round_bits`] and [`Self::is_bounded_query_profile`]
+    /// when choosing assumptions.
+    pub fn is_accepted_aggregate_profile(self) -> bool {
+        self.meets_unconditional_grover_128_floor() || self.is_bounded_query_profile()
     }
 
     /// Merkle-Canopy trees and the Fiat–Shamir transcript use width-12 Poseidon2.
@@ -426,7 +440,7 @@ fn stage_geometry(num_vars: usize) -> WhirSchedule {
 impl WhirSchedule {
     /// Aggregate authorization: canonical structure plus an accepted QROM profile.
     pub fn validate(&self, num_vars: usize) -> bool {
-        self.validate_structural(num_vars) && self.regime.meets_qrom_128_floor()
+        self.validate_structural(num_vars) && self.regime.is_accepted_aggregate_profile()
     }
 
     /// Validate geometry, resource limits, and the canonical query table of the selected
@@ -6671,15 +6685,12 @@ mod pcs_unit_tests {
             assert_eq!(regime as u8, tag);
             assert_eq!(regime.classical_fs_round_bits(), bits);
             assert_eq!(regime.qrom_grover_round_bits(), bits / 2);
-            assert_eq!(regime.meets_qrom_128_floor(), tag != 2);
+            assert_eq!(regime.is_accepted_aggregate_profile(), tag != 2);
             assert_eq!(
                 regime.meets_unconditional_grover_128_floor(),
                 matches!(tag, 4 | 9)
             );
-            assert_eq!(
-                regime.meets_bounded_qrom_128_profile(),
-                matches!(tag, 5..=8 | 10)
-            );
+            assert_eq!(regime.is_bounded_query_profile(), matches!(tag, 5..=8 | 10));
             assert_eq!(regime.pow_bits(), pow_bits);
             assert_eq!(regime.uses_poseidon2_canopy(), poseidon2);
             assert_eq!(regime.uses_turboshake_canopy(), turboshake);
@@ -6712,7 +6723,7 @@ mod pcs_unit_tests {
             for nv in 2..=MAX_PCS_NUM_VARS {
                 let schedule = regime.schedule(nv);
                 assert!(schedule.validate_structural(nv));
-                if !regime.meets_qrom_128_floor() {
+                if !regime.is_accepted_aggregate_profile() {
                     assert!(!schedule.validate(nv));
                     assert!(WhirSchedule::from_bytes_canonical(&schedule.to_bytes(), nv).is_none());
                     continue;
@@ -7225,7 +7236,7 @@ mod pcs_unit_tests {
 
             // Every other regime, including the one sharing this query table, rejects the proof.
             for other in WhirSecurityRegime::ALL {
-                if other == regime || !other.meets_qrom_128_floor() {
+                if other == regime || !other.is_accepted_aggregate_profile() {
                     continue;
                 }
                 let other_schedule = other.schedule(nv);
