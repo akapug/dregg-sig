@@ -1,5 +1,6 @@
-//! Non-native field arithmetic and fixed-base scalar multiplication for secp256k1 and
-//! Ed25519 over the Goldilocks constraint system of `dregg_sig_agg::zk_hem::relation`.
+//! Non-native field arithmetic and fixed-base scalar multiplication for secp256k1, Ed25519
+//! and BLS12-381 G1 over the Goldilocks constraint system of
+//! `dregg_sig_agg::zk_hem::relation`.
 //!
 //! # Representation
 //!
@@ -11,40 +12,95 @@
 //!
 //! # Reduction and its overflow bound
 //!
-//! `x = 0 (mod p)` is proved as the integer identity `x + K p - q p = 0` with `q` a
-//! bit-decomposed witness and `K` a public offset that makes `q` non-negative
-//! (`enforce_zero_mod`). The identity is checked limb group by limb group with carries.
-//! Every carry is range-checked to an interval derived from the coefficient intervals, and
-//! the builder asserts, for every group equation, that the absolute value of its left side
-//! over all admitted values is below the Goldilocks prime. A group equation that holds in
-//! the field therefore holds over the integers. No step relies on a wrap not happening by
-//! accident: if an interval is too wide, synthesis panics.
+//! `x = 0 (mod p)` is proved in three steps (`enforce_zero_mod`).
+//!
+//! 1. Fold. A coefficient `c_k` at a limb position `k >= limbs(p)` is replaced by
+//!    `c_k d_(k,j)` added at the positions `j < limbs(p)`, where `d_(k,j)` are public
+//!    signed digits with `sum_j d_(k,j) 2^(8j) = 2^(8k) mod p` (asserted when the modulus
+//!    is built, by construction from the native reduction). The folded integer is congruent
+//!    to `x`, its intervals follow by interval arithmetic, and it costs no rows.
+//! 2. Quotient. The folded integer `x'` satisfies `x' + K p - q p = 0` with `q` a
+//!    bit-decomposed witness and `K` a public offset that makes `q` non-negative. Because
+//!    `x'` is at most a few dozen bits longer than `p`, `q` has 14 to 30 bits rather than
+//!    the bit length of `p`.
+//! 3. Carries. The identity is checked limb group by limb group. Every carry is
+//!    range-checked to an interval derived from the coefficient intervals, and the builder
+//!    asserts, for every group equation, that the absolute value of its left side over all
+//!    admitted values is below the Goldilocks prime. A group equation that holds in the
+//!    field therefore holds over the integers.
+//!
+//! No step relies on a wrap not happening by accident: if an interval is too wide,
+//! synthesis panics.
+//!
+//! This is the single-auxiliary-modulus-free end of the design space described in
+//! `paperbin/foreign-field-plonk.pdf` (Ambrona, Firsov, Querejeta-Azurmendi, Section 1 and
+//! the discussion of [LB22]): they check the integer identity modulo the native modulus
+//! and auxiliary moduli and bound its magnitude. That residue-number variant was costed
+//! for this system and not adopted. With 64-bit Goldilocks, residues modulo auxiliary
+//! moduli near `2^35` (the largest for which a 32-term sum of 2^22-bounded coefficients
+//! cannot wrap) need a 27-bit range-checked quotient each, and six of them to cover a
+//! 256-bit identity: about 160 range rows against about 125 for the carry chain here.
+//! The folding step is this module's own; the papers do not claim it.
 //!
 //! # Scalar multiplication
 //!
-//! `[k]G = [2k]H` with `H = [1/2]G`. The low 252 scalar bits are cut into 21 windows of 12
-//! bits. A window with value `u` contributes the odd multiple `(2u + 1 - 2^12) 2^lo` of `H`,
-//! so its table holds 2^11 points and the top window bit selects the sign of `y`. The last
-//! window (4 bits) is unsigned and carries the constant `2^252 - 1` that the signed windows
-//! leave over. Every partial sum `S` of signed windows is an odd integer with
-//! `|S| < 2^lo <= |T|` for the next addend `T`, and `|S| + |T| < 2^252 <` group order, so
-//! `S != +-T` and neither is zero: the incomplete chord formula is exact there for every
-//! Boolean input. The last addition can meet `S = T` or `S = -T`; it carries the extra
-//! tangent-compatible equation of `add_step`, which makes doubling exact and leaves
-//! `S = -T` (scalar `= 0 mod` order) unsatisfiable.
+//! `[k]G = [2k]H` with `H = [1/2]G`. The scalar bits below the last 6 are cut into signed
+//! windows of 11 bits (one shorter window closes the gap). A window with value `u`
+//! contributes the odd multiple `(2u + 1 - 2^w) 2^lo` of `H`, so its table holds `2^(w-1)`
+//! points and the top window bit selects the sign of `y`. The last window (6 bits) is
+//! unsigned and carries the constant `2^lo - 1` that the signed windows leave over. Every
+//! partial sum `S` of signed windows is an odd integer with `|S| < 2^lo <= |T|` for the
+//! next addend `T`, and `|S| + |T| < 2^250 <` group order, so `S != +-T` and neither is
+//! zero: the incomplete chord formula is exact there for every Boolean input. The last
+//! addition can meet `S = T` or `S = -T`; it carries the extra tangent-compatible equation
+//! of `add_step`, which makes doubling exact and leaves `S = -T` (scalar `= 0 mod` order)
+//! unsatisfiable.
 //!
 //! The accumulator keeps `y` unreduced, as `lambda (x_T - x_3) - y_T`, so one addition
 //! costs two reduced witnesses (`lambda`, `x_3`) and two quotients.
 //!
 //! A table lookup resolves the low 8 index bits through their 247 subset products, where
-//! every table column is a linear form, and the high 3 bits by 7 rows per output. No table
+//! every table column is a linear form, and the high 2 bits by 3 rows per output. No table
 //! entry is addressed by a witness value: the assignment is computed by evaluating those
 //! forms.
+//!
+//! # Point additions with a variable point
+//!
+//! `P + [k]G` (`secp256k1_add_fixed_base`, `secp256k1_taproot_tweak`,
+//! `ed25519_add_fixed_base`) is one ladder and one `complete` addition. It is not cheaper
+//! than the scalar route `[(k_P + k) mod n]G`: both need one multiplication, because
+//! `[k]G` has to be formed either way. A BIP32 path with three public keys on it needs
+//! three multiplications by either route.
+//!
+//! # Hints, for a prover that holds the witness in shares
+//!
+//! A variable is a *hint* when it is neither a linear form nor a product of earlier
+//! variables. [`HintCount`] counts them per gadget (wrap the constraint system in
+//! [`Metered`]). They are:
+//!
+//! * element bits: the bit decomposition of a residue (a slope, a coordinate, a reduced
+//!   product). From shares: compute the residue in the foreign field (`divisions` counts
+//!   those that are a quotient, which needs one shared inversion), then a shared bit
+//!   decomposition of a value below `2^bits`;
+//! * quotient bits: `(x + K p) / p` for the folded integer `x`, 14 to 30 bits. From
+//!   shares: the integer `x` is a public linear form of earlier limbs and product
+//!   coefficients, so `x mod p` is known from the element it is compared with and the
+//!   quotient is a shared exact division by a public constant, then a bit decomposition;
+//! * carry bits: each carry is a public linear form of earlier variables divided by a
+//!   power of two (exactly); only its bit decomposition is needed;
+//! * zero tests: the inverse-or-zero of a small sum of bits, in comparisons with constants.
+//!   [`Options::product_only_comparisons`] replaces them by product chains (about 3 % more
+//!   rows in a scalar multiplication), leaving bit decompositions as the only hints.
+//!
+//! Everything else (limb variables, product coefficients, subset products, table outputs,
+//! selected signs) is a product of two linear forms or a public linear image of such
+//! products. Bit decompositions cannot be avoided in this row format: a range check is
+//! one row per bit and the bits are its witnesses.
 //!
 //! # Witness handling
 //!
 //! Native arithmetic on witness values is branch-free with fixed iteration counts. Its
-//! stack temporaries are not erased. Without `std` the window tables (about 43,000 points
+//! stack temporaries are not erased. Without `std` the window tables (about 23,000 points
 //! per curve) are rebuilt on every call.
 
 use alloc::vec;
@@ -1469,7 +1525,6 @@ struct Curve {
     f: Modulus,
     a2: u64,
     a4: u64,
-    order: Big,
     scalar_bits: usize,
     windows: Vec<WindowTable>,
 }
@@ -1560,7 +1615,6 @@ impl Curve {
             f,
             a2,
             a4,
-            order,
             scalar_bits,
             windows: Vec::new(),
         };
@@ -2656,6 +2710,15 @@ mod tests {
             assert!((2..=most).contains(&range), "{range} range rows");
             assert_eq!(other, 0);
         }
+        // A forged carry: every variable after the quotient is a carry bit, and each one is
+        // pinned.
+        let first_carry = var_of(&q.bits_le[q.bits_le.len() - 2]) + 1;
+        assert!(shape.mask_var_base - first_carry > 60);
+        for i in first_carry..shape.mask_var_base {
+            let mut bad = z.clone();
+            bad[i] = F::ONE - bad[i];
+            assert!(!shape.is_satisfied(&bad), "carry bit {i} is free");
+        }
         // The reduction no longer needs a wide quotient: the high limbs are folded first.
         assert!(q.bits_le.len() < 48, "quotient of {} bits", q.bits_le.len());
         assert!(q.bytes_le.len() >= 2);
@@ -3038,6 +3101,410 @@ mod tests {
         }
     }
 
+    // ---- BLS12-381 G1 ------------------------------------------------------
+
+    fn bls_scalars() -> Vec<U256> {
+        let mut rng = Rng(11);
+        let r = BLS_R;
+        // The last addition doubles: k_low = 58 * 2^249 - 1 - r under the top window value 57.
+        let doubling = u256_sub(&[u64::MAX, u64::MAX, u64::MAX, (115 << 57) - 1], &r).0;
+        let mut out = vec![
+            [1, 0, 0, 0],
+            [2, 0, 0, 0],
+            u256_sub(&r, &[1, 0, 0, 0]).0,
+            doubling,
+            [0, 0, 1 << 20, 1 << 60],
+        ];
+        out.extend((0..3).map(|_| {
+            let mut k = u256_from_bytes(&rng.bytes());
+            k[3] &= (1 << 62) - 1;
+            k
+        }));
+        out
+    }
+
+    /// Compressed public keys of [`bls_scalars`], recorded from the constant-time native
+    /// implementation `crate::bls12_381::BlsG1Point::generator_mul_ct(..).to_compressed_48()`
+    /// (commit 661e5a8), which this module does not depend on.
+    const BLS_VECTORS: [&str; 8] = [
+        "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb",
+        "a572cbea904d67468808c8eb50a9450c9721db309128012543902d0ac358a62ae28f75bb8f1c7c42c39a8c5529bf0f4e",
+        "b7f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb",
+        "83abcb46d14b9b55848c30bc7b8afba5bd023ab3c2be1434b64b28df5acfceb6bf55bb8c02ef4adb0b781fef2c19747c",
+        "965ca2ee2d4a16bb7894c9f1a93754fc4f8e3f5f0d0044148d52c365922982fdfcfbf5b5f4945b80fb41570afe3889a1",
+        "a3011056d0cb7b38ed291a2c396c1fed3acb496c6aed45ff4474974a3ee8f519ff8239b200c228bb9426fc020b2b0c21",
+        "b4b9d9caaba9000db3d2f077010c6eb827d1eaacb35edbc1b60755923511c2a34b9f8073d45d6885e0f0f60d44df359e",
+        "80f1b9b03db910e1fbf1e29126270d11136b6cc640f6fbd5b66f78dc1be547a55b5f348d928e65eb3abe2a49427403a6",
+    ];
+
+    fn hex(bytes: &[u8]) -> std::string::String {
+        bytes.iter().map(|b| std::format!("{b:02x}")).collect()
+    }
+
+    fn bits255(cs: &mut ConstraintSystem, k: &U256) -> Vec<Lc> {
+        let mut bits = bit_vars(cs, &le(k));
+        bits.truncate(255);
+        bits
+    }
+
+    #[test]
+    fn bls12_381_g1_matches_recorded_native_encodings() {
+        assert_eq!(
+            BLS_VECTORS[0],
+            "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb",
+            "the generator's standard encoding"
+        );
+        let mut signs = [0usize; 2];
+        for (k, want) in bls_scalars().iter().zip(BLS_VECTORS) {
+            let mut cs = ConstraintSystem::new();
+            let bits = bits255(&mut cs, k);
+            let pk = bls12_381_g1_fixed_base_mul(&mut cs, &bits);
+            assert_eq!(hex(&eval_bytes(&cs, &pk.compressed_bytes())), want);
+            assert_eq!(hex(&eval_bit_bytes(&cs, &pk.compressed_bits())), want);
+            // Double-and-add on the table-free group law, and the sign by comparison.
+            with_bls12_381_g1(|curve| {
+                let f = &curve.f;
+                let g = (f.mont(&BLS_G1_X), f.mont(&BLS_G1_Y));
+                let (x, y) = curve.scalar_mul(&big4(k), &g).unwrap();
+                let (x, y) = (f.canon(&x), f.canon(&y));
+                assert_eq!(eval_bytes(&cs, &pk.x.bytes_le), big_to_bytes(&x));
+                assert_eq!(eval_bytes(&cs, &pk.y.bytes_le), big_to_bytes(&y));
+                let (neg, _) = big_sub(&f.p, &y);
+                let largest = big_sub(&neg, &y).1;
+                assert_eq!(cs.eval(&pk.y_is_largest).to_canonical_u64(), largest);
+                signs[largest as usize] += 1;
+            });
+            let outputs = [
+                var_of(&pk.y_is_largest),
+                var_of(&pk.x.bits_le[6]),
+                var_of(&pk.x.bytes_le[47]),
+            ];
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z), "k = {k:x?}");
+            for i in outputs {
+                let mut bad = z.clone();
+                bad[i] = F::ONE - bad[i];
+                assert!(!shape.is_satisfied(&bad));
+            }
+        }
+        assert!(signs[0] > 0 && signs[1] > 0, "both sign flags must occur");
+
+        for k in [[0u64; 4], BLS_R] {
+            let mut cs = ConstraintSystem::new();
+            let bits = bits255(&mut cs, &k);
+            let _ = bls12_381_g1_fixed_base_mul(&mut cs, &bits);
+            let (shape, z) = cs.finish();
+            assert!(!shape.is_satisfied(&z));
+        }
+    }
+
+    #[test]
+    fn bls12_381_scalar_range_accepts_exactly_one_to_r_minus_one() {
+        let run = |k: U256| {
+            let mut cs = ConstraintSystem::new();
+            let bits = bits255(&mut cs, &k);
+            bls12_381_enforce_scalar_range(&mut cs, &bits);
+            let (shape, z) = cs.finish();
+            shape.is_satisfied(&z)
+        };
+        let r = BLS_R;
+        assert!(!run([0; 4]));
+        assert!(run([1, 0, 0, 0]));
+        assert!(run(u256_sub(&r, &[1, 0, 0, 0]).0));
+        assert!(!run(r));
+        assert!(!run(u256_add(&r, &[1, 0, 0, 0]).0));
+        assert!(!run([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 1]));
+        let mut rng = Rng(12);
+        for _ in 0..20 {
+            let near = [r[0] ^ (rng.next() & 0xffff), r[1], r[2], r[3]];
+            assert_eq!(run(near), u256_sub(&near, &r).1 == 1);
+        }
+    }
+
+    /// Shift-and-add reference on six words.
+    fn ref_mulmod_big(a: &Big, b: &Big, p: &Big) -> Big {
+        let reduce = |x: Big| {
+            let (d, borrow) = big_sub(&x, p);
+            if borrow == 0 { d } else { x }
+        };
+        let mut acc = [0u64; NW];
+        for i in (0..64 * NW).rev() {
+            acc = reduce(big_add(&acc, &acc).0);
+            if (b[i / 64] >> (i % 64)) & 1 == 1 {
+                acc = reduce(big_add(&acc, a).0);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn field_mul_matches_reference_for_the_381_bit_field() {
+        let m = Modulus::bls12_381_base();
+        assert_eq!(m.bits(), 381);
+        let mut rng = Rng(13);
+        for round in 0..3 {
+            let bytes = |rng: &mut Rng| {
+                let mut v = [0u8; 48];
+                v[..32].copy_from_slice(&rng.bytes());
+                v[32..].copy_from_slice(&rng.bytes()[..16]);
+                if round == 0 {
+                    v = [0xff; 48];
+                }
+                v[47] &= 0x1f;
+                v
+            };
+            let (a, b) = (bytes(&mut rng), bytes(&mut rng));
+            let mut cs = ConstraintSystem::new();
+            let (ea, eb) = (m.alloc(&mut cs, &a), m.alloc(&mut cs, &b));
+            let c = m.mul(&mut cs, &ea.lazy(), &eb.lazy());
+            m.enforce_canonical(&mut cs, &c);
+            let reduced = |x: &[u8; 48]| ref_mulmod_big(&big_from_bytes(x), &big(1), &BLS_P);
+            let want = ref_mulmod_big(&reduced(&a), &reduced(&b), &BLS_P);
+            assert_eq!(eval_bytes(&cs, &c.bytes_le), big_to_bytes(&want));
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+            for lc in [&c.bytes_le[0], &c.bytes_le[47], &c.bits_le[200]] {
+                let mut bad = z.clone();
+                bad[var_of(lc)] += F::ONE;
+                assert!(!shape.is_satisfied(&bad));
+            }
+        }
+    }
+
+    // ---- Taproot and child keys ----------------------------------------------
+
+    use crate::secp256k1_ct::{secp_scalar_add_mod_n, secp_scalar_neg_mod_n};
+
+    fn native_affine(k_be: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+        let (x, y) = SecpPoint::generator_mul_ct(k_be).to_affine().unwrap();
+        (le(&x.normalize().0), le(&y.normalize().0))
+    }
+
+    #[test]
+    fn taproot_tweak_matches_native_for_both_parities_and_the_exceptional_cases() {
+        let mut rng = Rng(14);
+        let mut parities = [0usize; 2];
+        let mut cases: Vec<([u8; 32], [u8; 32], bool)> = Vec::new();
+        for _ in 0..4 {
+            let mut d = rng.bytes();
+            let mut t = rng.bytes();
+            d[31] &= 0x7f;
+            t[31] &= 0x7f;
+            cases.push((d, t, true));
+        }
+        // lift_x(P) = [t] G (a doubling) and lift_x(P) = -[t] G (the identity).
+        let d = cases[0].0;
+        let odd = native_affine(&be(&d)).1[0] & 1 == 1;
+        let lifted_be = if odd {
+            secp_scalar_neg_mod_n(&be(&d))
+        } else {
+            be(&d)
+        };
+        cases.push((d, be(&lifted_be), true));
+        cases.push((d, be(&secp_scalar_neg_mod_n(&lifted_be)), false));
+        cases.push((d, [0; 32], false));
+
+        for (d, t, satisfiable) in cases {
+            let (px, py) = native_affine(&be(&d));
+            let odd = py[0] & 1 == 1;
+            parities[odd as usize] += 1;
+            let lifted = if odd {
+                secp_scalar_neg_mod_n(&be(&d))
+            } else {
+                be(&d)
+            };
+            let q_scalar = secp_scalar_add_mod_n(&lifted, &be(&t));
+
+            let mut cs = ConstraintSystem::new();
+            let d_bits = bit_vars(&mut cs, &d);
+            let t_bits = bit_vars(&mut cs, &t);
+            let internal = secp256k1_fixed_base_mul(&mut cs, &d_bits);
+            assert_eq!(eval_bytes(&cs, &internal.x.bytes_le), px);
+            let q = secp256k1_taproot_tweak(&mut cs, &internal, &t_bits);
+            let qx = secp256k1_taproot_tweak_x_only(&mut cs, &internal, &t_bits);
+            if satisfiable {
+                let want = SecpPoint::generator_mul_ct(&q_scalar)
+                    .to_compressed_bytes()
+                    .unwrap();
+                assert_eq!(eval_bytes(&cs, &q.x_only_bytes()), want[1..]);
+                assert_eq!(cs.eval(&q.y_is_odd()).to_canonical_u64() as u8, want[0] & 1);
+                let mut x_only = eval_bytes(&cs, &qx.bytes_le);
+                x_only.reverse();
+                assert_eq!(x_only, want[1..]);
+            }
+            let out = var_of(&q.x.bits_le[1]);
+            let (shape, z) = cs.finish();
+            assert_eq!(shape.is_satisfied(&z), satisfiable);
+            if satisfiable {
+                let mut bad = z.clone();
+                bad[out] = F::ONE - bad[out];
+                assert!(!shape.is_satisfied(&bad));
+            }
+        }
+        assert!(
+            parities[0] > 0 && parities[1] > 0,
+            "both parities of P must occur"
+        );
+    }
+
+    #[test]
+    fn add_fixed_base_matches_native_and_alloc_point_rejects_points_off_the_curve() {
+        let mut rng = Rng(15);
+        let mut k = rng.bytes();
+        k[31] &= 0x7f;
+        let mut i = rng.bytes();
+        i[31] &= 0x7f;
+        let minus_k = be(&secp_scalar_neg_mod_n(&be(&k)));
+        for (step, satisfiable) in [(i, true), (k, true), (minus_k, false), ([0; 32], false)] {
+            let (px, py) = native_affine(&be(&k));
+            let mut cs = ConstraintSystem::new();
+            let parent = secp256k1_alloc_point(&mut cs, &px, &py);
+            let bits = bit_vars(&mut cs, &step);
+            let child = secp256k1_add_fixed_base(&mut cs, &parent, &bits);
+            if satisfiable {
+                let sum = secp_scalar_add_mod_n(&be(&k), &be(&step));
+                let want = SecpPoint::generator_mul_ct(&sum)
+                    .to_compressed_bytes()
+                    .unwrap();
+                assert_eq!(eval_bytes(&cs, &child.compressed_bytes()), want);
+            }
+            let (shape, z) = cs.finish();
+            assert_eq!(shape.is_satisfied(&z), satisfiable);
+        }
+
+        let (px, py) = native_affine(&be(&k));
+        let mut off = py;
+        off[0] ^= 1;
+        let mut swapped = px;
+        swapped[3] ^= 0x10;
+        for (x, y, ok) in [
+            (px, py, true),
+            (px, off, false),
+            (swapped, py, false),
+            (py, px, false),
+        ] {
+            let mut cs = ConstraintSystem::new();
+            let _ = secp256k1_alloc_point(&mut cs, &x, &y);
+            let (shape, z) = cs.finish();
+            assert_eq!(shape.is_satisfied(&z), ok);
+        }
+    }
+
+    #[test]
+    fn ed25519_add_fixed_base_matches_native_including_doubling() {
+        let mut rng = Rng(16);
+        let mut a = rng.bytes();
+        a[31] &= 0x03;
+        // BIP32-Ed25519 shape: the step is 8 Z_L for a 224-bit Z_L.
+        let mut step = rng.bytes();
+        step[0] &= 0xf8;
+        step[28] &= 0x07;
+        step[29..].fill(0);
+        for b in [step, a] {
+            let sum = u256_add(&u256_from_bytes(&a), &u256_from_bytes(&b)).0;
+            let want = public_key_from_clamped_scalar(&le(&sum));
+            let mut cs = ConstraintSystem::new();
+            let (a_bits, b_bits) = (bit_vars(&mut cs, &a), bit_vars(&mut cs, &b));
+            let parent = ed25519_fixed_base_mul(&mut cs, &a_bits);
+            let child = ed25519_add_fixed_base(&mut cs, &parent, &b_bits);
+            assert_eq!(eval_bytes(&cs, &child.encoding_bytes()), want);
+            let out = var_of(&child.x_is_odd);
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+            let mut bad = z.clone();
+            bad[out] = F::ONE - bad[out];
+            assert!(!shape.is_satisfied(&bad));
+        }
+        // a + (l - a) is the identity.
+        let minus_a = u256_sub(&ED_L, &u256_from_bytes(&a)).0;
+        let mut cs = ConstraintSystem::new();
+        let (a_bits, b_bits) = (bit_vars(&mut cs, &a), bit_vars(&mut cs, &le(&minus_a)));
+        let parent = ed25519_fixed_base_mul(&mut cs, &a_bits);
+        let _ = ed25519_add_fixed_base(&mut cs, &parent, &b_bits);
+        let (shape, z) = cs.finish();
+        assert!(!shape.is_satisfied(&z));
+    }
+
+    #[test]
+    fn integer_bits_is_an_exact_sum_and_rejects_overflow_and_forged_carries() {
+        let mut rng = Rng(17);
+        let (a, b) = (rng.bytes(), [0xff; 32]);
+        let build = |width: usize| {
+            let mut cs = ConstraintSystem::new();
+            let (a_bits, b_bits) = (bit_vars(&mut cs, &a), bit_vars(&mut cs, &b));
+            // a + 8 b, the shape of k_L + 8 Z_L.
+            let sum = Lazy::from_bits(&a_bits).add(&Lazy::from_bits(&b_bits).scale(8));
+            let mut metered = Metered::new(&mut cs, Options::default());
+            let out = integer_bits(&mut metered, &sum, width);
+            let hints = metered.hints;
+            let value = eval_bytes(&cs, &out.bytes_le);
+            let limb = var_of(&out.bytes_le[5]);
+            let (shape, z) = cs.finish();
+            (shape, z, value, limb, hints)
+        };
+        let (shape, z, value, limb, hints) = build(260);
+        assert!(shape.is_satisfied(&z));
+        let (lo, carry) = u256_add(&u256_from_bytes(&a), &[!7, u64::MAX, u64::MAX, u64::MAX]);
+        // 8 * (2^256 - 1) = 2^259 - 8: low 256 bits are 2^256 - 8, plus 7 * 2^256.
+        assert_eq!(value[..32], le(&lo));
+        assert_eq!(value[32] as u64, 7 + carry);
+        assert!(hints.carries > 0 && hints.quotients == 0);
+        // Limb moved by one, with the neighbour compensating: only range rows object.
+        let mut bad = z.clone();
+        bad[limb] += F::from_u64_reduced(256);
+        bad[limb + 8] -= F::ONE;
+        let (range, other) = violated_rows(&shape, &bad);
+        assert!(
+            range >= 2 && other == 0,
+            "{range} range rows, {other} others"
+        );
+        // A changed limb alone breaks the chain.
+        let mut bad = z.clone();
+        bad[limb] += F::ONE;
+        assert!(!shape.is_satisfied(&bad));
+        // Too narrow an output cannot hold the sum.
+        let (shape, z, ..) = build(256);
+        assert!(!shape.is_satisfied(&z));
+    }
+
+    #[test]
+    fn hint_counts_and_product_only_comparisons() {
+        let k = secp_scalars()[11];
+        let build = |options: Options| {
+            let mut cs = ConstraintSystem::new();
+            let bits = bit_vars(&mut cs, &le(&k));
+            let mut metered = Metered::new(&mut cs, options);
+            secp256k1_enforce_scalar_range(&mut metered, &bits);
+            let pk = secp256k1_fixed_base_mul(&mut metered, &bits);
+            let hints = metered.hints;
+            let bytes = eval_bytes(&cs, &pk.compressed_bytes());
+            let rows = cs.num_rows();
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+            (hints, bytes, rows, shape.num_vars)
+        };
+        let (plain, bytes, rows, vars) = build(Options::default());
+        let (strict, strict_bytes, strict_rows, _) = build(Options {
+            product_only_comparisons: true,
+        });
+        assert_eq!(bytes, strict_bytes);
+        // 24 windows: 23 additions with a slope and an x each, plus the final y.
+        assert_eq!((plain.elements, plain.divisions), (47, 23));
+        assert_eq!(plain.element_bits, 47 * 256);
+        // Two reductions per addition, the tangent equation, the final y.
+        assert_eq!(plain.quotients, 48);
+        assert!(plain.zero_tests > 0);
+        assert_eq!(strict.zero_tests, 0);
+        assert_eq!(
+            (strict.elements, strict.quotient_bits, strict.carry_bits),
+            (plain.elements, plain.quotient_bits, plain.carry_bits)
+        );
+        assert!(strict_rows > rows && strict_rows * 2 < rows * 3);
+        // Every variable that is not a hint is a product or a linear image of products.
+        assert!(plain.variables() < vars);
+        println!("secp256k1 mul + range: {plain:?}; product-only rows {strict_rows} vs {rows}");
+    }
+
     #[test]
     #[ignore = "measurement"]
     fn row_census() {
@@ -3117,6 +3584,92 @@ mod tests {
             let bits = ed25519_clamp(&bit_vars(cs, &k));
             let _ = ed25519_fixed_base_mul(cs, &bits);
         });
+        report("255 scalar bits (overhead)", &|cs| {
+            let _ = bits255(cs, &u256_from_bytes(&k));
+        });
+        report("bls12-381 g1 fixed-base mul incl. scalar bits", &|cs| {
+            let mut scalar = u256_from_bytes(&k);
+            scalar[3] &= (1 << 62) - 1;
+            let bits = bits255(cs, &scalar);
+            let _ = bls12_381_g1_fixed_base_mul(cs, &bits);
+        });
+        let (px, py) = native_affine(&be(&[9; 32]));
+        report("secp256k1 alloc_point (curve membership)", &|cs| {
+            let _ = secp256k1_alloc_point(cs, &px, &py);
+        });
+        report(
+            "secp256k1 add_fixed_base incl. alloc_point and scalar bits",
+            &|cs| {
+                let parent = secp256k1_alloc_point(cs, &px, &py);
+                let bits = bit_vars(cs, &k);
+                let _ = secp256k1_add_fixed_base(cs, &parent, &bits);
+            },
+        );
+        report(
+            "secp256k1 taproot_tweak incl. alloc_point and tweak bits",
+            &|cs| {
+                let internal = secp256k1_alloc_point(cs, &px, &py);
+                let bits = bit_vars(cs, &k);
+                let _ = secp256k1_taproot_tweak(cs, &internal, &bits);
+            },
+        );
+        report(
+            "secp256k1 taproot_tweak_x_only incl. alloc_point and tweak bits",
+            &|cs| {
+                let internal = secp256k1_alloc_point(cs, &px, &py);
+                let bits = bit_vars(cs, &k);
+                let _ = secp256k1_taproot_tweak_x_only(cs, &internal, &bits);
+            },
+        );
+        report(
+            "ed25519 parent mul + add_fixed_base incl. 512 scalar bits",
+            &|cs| {
+                let a = ed25519_clamp(&bit_vars(cs, &k));
+                let b = ed25519_clamp(&bit_vars(cs, &k));
+                let parent = ed25519_fixed_base_mul(cs, &a);
+                let _ = ed25519_add_fixed_base(cs, &parent, &b);
+            },
+        );
+        let hints = |name: &str, build: &dyn Fn(&mut Metered)| {
+            let mut cs = ConstraintSystem::new();
+            let mut metered = Metered::new(&mut cs, Options::default());
+            build(&mut metered);
+            println!("hints {name}: {:?}", metered.hints);
+        };
+        hints("non-native mul", &|m| {
+            let (ea, eb) = (
+                Modulus::secp256k1_base().alloc(m, &a),
+                Modulus::secp256k1_base().alloc(m, &b),
+            );
+            let before = m.hints;
+            let _ = Modulus::secp256k1_base().mul(m, &ea.lazy(), &eb.lazy());
+            m.hints.elements -= before.elements;
+            m.hints.element_bits -= before.element_bits;
+        });
+        hints("secp256k1 fixed-base mul", &|m| {
+            let bits = bit_vars(m.cs, &k);
+            let _ = secp256k1_fixed_base_mul(m, &bits);
+        });
+        hints("ed25519 fixed-base mul", &|m| {
+            let bits = bit_vars(m.cs, &k);
+            let _ = ed25519_fixed_base_mul(m, &ed25519_clamp(&bits));
+        });
+        hints("bls12-381 g1 fixed-base mul", &|m| {
+            let mut scalar = u256_from_bytes(&k);
+            scalar[3] &= (1 << 62) - 1;
+            let bits = bits255(m.cs, &scalar);
+            let _ = bls12_381_g1_fixed_base_mul(m, &bits);
+        });
+        hints("secp256k1 taproot_tweak", &|m| {
+            let internal = secp256k1_alloc_point(m, &px, &py);
+            let before = m.hints;
+            let bits = bit_vars(m.cs, &k);
+            let _ = secp256k1_taproot_tweak(m, &internal, &bits);
+            m.hints.elements -= before.elements;
+            m.hints.element_bits -= before.element_bits;
+            m.hints.quotients -= before.quotients;
+        });
+
         let start = std::time::Instant::now();
         let fresh = Curve::secp256k1();
         println!(
