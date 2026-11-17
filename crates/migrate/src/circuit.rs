@@ -1,16 +1,13 @@
-//! Fixed-topology mixed-field ownership circuits and exact local conversions.
+//! Field elements of the five prime fields and GF(2) the general-quorum engine computes in.
 use crate::{
-    limbs, scalar,
+    bls12_381::{BLS_P, BLS_P_INV, BLS_P_MINUS_2, BLS_P_R2},
+    limbs,
+    pallas::{PALLAS_P, PALLAS_P_INV, PALLAS_P_MINUS_2, PALLAS_P_R2},
+    scalar,
     secp256k1_ct::{Fp256, SECP_P},
 };
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use dregg_sig_accel::{
-    ct::ct_zeroize_u64s,
-    goldilocks::{GOLDILOCKS_PRIME, gl_add, gl_mul, gl_sub},
-};
+use dregg_sig_accel::goldilocks::{GOLDILOCKS_PRIME, gl_add, gl_mul, gl_sub};
 
-pub(crate) type Wire = usize;
 pub(crate) type Value = [u64; 6];
 pub(crate) const ZERO: Value = [0; 6];
 pub(crate) const ONE: Value = [1, 0, 0, 0, 0, 0];
@@ -45,8 +42,14 @@ impl Domain {
 
     pub(crate) fn inverse(self, a: Value) -> Value {
         match self {
-            Self::PallasFp => lift4(crate::pallas::FpPallas(trunc4(a)).inv_or_zero().0),
-            Self::BlsFp => crate::bls12_381::FpBls381(a).inv_or_zero().0,
+            Self::PallasFp => lift4(limbs::mont_pow(
+                trunc4(a),
+                PALLAS_P_MINUS_2,
+                PALLAS_P,
+                PALLAS_P_INV,
+                PALLAS_P_R2,
+            )),
+            Self::BlsFp => limbs::mont_pow(a, BLS_P_MINUS_2, BLS_P, BLS_P_INV, BLS_P_R2),
             _ => {
                 let exp = limbs::sub_mod(self.modulus(), [2, 0, 0, 0, 0, 0], self.modulus());
                 let mut out = ONE;
@@ -66,8 +69,8 @@ impl Domain {
             Self::Gold => [GOLDILOCKS_PRIME, 0, 0, 0, 0, 0],
             Self::Secp => lift4(SECP_P),
             Self::Ed => lift4(scalar::ED_PRIME),
-            Self::PallasFp => lift4(crate::pallas::PALLAS_P),
-            Self::BlsFp => crate::bls12_381::BLS_P,
+            Self::PallasFp => lift4(PALLAS_P),
+            Self::BlsFp => BLS_P,
         }
     }
     pub(crate) fn width(self) -> usize {
@@ -112,12 +115,8 @@ impl Domain {
             Self::Gold => [gl_add(a[0], b[0]), 0, 0, 0, 0, 0],
             Self::Secp => lift4((Fp256(trunc4(a)) + Fp256(trunc4(b))).0),
             Self::Ed => lift4(limbs::add_mod(trunc4(a), trunc4(b), scalar::ED_PRIME)),
-            Self::PallasFp => lift4(limbs::add_mod(
-                trunc4(a),
-                trunc4(b),
-                crate::pallas::PALLAS_P,
-            )),
-            Self::BlsFp => limbs::add_mod(a, b, crate::bls12_381::BLS_P),
+            Self::PallasFp => lift4(limbs::add_mod(trunc4(a), trunc4(b), PALLAS_P)),
+            Self::BlsFp => limbs::add_mod(a, b, BLS_P),
         }
     }
     #[inline(always)]
@@ -127,12 +126,8 @@ impl Domain {
             Self::Gold => [gl_sub(a[0], b[0]), 0, 0, 0, 0, 0],
             Self::Secp => lift4((Fp256(trunc4(a)) - Fp256(trunc4(b))).0),
             Self::Ed => lift4(limbs::sub_mod(trunc4(a), trunc4(b), scalar::ED_PRIME)),
-            Self::PallasFp => lift4(limbs::sub_mod(
-                trunc4(a),
-                trunc4(b),
-                crate::pallas::PALLAS_P,
-            )),
-            Self::BlsFp => limbs::sub_mod(a, b, crate::bls12_381::BLS_P),
+            Self::PallasFp => lift4(limbs::sub_mod(trunc4(a), trunc4(b), PALLAS_P)),
+            Self::BlsFp => limbs::sub_mod(a, b, BLS_P),
         }
     }
     #[inline(always)]
@@ -143,309 +138,48 @@ impl Domain {
             Self::Secp => lift4((Fp256(trunc4(a)) * Fp256(trunc4(b))).0),
             Self::Ed => lift4(crate::ed25519_ct::multiply_limbs(trunc4(a), trunc4(b))),
             Self::PallasFp => {
-                lift4((crate::pallas::FpPallas(trunc4(a)) * crate::pallas::FpPallas(trunc4(b))).0)
+                let m = limbs::mont_mul(trunc4(a), trunc4(b), PALLAS_P, PALLAS_P_INV);
+                lift4(limbs::mont_mul(m, PALLAS_P_R2, PALLAS_P, PALLAS_P_INV))
             }
-            Self::BlsFp => (crate::bls12_381::FpBls381(a) * crate::bls12_381::FpBls381(b)).0,
+            Self::BlsFp => {
+                let m = limbs::mont_mul(a, b, BLS_P, BLS_P_INV);
+                limbs::mont_mul(m, BLS_P_R2, BLS_P, BLS_P_INV)
+            }
         }
     }
 }
-#[derive(Clone, Copy)]
-pub(crate) enum Op {
-    Input,
-    Constant(Value),
-    Add(Wire, Wire),
-    Sub(Wire, Wire),
-    Scale(Wire, Value),
-    Mul(Wire, Wire),
-    Lift(Wire, usize),
-    Digit(Wire, usize, usize),
-}
-pub(crate) struct Node {
-    pub(crate) domain: Domain,
-    pub(crate) op: Op,
-    pub(crate) value: Value,
-}
-pub(crate) struct Circuit {
-    pub(crate) nodes: Vec<Node>,
-    pub(crate) outputs: Vec<Wire>,
-}
-impl Drop for Node {
-    fn drop(&mut self) {
-        ct_zeroize_u64s(&mut self.value);
-    }
-}
-pub(crate) struct Builder {
-    nodes: RefCell<Vec<Node>>,
-    outputs: RefCell<Vec<Wire>>,
-}
+
 #[cfg(test)]
-std::thread_local! {
-    static FORBID_BUILD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-}
+mod tests {
+    use super::*;
 
-/// A deterministic work barrier: fail at construction, before allocating any nodes.
-#[cfg(test)]
-pub(crate) fn without_circuit_build<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORBID_BUILD.set(self.0);
-        }
-    }
-    let _restore = Restore(FORBID_BUILD.replace(true));
-    f()
-}
-
-// Written out so the test build can refuse construction; outside tests it equals the derive.
-#[cfg_attr(not(test), allow(clippy::derivable_impls))]
-impl Default for Builder {
-    fn default() -> Self {
-        #[cfg(test)]
-        assert!(
-            !FORBID_BUILD.get(),
-            "verifier constructed a circuit before structural rejection/authentication"
-        );
-        Self {
-            nodes: RefCell::default(),
-            outputs: RefCell::default(),
-        }
-    }
-}
-
-impl Builder {
-    fn push(&self, domain: Domain, op: Op, value: Value) -> Wire {
-        let mut ns = self.nodes.borrow_mut();
-        let w = ns.len();
-        if ns.len() == ns.capacity() {
-            // Vec growth would free copies of witness-dependent node values.
-            let mut grown = Vec::with_capacity(ns.capacity().saturating_mul(2).max(4));
-            grown.extend(ns.iter().map(|n| Node {
-                domain: n.domain,
-                op: n.op,
-                value: n.value,
-            }));
-            *ns = grown; // Node::drop wipes the old allocation, including on builder abort.
-        }
-        ns.push(Node { domain, op, value });
-        w
-    }
-    pub(crate) fn finish(self) -> Circuit {
-        Circuit {
-            nodes: self.nodes.into_inner(),
-            outputs: self.outputs.into_inner(),
-        }
-    }
-    pub(crate) fn value(&self, w: Wire) -> Value {
-        self.nodes.borrow()[w].value
-    }
-    pub(crate) fn domain(&self, w: Wire) -> Domain {
-        self.nodes.borrow()[w].domain
-    }
-    pub(crate) fn constant(&self, d: Domain, x: Value) -> Wire {
-        self.push(d, Op::Constant(x), x)
-    }
-    pub(crate) fn small(&self, d: Domain, x: u64) -> Wire {
-        self.constant(d, [x, 0, 0, 0, 0, 0])
-    }
-    pub(crate) fn input(&self, x: u8) -> Wire {
-        self.push(Domain::Bit, Op::Input, [u64::from(x & 1), 0, 0, 0, 0, 0])
-    }
-    fn known(&self, w: Wire) -> Option<Value> {
-        match self.nodes.borrow()[w].op {
-            Op::Constant(v) => Some(v),
-            _ => None,
-        }
-    }
-    pub(crate) fn add(&self, a: Wire, b: Wire) -> Wire {
-        let d = self.domain(a);
-        assert_eq!(d, self.domain(b));
-        match (self.known(a), self.known(b)) {
-            (Some(x), Some(y)) => self.constant(d, d.add(x, y)),
-            (Some(ZERO), _) => b,
-            (_, Some(ZERO)) => a,
-            _ => self.push(d, Op::Add(a, b), d.add(self.value(a), self.value(b))),
-        }
-    }
-    pub(crate) fn sub(&self, a: Wire, b: Wire) -> Wire {
-        let d = self.domain(a);
-        assert_eq!(d, self.domain(b));
-        if a == b {
-            return self.constant(d, ZERO);
-        }
-        match (self.known(a), self.known(b)) {
-            (Some(x), Some(y)) => self.constant(d, d.sub(x, y)),
-            (_, Some(ZERO)) => a,
-            _ => self.push(d, Op::Sub(a, b), d.sub(self.value(a), self.value(b))),
-        }
-    }
-    pub(crate) fn mul(&self, a: Wire, b: Wire) -> Wire {
-        let d = self.domain(a);
-        assert_eq!(d, self.domain(b));
-        match (self.known(a), self.known(b)) {
-            (Some(x), Some(y)) => self.constant(d, d.mul(x, y)),
-            (Some(x), _) => self.scale_value(b, x),
-            (_, Some(y)) => self.scale_value(a, y),
-            _ => self.push(d, Op::Mul(a, b), d.mul(self.value(a), self.value(b))),
-        }
-    }
-    pub(crate) fn scale_value(&self, a: Wire, x: Value) -> Wire {
-        let d = self.domain(a);
-        if x == ZERO {
-            return self.constant(d, ZERO);
-        }
-        if x == ONE {
-            return a;
-        }
-        let v = d.mul(self.value(a), x);
-        if self.known(a).is_some() {
-            self.constant(d, v)
-        } else {
-            self.push(d, Op::Scale(a, x), v)
-        }
-    }
-    pub(crate) fn scale(&self, a: Wire, x: u64) -> Wire {
-        self.scale_value(a, [x, 0, 0, 0, 0, 0])
-    }
-    pub(crate) fn not(&self, a: Wire) -> Wire {
-        self.add(a, self.small(Domain::Bit, 1))
-    }
-    pub(crate) fn select(&self, b: Wire, t: Wire, f: Wire) -> Wire {
-        self.add(f, self.mul(b, self.sub(t, f)))
-    }
-    pub(crate) fn output(&self, a: Wire) {
-        self.outputs.borrow_mut().push(a);
-    }
-    pub(crate) fn equal(&self, a: Wire, b: Wire) {
-        self.output(self.sub(a, b));
-    }
-    /// Each owner locally injects its own XOR share, then the arithmetic
-    /// circuit reconstructs XOR using x+y-2xy. No cross-domain equality oracle.
-    pub(crate) fn lift(&self, a: Wire, d: Domain) -> Wire {
-        assert_eq!(self.domain(a), Domain::Bit);
-        let parts: [Wire; 3] = core::array::from_fn(|p| {
-            self.push(d, Op::Lift(a, p), if p == 0 { self.value(a) } else { ZERO })
-        });
-        let xor = |x, y| self.sub(self.add(x, y), self.scale(self.mul(x, y), 2));
-        xor(xor(parts[0], parts[1]), parts[2])
-    }
-    pub(crate) fn pack(&self, bits: &[Wire], d: Domain) -> Wire {
-        bits.iter().rev().fold(self.small(d, 0), |a, &bit| {
-            self.add(self.scale(a, 2), self.lift(bit, d))
-        })
-    }
-    pub(crate) fn add_bits(&self, a: &[Wire], b: &[Wire], carry: Wire) -> (Vec<Wire>, Wire) {
-        let mut c = carry;
-        let out = a
-            .iter()
-            .zip(b)
-            .map(|(&x, &y)| {
-                let xc = self.add(x, c);
-                let yc = self.add(y, c);
-                let s = self.add(xc, y);
-                c = self.add(c, self.mul(xc, yc));
-                s
-            })
-            .collect();
-        (out, c)
-    }
-    pub(crate) fn constant_bits(&self, x: Value, width: usize) -> Vec<Wire> {
-        (0..width)
-            .map(|i| self.small(Domain::Bit, (x[i / 64] >> (i % 64)) & 1))
-            .collect()
-    }
-    fn modular_add_bits(&self, a: &[Wire], b: &[Wire], d: Domain) -> Vec<Wire> {
-        let (mut sum, carry) = self.add_bits(a, b, self.small(Domain::Bit, 0));
-        sum.push(carry);
-        let mut modulus = self.constant_bits(d.modulus(), a.len());
-        modulus.push(self.small(Domain::Bit, 0));
-        let complement: Vec<_> = modulus.iter().map(|&b| self.not(b)).collect();
-        let (diff, no_borrow) = self.add_bits(&sum, &complement, self.small(Domain::Bit, 1));
-        sum.iter()
-            .zip(&diff)
-            .take(a.len())
-            .map(|(&s, &v)| self.select(no_borrow, v, s))
-            .collect()
-    }
-    /// Canonically encode each local arithmetic share, then add and reduce
-    /// the three encodings inside GF(2). Both opened owners are checked locally.
-    pub(crate) fn bits(&self, a: Wire) -> Vec<Wire> {
-        let d = self.domain(a);
-        let width = d.width();
-        let parts: [Vec<Wire>; 3] = core::array::from_fn(|p| {
-            (0..width)
-                .map(|i| {
-                    let v = if p == 0 {
-                        (self.value(a)[i / 64] >> (i % 64)) & 1
-                    } else {
-                        0
-                    };
-                    self.push(Domain::Bit, Op::Digit(a, p, i), [v, 0, 0, 0, 0, 0])
-                })
-                .collect()
-        });
-        self.modular_add_bits(
-            &self.modular_add_bits(&parts[0], &parts[1], d),
-            &parts[2],
-            d,
-        )
-    }
-    pub(crate) fn require_canonical(&self, bits: &[Wire], order: Value) {
-        let complement: Vec<_> = self
-            .constant_bits(order, bits.len())
-            .iter()
-            .map(|&b| self.not(b))
-            .collect();
-        let (_, ge) = self.add_bits(bits, &complement, self.small(Domain::Bit, 1));
-        self.output(ge);
-    }
-    pub(crate) fn require_nonzero(&self, bits: &[Wire]) {
-        let all_zero = bits
-            .iter()
-            .fold(self.small(Domain::Bit, 1), |a, &b| self.mul(a, self.not(b)));
-        self.output(all_zero);
-    }
-    pub(crate) fn require_scalar(&self, bits: &[Wire], order: Value) {
-        self.require_canonical(bits, order);
-        self.require_nonzero(bits);
-    }
-    pub(crate) fn inverse(&self, a: Wire) -> Wire {
-        let d = self.domain(a);
-        // A private field input, independently shared just like the scalar bits.
-        // Only the multiplication constraint defines its relation to a.
-        let out = self.push(d, Op::Input, d.inverse(self.value(a)));
-        self.equal(self.mul(out, a), self.small(d, 1));
-        out
-    }
-}
-
-#[inline(always)]
-pub(crate) fn local(node: &Node, party: usize, wires: &[Value]) -> Value {
-    let d = node.domain;
-    match node.op {
-        Op::Constant(v) => {
-            if party == 0 {
-                v
-            } else {
-                ZERO
+    #[test]
+    fn every_prime_field_multiplies_and_inverts() {
+        for d in Domain::ALL_FIELDS {
+            let p = d.modulus();
+            let minus_one = d.sub(ZERO, ONE);
+            assert_eq!(d.add(minus_one, ONE), ZERO, "{d:?}");
+            assert_eq!(d.mul(minus_one, minus_one), ONE, "{d:?}");
+            assert!(d.canonical(minus_one) && !d.canonical(p), "{d:?}");
+            // 2 * (p + 1) / 2 = 1, and Fermat inversion agrees with it.
+            let two = d.add(ONE, ONE);
+            let mut half = p;
+            half[0] += 1;
+            let mut carry = 0;
+            for limb in half.iter_mut().rev() {
+                let next = *limb & 1;
+                *limb = (*limb >> 1) | (carry << 63);
+                carry = next;
             }
+            assert_eq!(d.mul(two, half), ONE, "{d:?}");
+            assert_eq!(d.inverse(two), half, "{d:?}");
+            let seven = [7, 0, 0, 0, 0, 0];
+            assert_eq!(d.mul(d.inverse(seven), seven), ONE, "{d:?}");
+            assert_eq!(
+                d.mul([3, 0, 0, 0, 0, 0], seven),
+                [21, 0, 0, 0, 0, 0],
+                "{d:?}"
+            );
         }
-        Op::Add(a, b) => d.add(wires[a], wires[b]),
-        Op::Sub(a, b) => d.sub(wires[a], wires[b]),
-        Op::Scale(a, v) => d.mul(wires[a], v),
-        Op::Lift(a, owner) => {
-            if party == owner {
-                wires[a]
-            } else {
-                ZERO
-            }
-        }
-        Op::Digit(a, owner, bit) => {
-            if party == owner {
-                [(wires[a][bit / 64] >> (bit % 64)) & 1, 0, 0, 0, 0, 0]
-            } else {
-                ZERO
-            }
-        }
-        Op::Input | Op::Mul(_, _) => ZERO,
     }
 }
