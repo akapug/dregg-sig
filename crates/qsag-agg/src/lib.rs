@@ -51,8 +51,7 @@
 //! [`zk_hem::protocol`] is a separate zero-knowledge argument over the same commitment scheme
 //! for relations built from S-box and multiplication rows ([`zk_hem::relation`]). Sumcheck
 //! masks and companion words are committed with the witness, and WHIR opens only their blend.
-//! [`zk_hem::blind_vc`] and [`zk_hem::multisig`] are the two relations defined on it. Aggregate
-//! proofs above are not zero-knowledge and do not use it.
+//! Aggregate proofs above are not zero-knowledge and do not use it.
 
 #![no_std]
 #![forbid(unsafe_code)]

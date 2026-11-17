@@ -26,10 +26,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-pub mod blind_vc;
-pub mod capability;
 pub mod full_shard;
-pub mod multisig;
 pub mod protocol;
 pub mod recursive_whir;
 pub mod relation;
