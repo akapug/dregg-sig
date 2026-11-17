@@ -5,6 +5,7 @@
 //! * [`engine`]: MAC-authenticated additive sharing over Goldilocks (SPDZ).
 //! * [`custody`]: from `(k, n)` Shamir or XOR custody shares of a secret to authenticated
 //!   shares of its bits.
+//! * [`prep`]: the dealerless ceremony that produces [`engine::Preprocessing`].
 //! * [`prover`]: one custodian's side of the proof, [`prover::prove_party`].
 //! * [`verify_threshold_ownership`]: the verifier for ownership statements.
 //!
@@ -157,10 +158,22 @@
 //! # Preprocessing
 //!
 //! The engine consumes Goldilocks triples and uniform values under two Goldilocks MAC
-//! keys, the algebra of `threshold_mpc::FieldShare`. `engine::Dealer` (tests and the
-//! `test-dealer` feature only) generates them from one seed and knows both keys. The
-//! dealerless ceremony of `threshold_prep` produces the same kinds of material but has
-//! not been connected to [`engine::Preprocessing`].
+//! keys. [`prep::run_preprocessing`] is the dealerless ceremony that produces every
+//! custodian's [`engine::Preprocessing`]: MASCOT-style triple generation and
+//! authentication over the OT mesh of `dregg_sig_core::preprocessing`, with security
+//! with abort against all members of the quorum but one. It runs all members' steps in
+//! one process on separated state and is not a wire protocol; its parameters and what
+//! its soundness arguments are worth are in the module documentation of [`prep`].
+//! `engine::Dealer` (tests and the `test-dealer` feature only) generates the same
+//! material from one seed and knows both keys.
+//!
+//! `prep::tests::measure_ceremony_rates` on hbox, three members, one thread: 1.93 ms
+//! per triple (65,536 triples in 126.2 s) and 63 microseconds per uniform value, after
+//! 1.1 s for the OT mesh. The 2,228,208 triples of one ownership statement below are
+//! therefore about 4,290 s (1.2 h) of ceremony for the quorum.
+//! `prep::tests::ceremony_output_drives_the_threshold_prover` runs the ceremony for a
+//! small relation (528 triples, 4,424 uniform values), inputs a clear assignment and
+//! proves on the result.
 //!
 //! # Measured cost
 //!
