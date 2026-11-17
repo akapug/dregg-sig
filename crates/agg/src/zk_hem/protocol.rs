@@ -6585,8 +6585,10 @@ mod tests {
     }
 
     /// Control for relations without lookups: the shape digest and the proof bytes of a
-    /// fixed relation, statement and seed are the ones computed before lookups existed
-    /// (commit bf3a1e9).
+    /// fixed relation, statement and seed. The digest is the one computed before lookups
+    /// existed (commit bf3a1e9). The proof bytes were pinned again after the coin
+    /// derivation of `prove` changed (bf31c9b, which binds the schedule); they were equal
+    /// to the pre-lookup bytes before that change.
     #[test]
     fn lookup_free_shape_digest_and_proof_bytes_are_unchanged() {
         let (shape, z) = preimage_relation([1, 77]);
@@ -6607,8 +6609,8 @@ mod tests {
             got,
             [
                 "429e960689855d733fa92e5004d8874f2af5874f1be6be678e647920c314004f",
-                "255467:aa2e775d1c2e1ddf6830c40151761d2eec6ee68efcb0f16e91fc6efc410ebb6f",
-                "204939:d6d40306fc1fb9406adaebbf471a8dc418f3e791d3c4a07d02f812dcfa36e4bf",
+                "255563:219b09c38dfae61e72e90efe3c316d115e84ace55cc5ded00cb34e78616688d5",
+                "205163:c2344f70e9e5280e45a189a3244b5ed24ffc54f4ba2d1ed0039148a8394ce0f0",
             ]
         );
     }

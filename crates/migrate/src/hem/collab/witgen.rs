@@ -426,9 +426,9 @@ fn sqrt(v: F) -> Option<F> {
         for _ in 0..m - i - 1 {
             b = b * b;
         }
-        x = x * b;
+        x *= b;
         c = b * b;
-        t = t * c;
+        t *= c;
         m = i;
     }
     Some(x)
@@ -462,8 +462,8 @@ fn interpolation_matrix(n: usize) -> Vec<Vec<F>> {
             .rev()
             .fold(F::ZERO, |acc, &c| acc * pt(j) + c);
         let inv = at.inv();
-        for k in 0..n {
-            out[k][j] = quotient[k] * inv;
+        for (row, &q) in out.iter_mut().zip(&quotient) {
+            row[j] = q * inv;
         }
     }
     out
@@ -1717,7 +1717,12 @@ pub(super) mod tests {
                 .collect();
             let mut plain = Plain::new(6);
             let z = Witgen::new(&mut plain)
-                .run(&shape, &defs, &st.public_inputs().unwrap(), &[bits.clone()])
+                .run(
+                    &shape,
+                    &defs,
+                    &st.public_inputs().unwrap(),
+                    core::slice::from_ref(&bits),
+                )
                 .unwrap();
             let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
             assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None);
