@@ -1,8 +1,7 @@
 //! Fixed-capacity multisignature with a witnessed policy as a zk-Hem relation.
 //!
-//! It uses committed masks intended to protect witness privacy. The composed simulator,
-//! unopened-leaf hiding bound, batching proximity loss and concrete knowledge-soundness
-//! bound remain unresolved; see [`protocol::prove`].
+//! It uses the committed-mask protocol; its security statement is summarised on
+//! [`protocol::prove`] and given in `crates/agg/SECURITY.md`.
 //!
 //! The only public inputs to the relation are the policy address and a 32-byte message:
 //!

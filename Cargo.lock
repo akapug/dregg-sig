@@ -112,6 +112,7 @@ dependencies = [
  "dregg-sig-accel",
  "dregg-sig-addr",
  "dregg-sig-asm",
+ "dregg-sig-core",
  "dregg-sig-fts",
  "dregg-sig-verified",
 ]

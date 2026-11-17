@@ -15,4 +15,4 @@ dregg-sig-addr = { path = "../addr" }
 dregg-sig-policy = { path = "../policy" }
 
 [features]
-std = ["dregg-sig-asm/std", "dregg-sig-core/std"]
+std = ["dregg-sig-asm/std", "dregg-sig-core/std", "dregg-sig-policy/std"]

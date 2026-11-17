@@ -23,15 +23,15 @@
 //! companions are committed with the witness and WHIR runs on the blended word only.
 //! [`relation`] is the constraint system it proves.
 //!
-//! These algebraic ingredients do not establish security of the composed Rust protocol.
-//! [`protocol::prove`] lists the unresolved composed simulator, unopened-leaf hiding bound,
-//! batching proximity loss and concrete knowledge-soundness bound. The name `zk-Hem`
-//! identifies the intended masking construction, not a completed zero-knowledge theorem.
+//! The security of the composed protocol (simulator, unopened-leaf hiding, batching
+//! proximity loss, knowledge soundness in the ROM and the QROM) is stated in
+//! `crates/agg/SECURITY.md`. [`bounds`] computes its numbers for a regime and a relation size.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 pub mod blind_vc;
+pub mod bounds;
 pub mod capability;
 pub mod full_shard;
 pub mod multisig;

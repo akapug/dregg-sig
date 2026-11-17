@@ -58,7 +58,11 @@ fn qsag(args: &[&str]) -> Output {
             )
             | (Some(&"hd"), Some(&"keygen" | &"recover" | &"export-rss"), _)
             | (Some(&"policy"), Some(&"init"), _)
-            | (Some(&"policy"), Some(&"biscuit"), Some(&"keygen" | &"mint"))
+            | (
+                Some(&"policy"),
+                Some(&"biscuit"),
+                Some(&"keygen" | &"mint" | &"verify")
+            )
     );
     let has_anchor = args.iter().any(|a| {
         matches!(
@@ -258,6 +262,11 @@ fn help_info_and_usage_errors() {
         "GoldilocksExt4",
         "WHIR",
         "CanopyMultiProof",
+        "qsag-migration-proof-v2",
+        "\"kind\": \"btc-hash160\"",
+        "\"kind\": \"eth-eoa\"",
+        "\"kind\": \"ed25519\"",
+        "\"kind\": \"bip32-secp256k1\"",
     ] {
         assert!(info.contains(needle), "info lacks {needle}");
     }
@@ -269,6 +278,31 @@ fn help_info_and_usage_errors() {
 
     expect(&[], 1);
     expect(&["frobnicate"], 1);
+    let migrate_help = expect(&["migrate", "--help"], 0);
+    for needle in ["claim", "prove", "verify", "registry", "btc-hash160", "bip32-secp256k1"] {
+        assert!(migrate_help.contains(needle), "migrate --help lacks {needle}");
+    }
+    for sub in [
+        &["claim"][..],
+        &["commit"],
+        &["prove"],
+        &["verify"],
+        &["registry"],
+        &["registry", "init"],
+        &["registry", "register"],
+        &["registry", "enroll"],
+        &["registry", "finalize"],
+        &["registry", "lookup"],
+    ] {
+        let mut args = vec!["migrate"];
+        args.extend_from_slice(sub);
+        args.push("--help");
+        assert!(!expect(&args, 0).is_empty(), "{args:?}");
+    }
+    expect(&["migrate"], 1);
+    expect(&["migrate", "frobnicate"], 1);
+    expect(&["migrate", "registry"], 1);
+    expect(&["migrate", "registry", "frobnicate"], 1);
     expect(
         &[
             "keygen",
@@ -2690,8 +2724,8 @@ fn e2e_hem_quorum_switch_2of3_to_3of5_and_untrusted_public_aggregate() {
 }
 
 #[test]
-fn e2e_cred_hd_and_migrate_subcommands() {
-    let dir = Workdir::new("cred-hd-migrate");
+fn e2e_cred_and_hd_subcommands() {
+    let dir = Workdir::new("cred-hd");
     let (msg, other) = (dir.path("msg"), dir.path("other"));
 
     // 1. `dregg-sig cred`: (2, 5) TOPRF + dealerless (2, 3) FIPS 204 threshold ML-DSA-44
@@ -2927,8 +2961,6 @@ fn e2e_cred_hd_and_migrate_subcommands() {
         ],
         0,
     );
-    let target_pq_addr = json_member(&dir.read("hd-child3.json"), "address");
-
     // 1 custodian (< threshold 2) cannot recover the child signing key (exit 4).
     expect(
         &[
@@ -2991,93 +3023,6 @@ fn e2e_cred_hd_and_migrate_subcommands() {
             &hd_child3_sig,
         ],
         0,
-    );
-
-    // 3. `dregg-sig migrate`: 438-rep ZKBoo classical-to-PQ migration proof to `target_pq_addr`
-    let legacy_key = dir.path("legacy-secp.hex");
-    std::fs::write(
-        &legacy_key,
-        "0000000000000000000000000000000000000000000000000000000000000001\n",
-    )
-    .unwrap();
-    let mig_claim = dir.path("mig-claim.json");
-    let mig_proof = dir.path("mig.proof");
-    let migration_domain = "42".repeat(32);
-    expect(
-        &[
-            "migrate",
-            "commit",
-            "--kind",
-            "btc-taproot",
-            "--legacy-secret",
-            &legacy_key,
-            "--out",
-            &mig_claim,
-        ],
-        0,
-    );
-    expect(
-        &[
-            "migrate",
-            "prove",
-            "--kind",
-            "btc-taproot",
-            "--legacy-secret",
-            &legacy_key,
-            "--target",
-            &target_pq_addr,
-            "--epoch",
-            "42",
-            "--out",
-            &mig_proof,
-            "--domain-hex",
-            &migration_domain,
-            "--deterministic",
-        ],
-        0,
-    );
-    expect(
-        &[
-            "migrate",
-            "verify",
-            "--proof",
-            &mig_proof,
-            "--domain-hex",
-            &migration_domain,
-            "--target",
-            &target_pq_addr,
-            "--epoch",
-            "42",
-        ],
-        0,
-    );
-    // A foreign campaign requires an explicit verifier-selected domain.
-    expect(&["migrate", "verify", "--proof", &mig_proof], 2);
-    // Wrong epoch or tampered proof fails verification with exit code 2.
-    expect(
-        &[
-            "migrate",
-            "verify",
-            "--proof",
-            &mig_proof,
-            "--domain-hex",
-            &migration_domain,
-            "--epoch",
-            "43",
-        ],
-        2,
-    );
-    flip_hex_digit(&mig_proof, "zk_proof");
-    expect(
-        &[
-            "migrate",
-            "verify",
-            "--proof",
-            &mig_proof,
-            "--domain-hex",
-            &migration_domain,
-        ],
-        2,
     );
 }
 
@@ -3382,6 +3327,39 @@ fn e2e_policy_macaroon_attenuation_third_party_discharge_and_refusal() {
         ],
         0,
     );
+    // A macaroon is a reusable bearer grant: verification keeps no state, so the same
+    // token and discharge verify again, and the output says so instead of implying
+    // that the grant was spent.
+    let again = expect(
+        &[
+            "policy",
+            "macaroon",
+            "verify",
+            "--key",
+            &root_key,
+            "--in",
+            &tok1,
+            "--audience-hex",
+            audience,
+            "--resource-hex",
+            resource,
+            "--actions",
+            "3",
+            "--amount",
+            huge_amount,
+            "--now",
+            "1700000000",
+            "--discharge",
+            &dis_bound,
+            "--discharge-key",
+            &tp_key,
+            "--json",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&again, "valid"), "true");
+    assert_eq!(json_member(&again, "consumed"), "false");
+    assert_eq!(json_member(&again, "reusable"), "true");
     // Spending 1 unit over the u128 max-amount cap is denied (exit 3).
     expect(
         &[
@@ -3976,11 +3954,1200 @@ fn passphrase_biscuit_authority_survives_multiple_anchored_mints() {
     }
 }
 
+// A seal consumed after a backup of the verifier's seal store must stay consumed when
+// the backup is put back. Without an anchor the restored store accepts it again.
+#[cfg(unix)]
+#[test]
+fn biscuit_seal_store_anchor_refuses_a_restored_store() {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = Workdir::new("seal-store-rollback");
+    let private = |name: &str| {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path(name))
+            .unwrap();
+        dir.path(name)
+    };
+    let sk = dir.path("authority.sk");
+    let pk = dir.path("authority.pk");
+    let audience = "12".repeat(32);
+    let resource = "34".repeat(32);
+    expect(
+        &[
+            "policy",
+            "biscuit",
+            "keygen",
+            "--secret-out",
+            &sk,
+            "--public-out",
+            &pk,
+            "--tree-height",
+            "2",
+        ],
+        0,
+    );
+    let seal = |n: usize| {
+        let token = dir.path(&format!("token-{n}"));
+        let step = dir.path(&format!("step-{n}"));
+        let sealed = dir.path(&format!("sealed-{n}"));
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "mint",
+                "--secret",
+                &sk,
+                "--audience-hex",
+                &audience,
+                "--resource-hex",
+                &resource,
+                "--token-out",
+                &token,
+                "--step-key-out",
+                &step,
+            ],
+            0,
+        );
+        expect(
+            &[
+                "policy",
+                "biscuit",
+                "seal",
+                "--in",
+                &token,
+                "--step-key",
+                &step,
+                "--out",
+                &sealed,
+            ],
+            0,
+        );
+        sealed
+    };
+    let verify = |sealed: &str, store: &str, extra: &[&str]| {
+        let mut args = vec![
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            sealed,
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            store,
+        ];
+        args.extend_from_slice(extra);
+        qsag(&args)
+    };
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    for anchored in [false, true] {
+        let store_dir = private(if anchored {
+            "anchored-store"
+        } else {
+            "bare-store"
+        });
+        let store = format!("{store_dir}/seals");
+        let anchor_dir = private(if anchored {
+            "anchor-a"
+        } else {
+            "anchor-unused"
+        });
+        let anchor: Vec<&str> = if anchored {
+            vec!["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"]
+        } else {
+            vec!["--ephemeral-unanchored"]
+        };
+        let with = |extra: &[&'static str]| -> Vec<&str> {
+            anchor
+                .iter()
+                .copied()
+                .chain(extra.iter().copied())
+                .collect()
+        };
+        let (first, second) = (
+            seal(usize::from(anchored) * 2),
+            seal(usize::from(anchored) * 2 + 1),
+        );
+
+        let created = verify(&first, &store, &with(&["--create-seal-store"]));
+        assert_eq!(code(&created), 0, "{}", stderr(&created));
+        let backup = snapshot_dir_files(Path::new(&store_dir));
+        let accepted = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&accepted), 0, "{}", stderr(&accepted));
+        let replayed = verify(&second, &store, &with(&[]));
+        assert_eq!(code(&replayed), 3, "{}", stderr(&replayed));
+        let current = snapshot_dir_files(Path::new(&store_dir));
+
+        // The store directory goes back to the backup, every inode kept.
+        restore_dir_files_in_place(&backup);
+        let after_restore = verify(&second, &store, &with(&[]));
+        if anchored {
+            assert_eq!(code(&after_restore), 4, "{}", stderr(&after_restore));
+            assert!(
+                stderr(&after_restore).contains("rollback"),
+                "{}",
+                stderr(&after_restore)
+            );
+            // The anchor requirement cannot be dropped to get around it.
+            let waived = verify(&second, &store, &["--ephemeral-unanchored"]);
+            assert_eq!(code(&waived), 4, "{}", stderr(&waived));
+            assert!(stderr(&waived).contains("must be opened with it"));
+            // The current store still opens and still refuses the consumed seals.
+            restore_dir_files_in_place(&current);
+            for sealed in [&first, &second] {
+                let refused = verify(sealed, &store, &with(&[]));
+                assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+            }
+        } else {
+            // No anchor: the consumed seal is accepted a second time.
+            assert_eq!(code(&after_restore), 0, "{}", stderr(&after_restore));
+            // And an unanchored store cannot be claimed to be anchored afterwards.
+            let claimed = verify(
+                &first,
+                &store,
+                &["--anchor-dir", &anchor_dir, "--allow-single-disk-anchor"],
+            );
+            assert_eq!(code(&claimed), 4, "{}", stderr(&claimed));
+            assert!(stderr(&claimed).contains("without an external anchor"));
+        }
+    }
+    // Neither an anchor nor the waiver: the command refuses to pick for the operator.
+    let output = Command::new(env!("CARGO_BIN_EXE_dregg-sig"))
+        .args([
+            "policy",
+            "biscuit",
+            "verify",
+            "--public",
+            &pk,
+            "--in",
+            &dir.path("sealed-3"),
+            "--audience-hex",
+            &audience,
+            "--resource-hex",
+            &resource,
+            "--seal-store",
+            &dir.path("undecided"),
+            "--create-seal-store",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(!Path::new(&dir.path("undecided")).exists());
+}
+
+/// secp256k1 secret key 1: public key `G`.
+const SECP_KEY_ONE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+/// A post-quantum address to migrate to: the address of a fresh SLH-DSA key.
+fn migration_target(dir: &Workdir, name: &str) -> String {
+    let public = dir.path(&format!("{name}.pk"));
+    expect(
+        &[
+            "keygen",
+            "--scheme",
+            "slh-dsa-shake-128s",
+            "--secret-out",
+            &dir.path(&format!("{name}.sk")),
+            "--public-out",
+            &public,
+        ],
+        0,
+    );
+    json_member(&std::fs::read_to_string(public).unwrap(), "address")
+}
+
+/// `migrate prove` of `kind` for the secret in `secret` to `target` at `epoch`, in the
+/// default domain unless `extra` names one. Returns the proof path.
+fn migrate_prove(
+    dir: &Workdir,
+    out: &str,
+    kind: &str,
+    secret: &str,
+    target: &str,
+    epoch: &str,
+    extra: &[&str],
+) -> String {
+    let out = dir.path(out);
+    let mut args = vec![
+        "migrate",
+        "prove",
+        "--kind",
+        kind,
+        "--legacy-secret",
+        secret,
+        "--target",
+        target,
+        "--epoch",
+        epoch,
+        "--out",
+        &out,
+        "--deterministic",
+    ];
+    args.extend_from_slice(extra);
+    expect(&args, 0);
+    out
+}
+
+#[test]
+fn migrate_every_statement_kind_claims_proves_and_verifies() {
+    let dir = Workdir::new("migrate-kinds");
+    let target = migration_target(&dir, "target");
+    let write = |name: &str, contents: &str| {
+        let path = dir.path(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    let secp = write("secp.hex", &format!("{SECP_KEY_ONE}\n"));
+    // RFC 8032 section 7.1, test 1.
+    let ed = write(
+        "ed.hex",
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    );
+    // BIP-32 test vector 1.
+    let seed = write("seed.hex", "000102030405060708090a0b0c0d0e0f");
+
+    // (kind as typed, canonical kind, secret, path, member holding the legacy value, value)
+    type Case<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, &'a str, &'a str);
+    let cases: [Case; 6] = [
+        (
+            "btc-p2wpkh",
+            "btc-hash160",
+            &secp,
+            None,
+            "legacy_hash160",
+            "751e76e8199196d454941c45d1b3a323f1433bd6",
+        ),
+        (
+            "btc-p2pkh",
+            "btc-hash160",
+            &secp,
+            None,
+            "legacy_hash160",
+            "751e76e8199196d454941c45d1b3a323f1433bd6",
+        ),
+        (
+            "eth-eoa",
+            "eth-eoa",
+            &secp,
+            None,
+            "legacy_address",
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+        ),
+        (
+            "ed25519",
+            "ed25519",
+            &ed,
+            None,
+            "legacy_public_key",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        ),
+        (
+            "bip32-secp256k1",
+            "bip32-secp256k1",
+            &seed,
+            Some("m/0'/1"),
+            "legacy_hash160",
+            "bef5a2f9a56a94aab12459f72ad9cf8cf19c7bbe",
+        ),
+        (
+            "bip32",
+            "bip32-secp256k1",
+            &seed,
+            Some("m/0h"),
+            "legacy_hash160",
+            "5c1bd648ed23aa5fd50ba52b2457c11e9e80a6a7",
+        ),
+    ];
+    for (index, (kind, canonical, secret, path, member, value)) in cases.into_iter().enumerate() {
+        let claim = dir.path(&format!("claim-{index}.json"));
+        let proof = dir.path(&format!("proof-{index}.json"));
+        let statement = |command: &'static str, out: &str| {
+            let mut args = vec![
+                "migrate",
+                command,
+                "--kind",
+                kind,
+                "--legacy-secret",
+                secret,
+                "--target",
+                target.as_str(),
+                "--epoch",
+                "42",
+                "--out",
+                out,
+            ];
+            if let Some(path) = path {
+                args.extend(["--path", path]);
+            }
+            expect(&args, 0)
+        };
+        statement("claim", &claim);
+        let claim_text = std::fs::read_to_string(&claim).unwrap();
+        assert_eq!(
+            json_member(&claim_text, "format"),
+            "qsag-migration-claim-v2"
+        );
+        assert_eq!(json_member(&claim_text, "kind"), canonical, "{kind}");
+        assert_eq!(json_member(&claim_text, member), value, "{kind}");
+        assert_eq!(json_member(&claim_text, "target_pq_address"), target);
+        assert_eq!(json_member(&claim_text, "epoch"), "42");
+        assert_eq!(
+            json_member(&claim_text, "key_exposure"),
+            if canonical.starts_with("btc") || canonical == "eth-eoa" {
+                "hidden"
+            } else {
+                "revealed"
+            },
+            "{kind}"
+        );
+
+        statement("prove", &proof);
+        let proof_text = std::fs::read_to_string(&proof).unwrap();
+        assert_eq!(
+            json_member(&proof_text, "format"),
+            "qsag-migration-proof-v2"
+        );
+        // The proof file states the claim's statement, byte for byte.
+        for shared in [
+            "statement",
+            "nullifier",
+            "legacy_id",
+            "pq_commitment",
+            member,
+        ] {
+            assert_eq!(
+                json_member(&proof_text, shared),
+                json_member(&claim_text, shared),
+                "{kind} {shared}"
+            );
+        }
+        let proof_bytes: usize = json_member(&proof_text, "proof_bytes").parse().unwrap();
+        assert!(
+            (300_000..2_000_000).contains(&proof_bytes),
+            "{kind}: {proof_bytes} proof bytes"
+        );
+        assert!(proof_text.len() < proof_bytes * 4 / 3 + 4096, "{kind}");
+
+        let verified = expect(
+            &[
+                "migrate", "verify", "--proof", &proof, "--epoch", "42", "--target", &target,
+                "--json",
+            ],
+            0,
+        );
+        assert_eq!(json_member(&verified, "valid"), "true");
+        assert_eq!(json_member(&verified, member), value, "{kind}");
+    }
+    // The nullifier is per on-chain credential: the two spellings of the HASH160 kind
+    // agree, and the Ethereum address of the same key has its own.
+    let nullifier = |index: usize| {
+        json_member(
+            &std::fs::read_to_string(dir.path(&format!("claim-{index}.json"))).unwrap(),
+            "nullifier",
+        )
+    };
+    assert_eq!(nullifier(0), nullifier(1));
+    assert_ne!(nullifier(0), nullifier(2));
+    assert_ne!(nullifier(0), nullifier(3));
+    assert_ne!(nullifier(4), nullifier(5));
+
+    // Options that do not fit the kind, and inputs that are not valid secrets.
+    let out = dir.path("refused.json");
+    let refused = |args: &[&str], needle: &str| {
+        let mut full = vec!["migrate", "claim", "--out", &out, "--epoch", "1"];
+        full.extend_from_slice(args);
+        let output = qsag(&full);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(code(&output), 1, "{args:?}: {stderr}");
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+        assert!(!Path::new(&out).exists(), "{args:?}");
+    };
+    let t = target.as_str();
+    refused(
+        &[
+            "--kind",
+            "btc-p2wsh",
+            "--legacy-secret",
+            &secp,
+            "--target",
+            t,
+        ],
+        "unsupported --kind",
+    );
+    refused(
+        &[
+            "--kind",
+            "btc-p2wpkh",
+            "--legacy-secret",
+            &secp,
+            "--target",
+            t,
+            "--path",
+            "m/0",
+        ],
+        "--path does not apply",
+    );
+    refused(
+        &["--kind", "bip32", "--legacy-secret", &seed, "--target", t],
+        "requires --path",
+    );
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &seed,
+            "--target",
+            t,
+            "--path",
+            "44'/0'",
+        ],
+        "not a BIP-32 path",
+    );
+    // A 16-byte seed is not a 32-byte key, and a 32-byte raw file is not a hex seed.
+    refused(
+        &["--kind", "eth-eoa", "--legacy-secret", &seed, "--target", t],
+        "must be 32 bytes",
+    );
+    let raw = dir.path("raw.bin");
+    std::fs::write(&raw, [0xa5u8; 32]).unwrap();
+    refused(
+        &[
+            "--kind",
+            "bip32",
+            "--legacy-secret",
+            &raw,
+            "--target",
+            t,
+            "--path",
+            "m",
+        ],
+        "must be hex",
+    );
+    let zero = write("zero.hex", &"00".repeat(32));
+    refused(
+        &[
+            "--kind",
+            "btc-p2wpkh",
+            "--legacy-secret",
+            &zero,
+            "--target",
+            t,
+        ],
+        "not a valid btc-hash160 secret",
+    );
+    refused(
+        &[
+            "--kind",
+            "btc-p2wpkh",
+            "--legacy-secret",
+            &secp,
+            "--target",
+            "qsp1notanaddress",
+        ],
+        "invalid --target",
+    );
+    // A raw 32-byte key file is read as the key itself.
+    expect(
+        &[
+            "migrate",
+            "claim",
+            "--kind",
+            "ed25519",
+            "--legacy-secret",
+            &raw,
+            "--target",
+            t,
+            "--epoch",
+            "1",
+        ],
+        0,
+    );
+}
+
+#[test]
+fn migrate_verify_refuses_wrong_target_epoch_domain_and_altered_files() {
+    let dir = Workdir::new("migrate-verify");
+    let target = migration_target(&dir, "target");
+    let other_target = migration_target(&dir, "other-target");
+    let secp = dir.path("secp.hex");
+    std::fs::write(&secp, SECP_KEY_ONE).unwrap();
+    let domain = "42".repeat(32);
+    let proof = migrate_prove(
+        &dir,
+        "proof.json",
+        "eth-eoa",
+        &secp,
+        &target,
+        "42",
+        &["--domain-hex", &domain],
+    );
+    let verify = |file: &str, epoch: &str, extra: &[&str], expected: i32, needle: &str| {
+        let mut args = vec!["migrate", "verify", "--proof", file, "--epoch", epoch];
+        args.extend_from_slice(extra);
+        let output = qsag(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(code(&output), expected, "{args:?}: {stderr}");
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    };
+    let in_domain = ["--domain-hex", domain.as_str()];
+    verify(&proof, "42", &in_domain, 0, "");
+    verify(
+        &proof,
+        "42",
+        &["--domain-hex", &domain, "--target", &target],
+        0,
+        "",
+    );
+    // The verifier names the epoch; there is no default.
+    let output = qsag(&[
+        "migrate",
+        "verify",
+        "--proof",
+        &proof,
+        "--domain-hex",
+        &domain,
+    ]);
+    assert_eq!(code(&output), 1);
+    verify(&proof, "43", &in_domain, 2, "epoch");
+    // The default domain is not the proof's, nor is any other.
+    verify(&proof, "42", &[], 2, "another migration domain");
+    verify(
+        &proof,
+        "42",
+        &["--domain-hex", &"43".repeat(32)],
+        2,
+        "another migration domain",
+    );
+    verify(
+        &proof,
+        "42",
+        &["--domain-hex", &domain, "--target", &other_target],
+        2,
+        "another target",
+    );
+
+    let original = std::fs::read_to_string(&proof).unwrap();
+    let altered = dir.path("altered.json");
+    let write_altered = |text: String| {
+        assert_ne!(text, original);
+        std::fs::write(&altered, text).unwrap();
+    };
+    // A changed proof body.
+    std::fs::write(&altered, &original).unwrap();
+    flip_hex_digit(&altered, "proof");
+    assert_ne!(std::fs::read_to_string(&altered).unwrap(), original);
+    verify(&altered, "42", &in_domain, 2, "");
+    // A rendered member that no longer matches the statement: the epoch, the target.
+    write_altered(original.replace("\"epoch\": 42", "\"epoch\": 43"));
+    verify(&altered, "43", &in_domain, 2, "\"epoch\" does not match");
+    write_altered(original.replace(&target, &other_target));
+    verify(&altered, "42", &in_domain, 2, "commits to");
+    // A statement for another epoch with its rendering made consistent: the proof is
+    // bound to the original statement and fails.
+    let other_epoch = migrate_prove(
+        &dir,
+        "epoch-43.json",
+        "eth-eoa",
+        &secp,
+        &target,
+        "43",
+        &["--domain-hex", &domain],
+    );
+    let other_epoch = std::fs::read_to_string(other_epoch).unwrap();
+    let proof_member = |text: &str| json_member(text, "proof");
+    write_altered(
+        other_epoch
+            .replace(&proof_member(&other_epoch), &proof_member(&original))
+            .replace(
+                &format!("\"proof_bytes\": {}", json_member(&other_epoch, "proof_bytes")),
+                &format!("\"proof_bytes\": {}", json_member(&original, "proof_bytes")),
+            ),
+    );
+    verify(&altered, "43", &in_domain, 2, "verification failed");
+    // Trailing proof bytes, a length that lies, an extra member, another format.
+    let body = proof_member(&original);
+    write_altered(original.replace(&body, &format!("{body}AAAA")));
+    verify(&altered, "42", &in_domain, 2, "");
+    let length = json_member(&original, "proof_bytes");
+    write_altered(original.replace(&format!("\"proof_bytes\": {length}"), "\"proof_bytes\": 1"));
+    verify(&altered, "42", &in_domain, 2, "proof_bytes");
+    write_altered(original.replace("\"kind\":", "\"note\": \"x\",\n  \"kind\":"));
+    verify(&altered, "42", &in_domain, 2, "unexpected member");
+    write_altered(original.replace("qsag-migration-proof-v2", "qsag-migration-proof-v1"));
+    verify(
+        &altered,
+        "42",
+        &in_domain,
+        2,
+        "not a qsag-migration-proof-v2",
+    );
+    // A proof padded far beyond any proof of the statement is refused by its size.
+    write_altered(original.replace(&body, &"A".repeat(4 * body.len())));
+    verify(&altered, "42", &in_domain, 2, "larger than any proof");
+    // A claim file is not a proof.
+    let claim = dir.path("claim.json");
+    expect(
+        &[
+            "migrate",
+            "claim",
+            "--kind",
+            "eth-eoa",
+            "--legacy-secret",
+            &secp,
+            "--target",
+            &target,
+            "--epoch",
+            "42",
+            "--domain-hex",
+            &domain,
+            "--out",
+            &claim,
+        ],
+        0,
+    );
+    verify(&claim, "42", &in_domain, 2, "not a qsag-migration-proof-v2");
+    // `prove` never overwrites.
+    let output = qsag(&[
+        "migrate",
+        "prove",
+        "--kind",
+        "eth-eoa",
+        "--legacy-secret",
+        &secp,
+        "--target",
+        &target,
+        "--epoch",
+        "42",
+        "--out",
+        &proof,
+    ]);
+    assert_eq!(code(&output), 5);
+    assert_eq!(std::fs::read_to_string(&proof).unwrap(), original);
+}
+
+#[test]
+fn migrate_registry_records_each_credential_once() {
+    let dir = Workdir::new("migrate-registry");
+    let target = migration_target(&dir, "target");
+    let other_target = migration_target(&dir, "other-target");
+    let key = |name: &str, hex: &str| {
+        let path = dir.path(name);
+        std::fs::write(&path, hex).unwrap();
+        path
+    };
+    let first = key("first.hex", SECP_KEY_ONE);
+    let second = key("second.hex", &format!("{}02", "00".repeat(31)));
+    let third = key("third.hex", &format!("{}03", "00".repeat(31)));
+    let registry = dir.path("registry");
+    let reg = ["--registry-dir", registry.as_str()];
+
+    // Creation names its rollback protection or waives it, in a fresh directory.
+    expect(
+        &["migrate", "registry", "init", "--registry-dir", &registry],
+        1,
+    );
+    assert!(!Path::new(&registry).exists());
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &registry,
+            "--ephemeral-unanchored",
+        ],
+        0,
+    );
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &registry,
+            "--ephemeral-unanchored",
+        ],
+        4,
+    );
+
+    let run = |args: &[&str], expected: i32| -> String {
+        let mut full = args.to_vec();
+        full.extend_from_slice(&reg);
+        full.push("--json");
+        expect(&full, expected)
+    };
+    let lookup =
+        |selector: &str, value: &str| run(&["migrate", "registry", "lookup", selector, value], 0);
+
+    let proof = migrate_prove(&dir, "first.json", "btc-p2wpkh", &first, &target, "7", &[]);
+    let proof_text = std::fs::read_to_string(&proof).unwrap();
+    let nullifier = json_member(&proof_text, "nullifier");
+    let legacy_id = json_member(&proof_text, "legacy_id");
+    assert_eq!(
+        json_member(&lookup("--statement", &proof), "status"),
+        "absent"
+    );
+
+    // A proof that does not verify registers nothing.
+    let bad = dir.path("bad.json");
+    std::fs::write(&bad, &proof_text).unwrap();
+    flip_hex_digit(&bad, "proof");
+    run(
+        &[
+            "migrate",
+            "verify",
+            "--register",
+            "--proof",
+            &bad,
+            "--epoch",
+            "7",
+        ],
+        2,
+    );
+    run(
+        &[
+            "migrate",
+            "verify",
+            "--register",
+            "--proof",
+            &proof,
+            "--epoch",
+            "8",
+        ],
+        2,
+    );
+    assert_eq!(
+        json_member(&lookup("--nullifier", &nullifier), "status"),
+        "absent"
+    );
+    // `--register` needs a registry, and registry options need `--register`.
+    expect(
+        &[
+            "migrate",
+            "verify",
+            "--register",
+            "--proof",
+            &proof,
+            "--epoch",
+            "7",
+        ],
+        1,
+    );
+    expect(
+        &[
+            "migrate",
+            "verify",
+            "--proof",
+            &proof,
+            "--epoch",
+            "7",
+            "--registry-dir",
+            &registry,
+        ],
+        1,
+    );
+
+    // Verify and register in one step; the same proof again is accepted and writes nothing.
+    let receipt = run(
+        &[
+            "migrate",
+            "verify",
+            "--register",
+            "--proof",
+            &proof,
+            "--epoch",
+            "7",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&receipt, "status"), "finalized");
+    assert_eq!(json_member(&receipt, "appended"), "true");
+    let checkpoint = json_member(&receipt, "checkpoint");
+    assert!(checkpoint.starts_with("1:"), "{checkpoint}");
+    let again = run(
+        &[
+            "migrate", "registry", "register", "--proof", &proof, "--epoch", "7",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&again, "status"), "finalized");
+    assert_eq!(json_member(&again, "appended"), "false");
+    assert_eq!(json_member(&again, "checkpoint"), checkpoint);
+    for (selector, value) in [
+        ("--nullifier", nullifier.as_str()),
+        ("--legacy-id", legacy_id.as_str()),
+        ("--statement", proof.as_str()),
+    ] {
+        let found = lookup(selector, value);
+        assert_eq!(json_member(&found, "status"), "finalized", "{selector}");
+        assert_eq!(json_member(&found, "nullifier"), nullifier, "{selector}");
+        assert_eq!(
+            json_member(&found, "pq_commitment"),
+            json_member(&proof_text, "pq_commitment"),
+            "{selector}"
+        );
+    }
+
+    // The same credential to another target, at another epoch or in another domain: each
+    // proof is valid and each is refused with exit code 4. (Another statement kind for the
+    // same credential is refused the same way; `hem::registry` tests that. Another
+    // credential of the same key, such as its Ethereum address, is a separate migration.)
+    let domain = "42".repeat(32);
+    for (name, kind, target, epoch, extra) in [
+        ("retarget.json", "btc-p2wpkh", &other_target, "7", &[][..]),
+        ("later.json", "btc-p2wpkh", &target, "8", &[][..]),
+        (
+            "domain.json",
+            "btc-p2wpkh",
+            &target,
+            "7",
+            &["--domain-hex", domain.as_str()][..],
+        ),
+    ] {
+        let conflicting = migrate_prove(&dir, name, kind, &first, target, epoch, extra);
+        let mut verify = vec![
+            "migrate",
+            "verify",
+            "--proof",
+            &conflicting,
+            "--epoch",
+            epoch,
+        ];
+        verify.extend_from_slice(extra);
+        expect(&verify, 0);
+        verify.push("--register");
+        let output = {
+            let mut full = verify.clone();
+            full.extend_from_slice(&reg);
+            qsag(&full)
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(code(&output), 4, "{name}: {stderr}");
+        assert!(
+            stderr.contains("bound to a different record") || stderr.contains("already migrated"),
+            "{name}: {stderr}"
+        );
+    }
+    // Nothing moved: same checkpoint, same binding.
+    let found = lookup("--nullifier", &nullifier);
+    assert_eq!(json_member(&found, "checkpoint"), checkpoint);
+    assert_eq!(
+        json_member(&found, "pq_commitment"),
+        json_member(&proof_text, "pq_commitment")
+    );
+
+    // Enrol, then finalize. Finalizing what was never enrolled is refused.
+    let enrolled = migrate_prove(&dir, "second.json", "eth-eoa", &second, &target, "7", &[]);
+    let unknown = migrate_prove(&dir, "third.json", "eth-eoa", &third, &target, "7", &[]);
+    run(
+        &[
+            "migrate", "registry", "finalize", "--proof", &unknown, "--epoch", "7",
+        ],
+        4,
+    );
+    let receipt = run(
+        &[
+            "migrate", "registry", "enroll", "--proof", &enrolled, "--epoch", "7",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&receipt, "status"), "enrolled");
+    assert_eq!(json_member(&receipt, "appended"), "true");
+    assert_eq!(
+        json_member(&lookup("--statement", &enrolled), "status"),
+        "enrolled"
+    );
+    let receipt = run(
+        &[
+            "migrate", "registry", "enroll", "--proof", &enrolled, "--epoch", "7",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&receipt, "appended"), "false");
+    // An enrolment already reserves the credential against another target.
+    let displaced = migrate_prove(
+        &dir,
+        "displace.json",
+        "eth-eoa",
+        &second,
+        &other_target,
+        "7",
+        &[],
+    );
+    run(
+        &[
+            "migrate", "registry", "register", "--proof", &displaced, "--epoch", "7",
+        ],
+        4,
+    );
+    run(
+        &[
+            "migrate", "registry", "finalize", "--proof", &displaced, "--epoch", "7",
+        ],
+        4,
+    );
+    let receipt = run(
+        &[
+            "migrate", "registry", "finalize", "--proof", &enrolled, "--epoch", "7",
+        ],
+        0,
+    );
+    assert_eq!(json_member(&receipt, "status"), "finalized");
+    assert_eq!(json_member(&receipt, "appended"), "true");
+    assert_eq!(
+        json_member(&lookup("--statement", &enrolled), "status"),
+        "finalized"
+    );
+    assert_eq!(
+        json_member(&lookup("--statement", &unknown), "status"),
+        "absent"
+    );
+
+    // A proof file above a megabyte (BIP-32, five levels) registers and is found again.
+    let seed = key("seed.hex", "000102030405060708090a0b0c0d0e0f");
+    let deep = migrate_prove(
+        &dir,
+        "deep.json",
+        "bip32",
+        &seed,
+        &target,
+        "7",
+        &["--path", "m/44'/0'/0'/0/0"],
+    );
+    assert!(std::fs::metadata(&deep).unwrap().len() > 1 << 20);
+    run(
+        &["migrate", "registry", "register", "--proof", &deep, "--epoch", "7"],
+        0,
+    );
+    let found = lookup("--statement", &deep);
+    assert_eq!(json_member(&found, "status"), "finalized");
+    assert_eq!(json_member(&found, "key_exposure"), "revealed");
+
+    // A sealed registry key needs its passphrase.
+    let sealed = dir.path("sealed-registry");
+    let pass = dir.path("pass");
+    std::fs::write(&pass, "correct horse battery staple").unwrap();
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &sealed,
+            "--ephemeral-unanchored",
+            "--passphrase-file",
+            &pass,
+        ],
+        0,
+    );
+    let sealed_args = [
+        "migrate",
+        "registry",
+        "register",
+        "--registry-dir",
+        &sealed,
+        "--proof",
+        &proof,
+        "--epoch",
+        "7",
+    ];
+    assert_ne!(code(&qsag(&sealed_args)), 0);
+    let mut with_pass = sealed_args.to_vec();
+    with_pass.extend(["--passphrase-file", pass.as_str()]);
+    expect(&with_pass, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_registry_rollback_is_refused_with_an_anchor_or_a_retained_checkpoint() {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = Workdir::new("migrate-registry-rollback");
+    let target = migration_target(&dir, "target");
+    let other_target = migration_target(&dir, "other-target");
+    let first = dir.path("first.hex");
+    std::fs::write(&first, SECP_KEY_ONE).unwrap();
+    let second = dir.path("second.hex");
+    std::fs::write(&second, format!("{}02", "00".repeat(31))).unwrap();
+    let proof_a = migrate_prove(&dir, "a.json", "btc-p2wpkh", &first, &target, "7", &[]);
+    let proof_b = migrate_prove(&dir, "b.json", "btc-p2wpkh", &second, &target, "7", &[]);
+    // The double migration a rollback is for: the first key again, to another address.
+    let proof_a2 = migrate_prove(
+        &dir,
+        "a2.json",
+        "btc-p2wpkh",
+        &first,
+        &other_target,
+        "7",
+        &[],
+    );
+    let register = |registry: &[&str], proof: &str, expected: i32| -> String {
+        let mut args = vec![
+            "migrate",
+            "verify",
+            "--register",
+            "--proof",
+            proof,
+            "--epoch",
+            "7",
+            "--json",
+        ];
+        args.extend_from_slice(registry);
+        expect(&args, expected)
+    };
+    let lookup = |registry: &[&str], proof: &str, expected: i32| -> String {
+        let mut args = vec![
+            "migrate",
+            "registry",
+            "lookup",
+            "--statement",
+            proof,
+            "--json",
+        ];
+        args.extend_from_slice(registry);
+        expect(&args, expected)
+    };
+
+    // With an anchor.
+    let anchor = dir.0.join("registry-anchor");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&anchor)
+        .unwrap();
+    let anchor = anchor.to_str().unwrap();
+    let anchored_dir = dir.path("anchored");
+    // An anchor on the registry's device needs the acknowledgement.
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &anchored_dir,
+            "--anchor-dir",
+            anchor,
+        ],
+        4,
+    );
+    let _ = std::fs::remove_dir_all(&anchored_dir);
+    let anchored = [
+        "--registry-dir",
+        anchored_dir.as_str(),
+        "--anchor-dir",
+        anchor,
+        "--allow-single-disk-anchor",
+    ];
+    let mut init = vec!["migrate", "registry", "init"];
+    init.extend_from_slice(&anchored);
+    expect(&init, 0);
+    // An anchored registry does not open without its anchor.
+    lookup(&["--registry-dir", &anchored_dir], &proof_a, 4);
+    register(&anchored, &proof_a, 0);
+    let before_b = snapshot_dir_files(Path::new(&anchored_dir));
+    register(&anchored, &proof_b, 0);
+    assert_eq!(
+        json_member(&lookup(&anchored, &proof_b, 0), "status"),
+        "finalized"
+    );
+    restore_dir_files_in_place(&before_b);
+    // The log is one record behind the anchor: nothing opens, nothing registers.
+    lookup(&anchored, &proof_a, 4);
+    register(&anchored, &proof_b, 4);
+    register(&anchored, &proof_a2, 4);
+    // Rolled back to before the first migration as well.
+    let after_init: Vec<_> = before_b
+        .iter()
+        .filter(|(path, _)| !path.to_string_lossy().ends_with("registry.log"))
+        .cloned()
+        .collect();
+    restore_dir_files_in_place(&after_init);
+    register(&anchored, &proof_a2, 4);
+
+    // Without an anchor, a retained checkpoint is the defence.
+    let plain_dir = dir.path("plain");
+    let plain = ["--registry-dir", plain_dir.as_str()];
+    expect(
+        &[
+            "migrate",
+            "registry",
+            "init",
+            "--registry-dir",
+            &plain_dir,
+            "--ephemeral-unanchored",
+        ],
+        0,
+    );
+    let checkpoint_a = json_member(&register(&plain, &proof_a, 0), "checkpoint");
+    let before_b = snapshot_dir_files(Path::new(&plain_dir));
+    let checkpoint_b = json_member(&register(&plain, &proof_b, 0), "checkpoint");
+    assert_ne!(checkpoint_a, checkpoint_b);
+    let at_least = |checkpoint: &str| {
+        vec![
+            "--registry-dir".to_string(),
+            plain_dir.clone(),
+            "--min-checkpoint".to_string(),
+            checkpoint.to_string(),
+        ]
+    };
+    let with = |checkpoint: &str, proof: &str, expected: i32| {
+        let options = at_least(checkpoint);
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
+        lookup(&options, proof, expected)
+    };
+    with(&checkpoint_a, &proof_b, 0);
+    with(&checkpoint_b, &proof_b, 0);
+    restore_dir_files_in_place(&before_b);
+    // The restored log is a valid earlier state: it opens, and has forgotten the second
+    // migration. Only the retained checkpoint tells.
+    assert_eq!(
+        json_member(&lookup(&plain, &proof_b, 0), "status"),
+        "absent"
+    );
+    with(&checkpoint_a, &proof_b, 0);
+    with(&checkpoint_b, &proof_b, 4);
+    // A checkpoint of the right length and the wrong tip is refused too.
+    let forged = format!("1:{}", "00".repeat(32));
+    with(&forged, &proof_a, 4);
+    // The anchor and the checkpoint are alternatives.
+    let mut both = anchored.to_vec();
+    both.extend(["--min-checkpoint", checkpoint_a.as_str()]);
+    lookup(&both, &proof_a, 1);
+}
+
 #[test]
 fn migration_rejects_sealed_or_damaged_envelope_legacy_seeds() {
     let dir = Workdir::new("migration-sealed-seed");
+    let target = migration_target(&dir, "target");
     let key = dir.path("legacy.json");
     let output = dir.path("claim.json");
+    let claim = |kind: &str| {
+        let mut args = vec![
+            "migrate",
+            "claim",
+            "--kind",
+            kind,
+            "--legacy-secret",
+            &key,
+            "--target",
+            &target,
+            "--epoch",
+            "1",
+            "--out",
+            &output,
+        ];
+        if kind == "bip32" {
+            args.extend(["--path", "m/0'"]);
+        }
+        let rejected = qsag(&args);
+        assert_eq!(code(&rejected), 1, "{kind}");
+        assert!(!Path::new(&output).exists(), "{kind}");
+        String::from_utf8_lossy(&rejected.stderr).into_owned()
+    };
     for header in [
         "envelope",
         "salt",
@@ -3988,53 +5155,44 @@ fn migration_rejects_sealed_or_damaged_envelope_legacy_seeds() {
         "envelope_salt",
         "envelope_nonce",
     ] {
-        std::fs::write(&key, format!("{{\"seed\":\"{SEED}\",\"{header}\":\"00\"}}")).unwrap();
-        let rejected = qsag(&[
-            "migrate",
-            "commit",
-            "--kind",
-            "btc-taproot",
-            "--legacy-secret",
-            &key,
-            "--out",
-            &output,
-        ]);
-        assert_eq!(code(&rejected), 1);
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("sealed legacy keys"));
-        assert!(!Path::new(&output).exists());
-        let short_json = format!("{{\"{header}\":0}}");
-        std::fs::write(&key, format!("{short_json:<32}")).unwrap();
-        let rejected = qsag(&[
-            "migrate",
-            "commit",
-            "--kind",
-            "btc-taproot",
-            "--legacy-secret",
-            &key,
-            "--out",
-            &output,
-        ]);
-        assert_eq!(code(&rejected), 1);
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("sealed legacy keys"));
-        assert!(!Path::new(&output).exists());
+        for kind in ["btc-p2wpkh", "ed25519", "bip32"] {
+            std::fs::write(&key, format!("{{\"seed\":\"{SEED}\",\"{header}\":\"00\"}}")).unwrap();
+            assert!(
+                claim(kind).contains("sealed legacy keys"),
+                "{kind} {header}"
+            );
+            let short_json = format!("{{\"{header}\":0}}");
+            std::fs::write(&key, format!("{short_json:<32}")).unwrap();
+            assert!(
+                claim(kind).contains("sealed legacy keys"),
+                "{kind} {header}"
+            );
+        }
     }
     // A 32-byte malformed JSON object must never be treated as 32 raw key bytes.
     let malformed_32b = format!("{:<32}", "{\"seed\":\"0011\"}");
     assert_eq!(malformed_32b.len(), 32);
     std::fs::write(&key, malformed_32b).unwrap();
-    let rejected = qsag(&[
-        "migrate",
-        "commit",
-        "--kind",
-        "btc-taproot",
-        "--legacy-secret",
-        &key,
-        "--out",
-        &output,
-    ]);
-    assert_eq!(code(&rejected), 1);
-    assert!(String::from_utf8_lossy(&rejected.stderr).contains("must be 32 bytes"));
-    assert!(!Path::new(&output).exists());
+    assert!(claim("btc-p2wpkh").contains("must be 32 bytes"));
+    // An unsealed JSON seed is accepted.
+    std::fs::write(&key, format!("{{\"seed\":\"{SEED}\"}}")).unwrap();
+    expect(
+        &[
+            "migrate",
+            "claim",
+            "--kind",
+            "ed25519",
+            "--legacy-secret",
+            &key,
+            "--target",
+            &target,
+            "--epoch",
+            "1",
+            "--out",
+            &output,
+        ],
+        0,
+    );
 }
 
 #[test]
