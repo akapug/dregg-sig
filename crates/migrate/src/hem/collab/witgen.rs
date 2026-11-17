@@ -1605,7 +1605,8 @@ pub(super) mod tests {
 
     use crate::hem::relations::{
         Bip32Root, Ed25519ExtendedKey, KeySource, Lock, OwnershipStatement, OwnershipWitness,
-        PathSpec, ownership_definitions, ownership_shape, synthesize_ownership,
+        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions,
+        ownership_shape, synthesize_ownership,
     };
 
     fn statement(lock: Lock, source: KeySource, witness: &OwnershipWitness) -> OwnershipStatement {
@@ -1701,6 +1702,148 @@ pub(super) mod tests {
                 vec![0x22; 32],
             ),
         ]
+    }
+
+    /// Statements whose relation takes inputs besides the secret, with their witness, the
+    /// secret, the hidden path and the script-tree root: a master seed with a public
+    /// path (`m/44'`), a longer seed with a hidden path under a Taproot script tree, a
+    /// SLIP-0010 seed with a hidden path, and an extended key with a hidden public step.
+    #[allow(clippy::type_complexity)]
+    pub(in super::super) fn derived_cases() -> Vec<(
+        OwnershipStatement,
+        OwnershipWitness,
+        Vec<u8>,
+        Vec<u32>,
+        Option<[u8; 32]>,
+    )> {
+        const H: u32 = 1 << 31;
+        let mut out = Vec::new();
+        let seed = vec![0x31; 16];
+        let witness = OwnershipWitness::seed(&seed);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Public(vec![H + 44]),
+        };
+        out.push((
+            statement(Lock::P2pkh, source, &witness),
+            witness,
+            seed,
+            Vec::new(),
+            None,
+        ));
+        let seed: Vec<u8> = (0..33).map(|i| 0x40 + i as u8).collect();
+        let (path, root) = (vec![H + 86], [0x5a; 32]);
+        let witness = OwnershipWitness::seed(&seed)
+            .with_path(&path)
+            .with_merkle_root(root);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Hidden { max_depth: 2 },
+        };
+        out.push((
+            statement(Lock::TaprootScriptTree, source, &witness),
+            witness,
+            seed,
+            path,
+            Some(root),
+        ));
+        let seed = vec![0x77; 64];
+        let path = vec![H + 5];
+        let witness = OwnershipWitness::seed(&seed).with_path(&path);
+        let source = KeySource::Slip10 {
+            path: PathSpec::Hidden { max_depth: 1 },
+        };
+        out.push((
+            statement(Lock::Ed25519, source, &witness),
+            witness,
+            seed,
+            path,
+            None,
+        ));
+        let node = bip32_derive(&[0x21; 32], &[H]).unwrap();
+        let secret = [node.private_key, node.chain_code].concat();
+        let path = vec![7];
+        let witness = OwnershipWitness::extended_key(&node).with_path(&path);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::ExtendedKey,
+            path: PathSpec::Hidden { max_depth: 1 },
+        };
+        out.push((
+            statement(Lock::P2pkh, source, &witness),
+            witness,
+            secret,
+            path,
+            None,
+        ));
+        out
+    }
+
+    /// The inputs of a relation as plain values: the secret padded to the first input's
+    /// width, then the auxiliary inputs.
+    fn clear_inputs(defs: &Definitions, secret: &[u8], auxiliary: &[Vec<bool>]) -> Vec<Vec<Clear>> {
+        let widths = input_bits(defs);
+        assert_eq!(widths.len(), 1 + auxiliary.len());
+        assert!(widths[0] >= 8 * secret.len());
+        let mut first: Vec<Clear> = (0..8 * secret.len())
+            .map(|i| Clear(f(u64::from((secret[i / 8] >> (i % 8)) & 1))))
+            .collect();
+        first.resize(widths[0], Clear(F::ZERO));
+        let mut out = vec![first];
+        for (bits, &width) in auxiliary.iter().zip(&widths[1..]) {
+            assert_eq!(bits.len(), width);
+            out.push(bits.iter().map(|&b| Clear(f(u64::from(b)))).collect());
+        }
+        out
+    }
+
+    /// Seeds of hidden length, hidden paths and script-tree roots: the auxiliary inputs
+    /// are the ones the gadgets allocate, in their order, so the definitions evaluated on
+    /// the secret and those inputs give the gadget's assignment.
+    #[test]
+    fn auxiliary_inputs_reproduce_the_gadget_assignment() {
+        const H: u32 = 1 << 31;
+        for (st, witness, secret, path, root) in derived_cases() {
+            let (shape, assignment) = synthesize_ownership(&st, &witness).unwrap();
+            let (recorded, defs) = ownership_definitions(&st).unwrap();
+            assert_eq!(recorded.digest(), shape.digest());
+            let auxiliary =
+                ownership_auxiliary_inputs(&st, secret.len(), &path, root.as_ref()).unwrap();
+            let inputs = clear_inputs(&defs, &secret, &auxiliary);
+            let run = |inputs: &[Vec<Clear>]| {
+                Witgen::new(&mut Plain::new(6)).run(
+                    &shape,
+                    &defs,
+                    &st.public_inputs().unwrap(),
+                    inputs,
+                )
+            };
+            let z = run(&inputs).unwrap();
+            let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
+            assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None, "{:?}", st.source);
+
+            // The auxiliary inputs matter: flipping the first or the last of them moves
+            // the assignment (or leaves the relation without one).
+            for k in [1, inputs.len() - 1] {
+                let mut other = inputs.clone();
+                other[k][0] = Clear(F::ONE - other[k][0].0);
+                assert!(run(&other).map_or(true, |o| o != z), "input {k}");
+            }
+
+            // What does not fit the statement is refused.
+            let aux = |bytes: usize, path: &[u32], root: Option<&[u8; 32]>| {
+                ownership_auxiliary_inputs(&st, bytes, path, root)
+            };
+            assert_eq!(aux(secret.len(), &path, root.as_ref()), Some(auxiliary));
+            assert_eq!(aux(15, &path, root.as_ref()), None);
+            assert_eq!(aux(65, &path, root.as_ref()), None);
+            let long = [path.clone(), vec![H, H, H]].concat();
+            assert_eq!(aux(secret.len(), &long, root.as_ref()), None);
+            let flipped = if root.is_some() { None } else { Some(&[1u8; 32]) };
+            assert_eq!(aux(secret.len(), &path, flipped), None);
+        }
+        // A SLIP-0010 path has hardened steps only.
+        let (st, _, secret, _, _) = derived_cases().swap_remove(2);
+        assert_eq!(ownership_auxiliary_inputs(&st, secret.len(), &[5], None), None);
     }
 
     /// The definitions mean what the gadgets compute: evaluated on plain values from the

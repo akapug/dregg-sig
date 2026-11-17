@@ -1710,6 +1710,78 @@ pub fn ownership_definitions(statement: &OwnershipStatement) -> Option<(Shape, D
     Some((shape, definitions))
 }
 
+/// The inputs of the relation of `statement` after its secret, in the order of the
+/// relation's [`Source::Input`]s, for a prover that holds the secret in shares: the
+/// one-hot length of a master seed of `secret_bytes` bytes, the steps of a hidden
+/// derivation path (active flag, 31 index bits and, where the relation has it, the
+/// hardened flag of each of the `max_depth` steps), and the script-tree root. These are
+/// witness to the verifier and known to every prover. The secret itself is the first
+/// input, zero-padded to that input's width (a master seed to 64 bytes).
+///
+/// `None` for a malformed statement, a secret length the source does not take, a path
+/// longer than the hidden depth or with an index the source forbids, and a script-tree
+/// root that is missing or not called for.
+pub fn ownership_auxiliary_inputs(
+    statement: &OwnershipStatement,
+    secret_bytes: usize,
+    path: &[u32],
+    merkle_root: Option<&[u8; 32]>,
+) -> Option<Vec<Vec<bool>>> {
+    if !statement.is_well_formed() {
+        return None;
+    }
+    let mut out: Vec<Vec<bool>> = Vec::new();
+    let seed_length = |out: &mut Vec<Vec<bool>>| {
+        SEED_BYTES.contains(&secret_bytes).then(|| {
+            out.extend(SEED_BYTES.map(|l| vec![l == secret_bytes]));
+        })
+    };
+    let steps = |out: &mut Vec<Vec<bool>>, spec: &PathSpec, hardened_only: bool| match spec {
+        PathSpec::Public(_) => path.is_empty().then_some(()),
+        PathSpec::Hidden { max_depth } => {
+            if path.len() > usize::from(*max_depth) {
+                return None;
+            }
+            for j in 0..usize::from(*max_depth) {
+                let index = path.get(j).copied().unwrap_or(0);
+                out.push(vec![j < path.len()]);
+                out.extend((0..31).map(|k| vec![(index >> k) & 1 == 1]));
+                if !hardened_only {
+                    out.push(vec![index >= HARDENED]);
+                } else if j < path.len() && index < HARDENED {
+                    return None;
+                }
+            }
+            Some(())
+        }
+    };
+    match &statement.source {
+        KeySource::Bip32 { root, path: spec } => {
+            match root {
+                Bip32Root::Seed => seed_length(&mut out)?,
+                Bip32Root::ExtendedKey => (secret_bytes == 64).then_some(())?,
+            }
+            steps(&mut out, spec, false)?;
+        }
+        KeySource::Slip10 { path: spec } => {
+            seed_length(&mut out)?;
+            steps(&mut out, spec, true)?;
+        }
+        KeySource::Secp256k1Key | KeySource::Bls12381Key | KeySource::Ed25519Seed => {
+            (secret_bytes == 32 && path.is_empty()).then_some(())?;
+        }
+        KeySource::Bip32Ed25519 { .. } => (secret_bytes == 96 && path.is_empty()).then_some(())?,
+    }
+    match (statement.lock, merkle_root) {
+        (Lock::TaprootScriptTree, Some(root)) => {
+            out.push((0..256).map(|i| (root[i / 8] >> (i % 8)) & 1 == 1).collect());
+        }
+        (Lock::TaprootScriptTree, None) | (_, Some(_)) => return None,
+        _ => {}
+    }
+    Some(out)
+}
+
 /// A valid secret for building a shape without a witness.
 fn placeholder_secret(source: &KeySource) -> Vec<u8> {
     match source {
