@@ -16,7 +16,7 @@ Research prototype. No external audit.
 | `dregg-sig-policy` | `crates/policy` | Velocity, allowlist and window rules checked before custodians release shares; reusable `SpongeMacaroon` bearer grants and attenuable `PqBiscuit` chains. Biscuit V2 seals optionally bind the complete intent and require a consumption store for one-use acceptance; the local disk store survives crashes, not adversarial rollback or independent replicas. |
 | `dregg-sig-addr` | `crates/addr` | Bech32m post-quantum addresses, hybrid keys, and the canonical 128-byte signing intent. |
 | `dregg-sig-hd` | `crates/hd` | Dealerless module-lattice key hierarchies and committed watch-only inventories. |
-| `dregg-sig-migrate` | `crates/migrate` | Zero-knowledge ownership proofs for secp256k1, Ed25519, Pallas and BLS12-381 keys, local or threshold, bound to a post-quantum address. Read `crates/migrate/SECURITY.md` before relying on it. |
+| `dregg-sig-migrate` | `crates/migrate` | Proofs that the holder of a legacy credential (Bitcoin `HASH160`, Ethereum address, Ed25519 seed, BIP-32 seed) authorises a post-quantum address, over the zk-Hem argument, and a durable one-way registry that records each migration once. A proof shows authorisation, nothing more; the composed security bounds of the argument are not established. Read `crates/migrate/SECURITY.md` before relying on it. |
 | `dregg-sig-cli` | `crates/cli` | The `dregg-sig` command-line tool and the runnable examples. |
 | `dregg-sig-accel` | `crates/accel` | Hash and field kernels behind one backend trait, a CPU reference backend, and a Vulkan compute prover (feature `vulkan`, Linux). |
 | `dregg-sig-asm` | `crates/asm` | Constant-time SIMD and assembly kernels (x86-64 and AArch64) with portable fallbacks, secret wiping, durable-file primitives. |
@@ -39,6 +39,16 @@ cargo run --release -p dregg-sig-cli -- keygen --scheme slh-dsa-shake-128f \
   --secret-out "$D/sk.json" --public-out "$D/pk.json"
 cargo run --release -p dregg-sig-cli -- sign --secret "$D/sk.json" --in "$D/msg" --out "$D/sig.json"
 cargo run --release -p dregg-sig-cli -- verify --public "$D/pk.json" --in "$D/msg" --sig "$D/sig.json"
+
+# Bind a legacy key to that key's address: prove, then verify and record it once.
+ADDR=$(sed -n 's/.*"address": "\(.*\)".*/\1/p' "$D/pk.json")
+printf '%064x\n' 1 > "$D/legacy.hex"
+cargo run --release -p dregg-sig-cli -- migrate prove --kind btc-p2wpkh \
+  --legacy-secret "$D/legacy.hex" --target "$ADDR" --epoch 1 --out "$D/migration.json"
+cargo run --release -p dregg-sig-cli -- migrate registry init --registry-dir "$D/registry" \
+  --ephemeral-unanchored
+cargo run --release -p dregg-sig-cli -- migrate verify --proof "$D/migration.json" --epoch 1 \
+  --register --registry-dir "$D/registry"
 
 # Examples.
 cargo run --release -p dregg-sig-cli --example threshold_slh_dsa_quickstart
