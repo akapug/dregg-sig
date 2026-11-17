@@ -1380,7 +1380,8 @@ fn verify_canopy_multiproof_byte(
                     k += 1;
                     supplied
                 };
-                let Some(pair) = dregg_sig_whir_verified::step_merkle_pair_order(u as u64, 0, hu, hsib)
+                let Some(pair) =
+                    dregg_sig_whir_verified::step_merkle_pair_order(u as u64, 0, hu, hsib)
                 else {
                     return false;
                 };
@@ -2543,134 +2544,291 @@ fn push_sumcheck_wire_polys<const N: usize>(polys: &[[GoldilocksExt4; N]], out: 
     }
 }
 
+/// The part of an opening proof that depends only on the opened word: everything except the
+/// Stage-0 leaf openings.
+struct WhirStageFields {
+    stage0_ood_evals: [GoldilocksExt4; 2],
+    fold_sumcheck_polys: Vec<[GoldilocksExt4; 5]>,
+    fold_pow_nonces: Vec<u64>,
+    folded_layers: Vec<WhirStageProof>,
+    final_coeffs: Vec<GoldilocksExt4>,
+    pow_nonce: u64,
+}
+
+fn push_whir_stage_fields(
+    stage0_ood_evals: [GoldilocksExt4; 2],
+    fold_sumcheck_polys: &[[GoldilocksExt4; 5]],
+    fold_pow_nonces: &[u64],
+    folded_layers: &[WhirStageProof],
+    final_coeffs: &[GoldilocksExt4],
+    pow_nonce: u64,
+    out: &mut Vec<u8>,
+) {
+    assert_eq!(
+        fold_sumcheck_polys.len(),
+        fold_pow_nonces.len(),
+        "fold sumcheck and fold PoW nonce lengths differ"
+    );
+    for v in stage0_ood_evals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    push_sumcheck_wire_polys(fold_sumcheck_polys, out);
+    for &nonce in fold_pow_nonces {
+        out.extend_from_slice(&nonce.to_le_bytes());
+    }
+    out.extend_from_slice(&(folded_layers.len() as u32).to_le_bytes());
+    for layer in folded_layers {
+        out.extend_from_slice(&layer.commitment.to_bytes());
+        for v in layer.stage_ood_evals {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&layer.pow_nonce.to_le_bytes());
+        out.extend_from_slice(&(layer.opened_vals.len() as u32).to_le_bytes());
+        for v in &layer.opened_vals {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        layer.multiproof.push_bytes(out);
+    }
+    out.extend_from_slice(&(final_coeffs.len() as u32).to_le_bytes());
+    for v in final_coeffs {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&pow_nonce.to_le_bytes());
+}
+
+fn read_whir_stage_fields(bytes: &[u8], pos: &mut usize) -> Option<WhirStageFields> {
+    let stage0_ood_evals = [read_ext4(bytes, pos)?, read_ext4(bytes, pos)?];
+    let fold_sumcheck_polys = read_sumcheck_wire_polys(bytes, pos, MAX_PCS_NUM_VARS)?;
+    let mut fold_pow_nonces = Vec::with_capacity(fold_sumcheck_polys.len());
+    for _ in 0..fold_sumcheck_polys.len() {
+        fold_pow_nonces.push(read_u64(bytes, pos)?);
+    }
+
+    let n_layers = read_u32(bytes, pos)? as usize;
+    if n_layers >= MAX_WHIR_STAGES {
+        return None;
+    }
+    let mut folded_layers = Vec::with_capacity(n_layers);
+    for _ in 0..n_layers {
+        let (commitment, used_c) = CanopyCommitment::from_bytes_canonical(bytes.get(*pos..)?)?;
+        *pos += used_c;
+        let stage_ood_evals = [read_ext4(bytes, pos)?, read_ext4(bytes, pos)?];
+        let layer_pow_nonce = read_u64(bytes, pos)?;
+        let n_vals = read_u32(bytes, pos)? as usize;
+        if n_vals == 0 || n_vals > NUM_PCS_QUERIES * MAX_FIBER_ARITY || (n_vals & 1) != 0 {
+            return None;
+        }
+        let mut opened_vals = Vec::with_capacity(n_vals);
+        for _ in 0..n_vals {
+            opened_vals.push(read_ext4(bytes, pos)?);
+        }
+        let (multiproof, used_mp) = CanopyMultiProof::from_bytes_canonical(bytes.get(*pos..)?)?;
+        *pos += used_mp;
+        folded_layers.push(WhirStageProof {
+            commitment,
+            stage_ood_evals,
+            pow_nonce: layer_pow_nonce,
+            opened_vals,
+            multiproof,
+        });
+    }
+
+    let n_final = read_u32(bytes, pos)? as usize;
+    if !(4..=((1usize << EARLY_STOP_VARS) + 2)).contains(&n_final)
+        || !(n_final - 2).is_power_of_two()
+    {
+        return None;
+    }
+    let mut final_coeffs = Vec::with_capacity(n_final);
+    for _ in 0..n_final {
+        final_coeffs.push(read_ext4(bytes, pos)?);
+    }
+
+    let pow_nonce = read_u64(bytes, pos)?;
+    Some(WhirStageFields {
+        stage0_ood_evals,
+        fold_sumcheck_polys,
+        fold_pow_nonces,
+        folded_layers,
+        final_coeffs,
+        pow_nonce,
+    })
+}
+
+fn push_stage0_opening(
+    salts: &[[u8; 16]],
+    vals: &[Goldilocks],
+    multiproof: &CanopyMultiProof,
+    out: &mut Vec<u8>,
+) {
+    out.extend_from_slice(&(salts.len() as u32).to_le_bytes());
+    for salt in salts {
+        out.extend_from_slice(salt);
+    }
+    out.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+    for v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    multiproof.push_bytes(out);
+}
+
+fn read_stage0_opening(bytes: &[u8], pos: &mut usize) -> Option<Stage0ShareOpening> {
+    let n_queries = read_u32(bytes, pos)? as usize;
+    if n_queries == 0 || n_queries > NUM_PCS_QUERIES {
+        return None;
+    }
+    let salt_bytes = bytes.get(*pos..pos.checked_add(16 * n_queries)?)?;
+    let salts: Vec<[u8; 16]> = salt_bytes.as_chunks::<16>().0.to_vec();
+    *pos += 16 * n_queries;
+
+    let n_r0 = read_u32(bytes, pos)? as usize;
+    if n_r0 == 0 || !n_r0.is_multiple_of(n_queries) || n_r0 / n_queries > MAX_ROUND0_LEAF_VALS {
+        return None;
+    }
+    let val_bytes = bytes.get(*pos..pos.checked_add(8 * n_r0)?)?;
+    let mut vals = Vec::with_capacity(n_r0);
+    for &lb in val_bytes.as_chunks::<8>().0 {
+        vals.push(Goldilocks::from_le_bytes_canonical(lb).ok()?);
+    }
+    *pos += 8 * n_r0;
+
+    let (multiproof, used_mp) = CanopyMultiProof::from_bytes_canonical(bytes.get(*pos..)?)?;
+    *pos += used_mp;
+    Some(Stage0ShareOpening {
+        salts,
+        vals,
+        multiproof,
+    })
+}
+
 impl HemWhirOpeningProof {
     pub fn push_bytes(&self, out: &mut Vec<u8>) {
-        assert_eq!(
-            self.fold_sumcheck_polys.len(),
-            self.fold_pow_nonces.len(),
-            "fold sumcheck and fold PoW nonce lengths differ"
+        push_whir_stage_fields(
+            self.stage0_ood_evals,
+            &self.fold_sumcheck_polys,
+            &self.fold_pow_nonces,
+            &self.folded_layers,
+            &self.final_coeffs,
+            self.pow_nonce,
+            out,
         );
-        for v in self.stage0_ood_evals {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        push_sumcheck_wire_polys(&self.fold_sumcheck_polys, out);
-        for &nonce in &self.fold_pow_nonces {
-            out.extend_from_slice(&nonce.to_le_bytes());
-        }
-        out.extend_from_slice(&(self.folded_layers.len() as u32).to_le_bytes());
-        for layer in &self.folded_layers {
-            out.extend_from_slice(&layer.commitment.to_bytes());
-            for v in layer.stage_ood_evals {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            out.extend_from_slice(&layer.pow_nonce.to_le_bytes());
-            out.extend_from_slice(&(layer.opened_vals.len() as u32).to_le_bytes());
-            for v in &layer.opened_vals {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            layer.multiproof.push_bytes(out);
-        }
-        out.extend_from_slice(&(self.final_coeffs.len() as u32).to_le_bytes());
-        for v in &self.final_coeffs {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.extend_from_slice(&self.pow_nonce.to_le_bytes());
-        out.extend_from_slice(&(self.round0_salts.len() as u32).to_le_bytes());
-        for salt in &self.round0_salts {
-            out.extend_from_slice(salt);
-        }
-        out.extend_from_slice(&(self.round0_vals.len() as u32).to_le_bytes());
-        for v in &self.round0_vals {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        self.round0_multiproof.push_bytes(out);
+        push_stage0_opening(
+            &self.round0_salts,
+            &self.round0_vals,
+            &self.round0_multiproof,
+            out,
+        );
     }
 
     pub fn from_bytes_canonical(bytes: &[u8]) -> Option<(Self, usize)> {
         let mut pos = 0usize;
-        let stage0_ood_evals = [read_ext4(bytes, &mut pos)?, read_ext4(bytes, &mut pos)?];
-        let fold_sumcheck_polys = read_sumcheck_wire_polys(bytes, &mut pos, MAX_PCS_NUM_VARS)?;
-        let mut fold_pow_nonces = Vec::with_capacity(fold_sumcheck_polys.len());
-        for _ in 0..fold_sumcheck_polys.len() {
-            fold_pow_nonces.push(read_u64(bytes, &mut pos)?);
-        }
+        let stages = read_whir_stage_fields(bytes, &mut pos)?;
+        let stage0 = read_stage0_opening(bytes, &mut pos)?;
+        Some((Self::from_parts(stages, stage0), pos))
+    }
 
-        let n_layers = read_u32(bytes, &mut pos)? as usize;
-        if n_layers >= MAX_WHIR_STAGES {
+    fn from_parts(stages: WhirStageFields, stage0: Stage0ShareOpening) -> Self {
+        Self {
+            stage0_ood_evals: stages.stage0_ood_evals,
+            fold_sumcheck_polys: stages.fold_sumcheck_polys,
+            fold_pow_nonces: stages.fold_pow_nonces,
+            folded_layers: stages.folded_layers,
+            final_coeffs: stages.final_coeffs,
+            pow_nonce: stages.pow_nonce,
+            round0_salts: stage0.salts,
+            round0_vals: stage0.vals,
+            round0_multiproof: stage0.multiproof,
+        }
+    }
+}
+
+/// Largest number of Stage-0 roots behind one [`HemWhirSplitOpeningProof`] (the share count is
+/// one byte on the wire).
+pub const MAX_STAGE0_SHARES: usize = 255;
+
+/// One committer's answer to the Stage-0 queries: its leaf salts, its leaf contents (same layout
+/// as [`HemWhirOpeningProof::round0_vals`]) and its multiproof against its own root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stage0ShareOpening {
+    /// 16-byte blinding salt of each queried leaf, in ascending leaf order.
+    pub salts: Vec<[u8; 16]>,
+    /// Per queried leaf, `group_arity_0` base-field values for each committed table in
+    /// commitment order.
+    pub vals: Vec<Goldilocks>,
+    /// Steiner-deduplicated Merkle-Canopy multi-proof against this committer's root.
+    pub multiproof: CanopyMultiProof,
+}
+
+/// Opening proof for a commitment that is a list of `1..=MAX_STAGE0_SHARES` Stage-0 roots, one per
+/// committer, over additive shares of the committed tables: the committed table `i` is the sum
+/// over committers of their table `i`. Every field except `shares` has the meaning it has in
+/// [`HemWhirOpeningProof`] and is a function of the opened word alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HemWhirSplitOpeningProof {
+    pub stage0_ood_evals: [GoldilocksExt4; 2],
+    pub fold_sumcheck_polys: Vec<[GoldilocksExt4; 5]>,
+    pub fold_pow_nonces: Vec<u64>,
+    pub folded_layers: Vec<WhirStageProof>,
+    pub final_coeffs: Vec<GoldilocksExt4>,
+    pub pow_nonce: u64,
+    /// One Stage-0 opening per root, in root order. All open the same leaves.
+    pub shares: Vec<Stage0ShareOpening>,
+}
+
+impl HemWhirSplitOpeningProof {
+    /// The [`HemWhirOpeningProof`] stage fields, then one byte holding the share count, then every
+    /// share in the layout of the Stage-0 fields of [`HemWhirOpeningProof`].
+    pub fn push_bytes(&self, out: &mut Vec<u8>) {
+        assert!(
+            (1..=MAX_STAGE0_SHARES).contains(&self.shares.len()),
+            "share count out of range"
+        );
+        push_whir_stage_fields(
+            self.stage0_ood_evals,
+            &self.fold_sumcheck_polys,
+            &self.fold_pow_nonces,
+            &self.folded_layers,
+            &self.final_coeffs,
+            self.pow_nonce,
+            out,
+        );
+        out.push(self.shares.len() as u8);
+        for share in &self.shares {
+            push_stage0_opening(&share.salts, &share.vals, &share.multiproof, out);
+        }
+    }
+
+    /// Parse a proof from the front of `bytes`, returning it with the number of bytes it used.
+    /// Rejects a zero share count and shares that do not all open the same number of leaves with
+    /// the same number of values.
+    pub fn from_bytes_canonical(bytes: &[u8]) -> Option<(Self, usize)> {
+        let mut pos = 0usize;
+        let stages = read_whir_stage_fields(bytes, &mut pos)?;
+        let n_shares = *bytes.get(pos)? as usize;
+        pos += 1;
+        if n_shares == 0 {
             return None;
         }
-        let mut folded_layers = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            let (commitment, used_c) = CanopyCommitment::from_bytes_canonical(bytes.get(pos..)?)?;
-            pos += used_c;
-            let stage_ood_evals = [read_ext4(bytes, &mut pos)?, read_ext4(bytes, &mut pos)?];
-            let layer_pow_nonce = read_u64(bytes, &mut pos)?;
-            let n_vals = read_u32(bytes, &mut pos)? as usize;
-            if n_vals == 0 || n_vals > NUM_PCS_QUERIES * MAX_FIBER_ARITY || (n_vals & 1) != 0 {
+        // Every share costs at least 16 bytes of input, so the reservation is bounded by it.
+        let mut shares: Vec<Stage0ShareOpening> = Vec::with_capacity(n_shares);
+        for _ in 0..n_shares {
+            let share = read_stage0_opening(bytes, &mut pos)?;
+            if let Some(first) = shares.first()
+                && (share.salts.len() != first.salts.len() || share.vals.len() != first.vals.len())
+            {
                 return None;
             }
-            let mut opened_vals = Vec::with_capacity(n_vals);
-            for _ in 0..n_vals {
-                opened_vals.push(read_ext4(bytes, &mut pos)?);
-            }
-            let (multiproof, used_mp) = CanopyMultiProof::from_bytes_canonical(bytes.get(pos..)?)?;
-            pos += used_mp;
-            folded_layers.push(WhirStageProof {
-                commitment,
-                stage_ood_evals,
-                pow_nonce: layer_pow_nonce,
-                opened_vals,
-                multiproof,
-            });
+            shares.push(share);
         }
-
-        let n_final = read_u32(bytes, &mut pos)? as usize;
-        if !(4..=((1usize << EARLY_STOP_VARS) + 2)).contains(&n_final)
-            || !(n_final - 2).is_power_of_two()
-        {
-            return None;
-        }
-        let mut final_coeffs = Vec::with_capacity(n_final);
-        for _ in 0..n_final {
-            final_coeffs.push(read_ext4(bytes, &mut pos)?);
-        }
-
-        let pow_nonce = read_u64(bytes, &mut pos)?;
-
-        let n_queries = read_u32(bytes, &mut pos)? as usize;
-        if n_queries == 0 || n_queries > NUM_PCS_QUERIES {
-            return None;
-        }
-        let salt_bytes = bytes.get(pos..pos.checked_add(16 * n_queries)?)?;
-        let round0_salts: Vec<[u8; 16]> = salt_bytes.as_chunks::<16>().0.to_vec();
-        pos += 16 * n_queries;
-
-        let n_r0 = read_u32(bytes, &mut pos)? as usize;
-        if n_r0 == 0 || !n_r0.is_multiple_of(n_queries) || n_r0 / n_queries > MAX_ROUND0_LEAF_VALS {
-            return None;
-        }
-        let val_bytes = bytes.get(pos..pos.checked_add(8 * n_r0)?)?;
-        let mut round0_vals = Vec::with_capacity(n_r0);
-        for &lb in val_bytes.as_chunks::<8>().0 {
-            round0_vals.push(Goldilocks::from_le_bytes_canonical(lb).ok()?);
-        }
-        pos += 8 * n_r0;
-
-        let (round0_multiproof, used_r0_mp) =
-            CanopyMultiProof::from_bytes_canonical(bytes.get(pos..)?)?;
-        pos += used_r0_mp;
-
         Some((
             Self {
-                stage0_ood_evals,
-                fold_sumcheck_polys,
-                fold_pow_nonces,
-                folded_layers,
-                final_coeffs,
-                pow_nonce,
-                round0_salts,
-                round0_vals,
-                round0_multiproof,
+                stage0_ood_evals: stages.stage0_ood_evals,
+                fold_sumcheck_polys: stages.fold_sumcheck_polys,
+                fold_pow_nonces: stages.fold_pow_nonces,
+                folded_layers: stages.folded_layers,
+                final_coeffs: stages.final_coeffs,
+                pow_nonce: stages.pow_nonce,
+                shares,
             },
             pos,
         ))
@@ -3495,7 +3653,10 @@ pub fn whir_commit_batch_owned_with_schedule(
     whir_commit_batch_owned_with_schedule_inner(polys, salt_seed, schedule, 0, false)
 }
 
-pub(crate) fn whir_commit_batch_secret_with_schedule(
+/// [`whir_commit_batch_owned_with_schedule`] for secret tables: the monomial coefficients are not
+/// cached and every buffer derived from the tables is wiped when it is released. A committer of
+/// one additive share of the tables behind a [`HemWhirSplitOpeningProof`] commits with this.
+pub fn whir_commit_batch_secret_with_schedule(
     polys: Vec<Vec<Goldilocks>>,
     salt_seed: &[u8; 32],
     schedule: &WhirSchedule,
@@ -4071,19 +4232,48 @@ const COMPACT_FOLD_MIN_LEN: usize = 1 << 22;
 
 type CpuRound0Artifacts = (Vec<Vec<Goldilocks>>, Option<MerkleCanopyTree>);
 
-fn whir_open_core(
-    state: &HemWhirProverState,
-    precomputed_monomial_polys: Option<&[Vec<Goldilocks>]>,
-    weights: &[[GoldilocksExt4; 2]],
-    mut cur_k: Vec<GoldilocksExt4>,
-    mut cur_sum_claim: GoldilocksExt4,
-    transcript: &mut FiatShamirTranscript<InstanceBound>,
-) -> HemWhirOpeningProof {
-    // A state without its Stage-0 Reed-Solomon cache re-encodes it, but only once the
-    // Stage-0 queries need it: by then the coefficient and kernel tables have been folded
-    // `2^step_vars`-fold, so the codewords never coexist with the full-size tables.
-    let mut lazy_cpu_r0: Option<CpuRound0Artifacts> = None;
-    let rebuild_round0 = || {
+/// The Stage-0 queries the transcript selected: fiber indices in ascending order without
+/// repeats, their coset base points `y0` and inverses, and the fiber generator `zeta`
+/// (fiber `g` is the points `y0 * zeta^k`, `k < arity`).
+struct Stage0Queries {
+    indices: Vec<usize>,
+    y0s: Vec<Goldilocks>,
+    inv_y0s: Vec<Goldilocks>,
+    zeta: Goldilocks,
+    arity: usize,
+}
+
+impl Stage0Queries {
+    fn sample(
+        transcript: &mut FiatShamirTranscript<InstanceBound>,
+        num_vars: usize,
+        st0: &WhirStageSpec,
+    ) -> Self {
+        let arity = 1usize << st0.step_vars;
+        let domain_0 = (1usize << num_vars) * st0.blowup;
+        let num_groups_0 = domain_0 / arity;
+        let omega_0 = Goldilocks::two_adic_generator(domain_0.trailing_zeros() as usize);
+        let zeta = omega_0.pow(num_groups_0 as u64);
+        let indices = sample_stage_queries(transcript, 0, num_groups_0, st0.num_queries);
+        let (y0s, inv_y0s) = batch_coset_points_and_inverses(omega_0, &indices);
+        Self {
+            indices,
+            y0s,
+            inv_y0s,
+            zeta,
+            arity,
+        }
+    }
+}
+
+/// Open the Stage-0 leaves of `state` at `q_indices` (ascending, no repeats): salts, leaf
+/// contents and the multiproof against `state.commitment()`.
+///
+/// A state without its Stage-0 Reed-Solomon cache re-encodes it here, which in an opening is
+/// after the first stage's folds: the codewords never coexist with the full-size coefficient and
+/// kernel tables.
+fn open_stage0_leaves(state: &HemWhirProverState, q_indices: &[usize]) -> Stage0ShareOpening {
+    let mut lazy_cpu_r0: Option<CpuRound0Artifacts> = state.codewords_0.is_empty().then(|| {
         let (_, codewords) = build_cpu_round0_codewords(
             &state.hypercube_evals,
             state.schedule.stages[0].blowup,
@@ -4099,26 +4289,91 @@ fn whir_open_core(
             )
         });
         (codewords, tree)
+    });
+    let (codewords_0, tree_0): (&[Vec<Goldilocks>], &MerkleCanopyTree) = match &lazy_cpu_r0 {
+        Some((codewords, tree)) => (codewords.as_slice(), tree.as_ref().unwrap_or(&state.tree_0)),
+        None => (state.codewords_0.as_slice(), &state.tree_0),
     };
-    let release_round0 = |lazy: &mut Option<CpuRound0Artifacts>| {
-        if let Some((mut cws, _)) = lazy.take()
-            && state.secret
-        {
-            for secret_vec in &mut cws {
-                dregg_sig_asm::volatile_fill(secret_vec, Goldilocks::ZERO);
+    let turbo = state.schedule.regime.uses_turboshake_canopy();
+    let arity = state.group_arity_0;
+    let num_groups_0 = state.num_groups_0();
+
+    let mut salts = Vec::with_capacity(q_indices.len());
+    let mut vals = Vec::with_capacity(q_indices.len() * codewords_0.len() * arity);
+    for &g in q_indices {
+        salts.push(derive_round0_salt_mode(turbo, &state.salt_seed, g as u32));
+        for cw in codewords_0 {
+            for k in 0..arity {
+                vals.push(cw[g + k * num_groups_0]);
             }
         }
-    };
+    }
+    let multiproof = tree_0.open_multi_with_leaf_fn(q_indices, |g| {
+        round0_leaf_hash_mode(turbo, codewords_0, &state.salt_seed, g, num_groups_0, arity)
+    });
+    if let Some((mut codewords, _)) = lazy_cpu_r0.take()
+        && state.secret
+    {
+        for secret_vec in &mut codewords {
+            dregg_sig_asm::volatile_fill(secret_vec, Goldilocks::ZERO);
+        }
+    }
+    Stage0ShareOpening {
+        salts,
+        vals,
+        multiproof,
+    }
+}
 
+/// The fibers of the opened word $\sum_i (w_{i,0} + w_{i,1} x) W_i(x)$ at the queried Stage-0
+/// leaves, `arity` values per query, from the leaf contents `vals` (per query, `arity` values
+/// of each table). One table is opened as it stands, whatever its weight.
+fn blend_stage0_fibers(
+    vals: &[Goldilocks],
+    weights: &[[GoldilocksExt4; 2]],
+    queries: &Stage0Queries,
+) -> Vec<GoldilocksExt4> {
+    let arity = queries.arity;
+    let per_query = weights.len() * arity;
+    assert_eq!(vals.len(), queries.indices.len() * per_query);
+    if weights.len() == 1 {
+        return vals
+            .iter()
+            .copied()
+            .map(GoldilocksExt4::from_base)
+            .collect();
+    }
+    let mut fibers = vec![GoldilocksExt4::ZERO; queries.indices.len() * arity];
+    for ((fiber, q_vals), &y0) in fibers
+        .chunks_exact_mut(arity)
+        .zip(vals.chunks_exact(per_query))
+        .zip(&queries.y0s)
+    {
+        for (w, poly_vals) in weights.iter().zip(q_vals.chunks_exact(arity)) {
+            let mut x = y0;
+            for (dst, &v) in fiber.iter_mut().zip(poly_vals) {
+                *dst += (w[0] + w[1].mul_base(x)).mul_base(v);
+                x *= queries.zeta;
+            }
+        }
+    }
+    fibers
+}
+
+/// Open $\sum_i (w_{i,0} + w_{i,1} x) W_i$ of the tables committed in `state` against the
+/// functional `cur_k`: combine the monomial coefficients, run [`whir_open_stages`] on them and
+/// answer its Stage-0 queries from `state`.
+fn whir_open_core(
+    state: &HemWhirProverState,
+    precomputed_monomial_polys: Option<&[Vec<Goldilocks>]>,
+    weights: &[[GoldilocksExt4; 2]],
+    cur_k: Vec<GoldilocksExt4>,
+    cur_sum_claim: GoldilocksExt4,
+    transcript: &mut FiatShamirTranscript<InstanceBound>,
+) -> HemWhirOpeningProof {
     let num_polys = state.num_polys();
     assert_eq!(weights.len(), num_polys);
     let single = num_polys == 1;
-    let sched = &state.schedule;
-    let turbo = sched.regime.uses_turboshake_canopy();
-    let num_stages = sched.stages.len();
-    let early_stop = sched.early_stop_vars;
-    let fold_vars = state.num_vars - early_stop;
-    absorb_whir_schedule(transcript, sched);
     let core_len = 1usize << state.num_vars;
     let pre_monos = precomputed_monomial_polys
         .or((state.monomial_coeffs_0.len() == num_polys)
@@ -4138,7 +4393,7 @@ fn whir_open_core(
         None
     };
 
-    let mut cur_coeffs = if unit_c0.is_some() {
+    let cur_coeffs = if unit_c0.is_some() {
         Vec::with_capacity(core_len / 2 + 2)
     } else {
         let _combine_phase = crate::profile::span("whir_open_combine_coeffs");
@@ -4188,6 +4443,57 @@ fn whir_open_core(
         coeffs
     };
 
+    let mut stage0 = None;
+    let stages = whir_open_stages(
+        &state.schedule,
+        state.num_vars,
+        state.secret,
+        unit_c0,
+        cur_coeffs,
+        cur_k,
+        cur_sum_claim,
+        transcript,
+        &mut |queries| {
+            let opening = open_stage0_leaves(state, &queries.indices);
+            let fibers = blend_stage0_fibers(&opening.vals, weights, queries);
+            stage0 = Some(opening);
+            fibers
+        },
+    );
+    let Some(stage0) = stage0 else {
+        unreachable!("every schedule queries Stage 0")
+    };
+    HemWhirOpeningProof::from_parts(stages, stage0)
+}
+
+/// Core multi-stage `Hem` WHIR rate-escalated opening over `GoldilocksExt4` of the word with
+/// monomial coefficients `cur_coeffs` (`2^num_vars` of them and two overflow slots), or of the
+/// base-field word `unit_c0` when that is given (`cur_coeffs` is then empty with capacity).
+///
+/// Nothing here reads a Stage-0 codeword. `stage0_fibers` is called exactly once, with the
+/// Stage-0 queries, and returns the opened word's fibers at them (`arity` values per query, in
+/// query order); how the leaves behind them are opened is the caller's business. The transcript
+/// absorbs the folded fibers (`WHIR_SHIFT_VALS`) when Stage 0 is not the last stage and nothing
+/// of Stage 0 otherwise; leaf contents, salts and multiproofs are never absorbed.
+#[allow(clippy::too_many_arguments)]
+fn whir_open_stages(
+    sched: &WhirSchedule,
+    num_vars: usize,
+    secret: bool,
+    unit_c0: Option<&[Goldilocks]>,
+    mut cur_coeffs: Vec<GoldilocksExt4>,
+    mut cur_k: Vec<GoldilocksExt4>,
+    mut cur_sum_claim: GoldilocksExt4,
+    transcript: &mut FiatShamirTranscript<InstanceBound>,
+    stage0_fibers: &mut dyn FnMut(&Stage0Queries) -> Vec<GoldilocksExt4>,
+) -> WhirStageFields {
+    let num_stages = sched.stages.len();
+    let early_stop = sched.early_stop_vars;
+    let fold_vars = num_vars - early_stop;
+    let core_len = 1usize << num_vars;
+    let turbo = sched.regime.uses_turboshake_canopy();
+    absorb_whir_schedule(transcript, sched);
+
     let ood_phase = crate::profile::span("whir_open_stage0_ood");
     let z_ood_0 = core::array::from_fn::<_, 2, _>(|_| transcript.squeeze_ext4(b"WHIR_OOD_CHAL"));
     let stage0_ood_evals = match unit_c0 {
@@ -4207,15 +4513,10 @@ fn whir_open_core(
     let inv_two = Goldilocks::TWO.inv();
     let inv_zetas = build_inv_zetas();
 
-    let mut rem_vars = state.num_vars;
+    let mut rem_vars = num_vars;
     let mut fold_sumcheck_polys = Vec::with_capacity(fold_vars);
     let mut fold_pow_nonces = Vec::with_capacity(fold_vars);
     let mut stage_pow_nonce_0: u64 = 0;
-    let mut round0_salts: Vec<[u8; 16]> = Vec::new();
-    let mut round0_vals: Vec<Goldilocks> = Vec::new();
-    let mut round0_multiproof = CanopyMultiProof {
-        auth_siblings: Vec::new(),
-    };
     let mut c_scratch = Vec::with_capacity(core_len / 4 + 4);
     let mut k_scratch = Vec::with_capacity(cur_k.len() / 2 + 2);
 
@@ -4225,11 +4526,10 @@ fn whir_open_core(
 
     for (stage_idx, st) in sched.stages.iter().enumerate() {
         let arity = 1usize << st.step_vars;
-        release_round0(&mut lazy_cpu_r0);
 
         let mut stage_chals = [[GoldilocksExt4::ZERO; 3]; MAX_FOLD_STEP_VARS];
         for (fold_in_stage, slot) in stage_chals.iter_mut().take(st.step_vars).enumerate() {
-            let compact = !state.secret && cur_coeffs.len() >= COMPACT_FOLD_MIN_LEN;
+            let compact = !secret && cur_coeffs.len() >= COMPACT_FOLD_MIN_LEN;
             let (wire, fold_pow_nonce, chals) = if stage_idx == 0
                 && fold_in_stage == 0
                 && let Some(c0) = unit_c0
@@ -4294,72 +4594,24 @@ fn whir_open_core(
 
             let shift_claims = if stage_idx == 0 {
                 stage_pow_nonce_0 = pow_nonce;
-                if state.codewords_0.is_empty() {
-                    lazy_cpu_r0 = Some(rebuild_round0());
-                }
-                let (codewords_0, tree_0): (&[Vec<Goldilocks>], &MerkleCanopyTree) =
-                    match &lazy_cpu_r0 {
-                        Some((codewords, tree)) => {
-                            (codewords.as_slice(), tree.as_ref().unwrap_or(&state.tree_0))
-                        }
-                        None => (state.codewords_0.as_slice(), &state.tree_0),
-                    };
-                let num_groups_0 = state.num_groups_0();
-                let domain_0 = codewords_0[0].len();
-                let log_d0 = domain_0.trailing_zeros() as usize;
-                let omega_0 = Goldilocks::two_adic_generator(log_d0);
-                let zeta_0 = omega_0.pow(num_groups_0 as u64);
-                let q_indices = sample_stage_queries(transcript, 0, num_groups_0, st.num_queries);
-                let (y0s, inv_y0s) = batch_coset_points_and_inverses(omega_0, &q_indices);
-
-                round0_salts.reserve(q_indices.len());
-                round0_vals.reserve(q_indices.len() * num_polys * arity);
-                let mut claims = Vec::with_capacity(q_indices.len());
-                for (q_pos, &g) in q_indices.iter().enumerate() {
-                    let y0 = y0s[q_pos];
-                    let inv_y0 = inv_y0s[q_pos];
-                    round0_salts.push(derive_round0_salt_mode(turbo, &state.salt_seed, g as u32));
-                    let mut fiber = [GoldilocksExt4::ZERO; MAX_FIBER_ARITY];
-                    if single {
-                        let cw0 = &codewords_0[0];
-                        for k in 0..arity {
-                            let v = cw0[g + k * num_groups_0];
-                            round0_vals.push(v);
-                            fiber[k] = GoldilocksExt4::from_base(v);
-                        }
-                    } else {
-                        for (w, cw) in weights.iter().zip(codewords_0) {
-                            let mut x = y0;
-                            for k in 0..arity {
-                                let v = cw[g + k * num_groups_0];
-                                round0_vals.push(v);
-                                fiber[k] += (w[0] + w[1].mul_base(x)).mul_base(v);
-                                x *= zeta_0;
-                            }
-                        }
-                    }
-                    let v_shift = fold_coset_group_ext4(
-                        &fiber[..arity],
-                        y0,
-                        inv_y0,
-                        inv_two,
-                        &inv_zetas,
-                        chals_slice,
-                    );
-                    let z_u = pow2_iter_base(y0, st.step_vars);
-                    claims.push((z_u, v_shift));
-                }
-                round0_multiproof = tree_0.open_multi_with_leaf_fn(&q_indices, |g| {
-                    round0_leaf_hash_mode(
-                        turbo,
-                        codewords_0,
-                        &state.salt_seed,
-                        g,
-                        num_groups_0,
-                        arity,
-                    )
-                });
-                claims
+                let queries = Stage0Queries::sample(transcript, num_vars, st);
+                let fibers = stage0_fibers(&queries);
+                assert_eq!(fibers.len(), queries.indices.len() * arity);
+                fibers
+                    .chunks_exact(arity)
+                    .zip(queries.y0s.iter().zip(&queries.inv_y0s))
+                    .map(|(fiber, (&y0, &inv_y0))| {
+                        let v_shift = fold_coset_group_ext4(
+                            fiber,
+                            y0,
+                            inv_y0,
+                            inv_two,
+                            &inv_zetas,
+                            chals_slice,
+                        );
+                        (pow2_iter_base(y0, st.step_vars), v_shift)
+                    })
+                    .collect::<Vec<_>>()
             } else {
                 let (prev_cw, prev_tree, prev_ood) = match active_stage_oracle.take() {
                     Some(oracle) => oracle,
@@ -4449,51 +4701,16 @@ fn whir_open_core(
 
             if stage_idx == 0 {
                 stage_pow_nonce_0 = pow_nonce;
-                if state.codewords_0.is_empty() {
-                    lazy_cpu_r0 = Some(rebuild_round0());
-                }
-                let (codewords_0, tree_0): (&[Vec<Goldilocks>], &MerkleCanopyTree) =
-                    match &lazy_cpu_r0 {
-                        Some((codewords, tree)) => {
-                            (codewords.as_slice(), tree.as_ref().unwrap_or(&state.tree_0))
-                        }
-                        None => (state.codewords_0.as_slice(), &state.tree_0),
-                    };
-                let num_groups_0 = state.num_groups_0();
-                let domain_0 = codewords_0[0].len();
-                let log_d0 = domain_0.trailing_zeros() as usize;
-                let omega_0 = Goldilocks::two_adic_generator(log_d0);
-                let zeta_0 = omega_0.pow(num_groups_0 as u64);
-                let q_indices = sample_stage_queries(transcript, 0, num_groups_0, st.num_queries);
-                let (y0s, inv_y0s) = batch_coset_points_and_inverses(omega_0, &q_indices);
-                round0_salts.reserve(q_indices.len());
-                round0_vals.reserve(q_indices.len() * num_polys * arity);
-                for (q_pos, &g) in q_indices.iter().enumerate() {
-                    let y0 = y0s[q_pos];
-                    let inv_y0 = inv_y0s[q_pos];
-                    round0_salts.push(derive_round0_salt_mode(turbo, &state.salt_seed, g as u32));
-                    let mut fiber = [GoldilocksExt4::ZERO; MAX_FIBER_ARITY];
-                    if single {
-                        let cw0 = &codewords_0[0];
-                        for k in 0..arity {
-                            let v = cw0[g + k * num_groups_0];
-                            round0_vals.push(v);
-                            fiber[k] = GoldilocksExt4::from_base(v);
-                        }
-                    } else {
-                        for (w, cw) in weights.iter().zip(codewords_0) {
-                            let mut x = y0;
-                            for k in 0..arity {
-                                let v = cw[g + k * num_groups_0];
-                                round0_vals.push(v);
-                                fiber[k] += (w[0] + w[1].mul_base(x)).mul_base(v);
-                                x *= zeta_0;
-                            }
-                        }
-                    }
+                let queries = Stage0Queries::sample(transcript, num_vars, st);
+                let fibers = stage0_fibers(&queries);
+                assert_eq!(fibers.len(), queries.indices.len() * arity);
+                for (fiber, (&y0, &inv_y0)) in fibers
+                    .chunks_exact(arity)
+                    .zip(queries.y0s.iter().zip(&queries.inv_y0s))
+                {
                     assert!(
                         final_fiber_matches_terminal_poly(
-                            &fiber[..arity],
+                            fiber,
                             y0,
                             inv_y0,
                             inv_two,
@@ -4504,16 +4721,6 @@ fn whir_open_core(
                         "final polynomial disagrees with an opened Round-0 fiber"
                     );
                 }
-                round0_multiproof = tree_0.open_multi_with_leaf_fn(&q_indices, |g| {
-                    round0_leaf_hash_mode(
-                        turbo,
-                        codewords_0,
-                        &state.salt_seed,
-                        g,
-                        num_groups_0,
-                        arity,
-                    )
-                });
             } else {
                 let (prev_cw, prev_tree, prev_ood) = match active_stage_oracle.take() {
                     Some(oracle) => oracle,
@@ -4559,21 +4766,17 @@ fn whir_open_core(
         }
     }
 
-    release_round0(&mut lazy_cpu_r0);
-    if state.secret {
+    if secret {
         dregg_sig_asm::volatile_fill(&mut c_scratch, GoldilocksExt4::ZERO);
     }
 
-    HemWhirOpeningProof {
+    WhirStageFields {
         stage0_ood_evals,
         fold_sumcheck_polys,
         fold_pow_nonces,
         folded_layers,
         final_coeffs: cur_coeffs,
         pow_nonce: stage_pow_nonce_0,
-        round0_salts,
-        round0_vals,
-        round0_multiproof,
     }
 }
 
@@ -4593,7 +4796,9 @@ fn word_to_gl_checked(w: u64) -> Result<Goldilocks, dregg_sig_accel::VulkanError
 
 #[cfg(feature = "vulkan")]
 #[inline]
-pub(crate) fn arr_to_ext4_checked(a: [u64; 4]) -> Result<GoldilocksExt4, dregg_sig_accel::VulkanError> {
+pub(crate) fn arr_to_ext4_checked(
+    a: [u64; 4],
+) -> Result<GoldilocksExt4, dregg_sig_accel::VulkanError> {
     let mut limbs = [Goldilocks::ZERO; 4];
     for (&w, dst) in a.iter().zip(&mut limbs) {
         *dst = word_to_gl_checked(w)?;
@@ -5729,11 +5934,25 @@ pub fn whir_verify_blend(
     transcript: &mut FiatShamirTranscript<InstanceBound>,
     schedule: &WhirSchedule,
 ) -> bool {
-    if scalars.len() < 2 || terms.iter().any(|t| t.point.len() != num_vars) {
+    let Some((weights, claims)) = blend_weights_and_claims(num_vars, scalars, terms) else {
         return false;
+    };
+    whir_verify_core_claims(
+        comm_0, &weights, num_vars, claims, claim, proof, transcript, schedule,
+    )
+}
+
+/// Table weights and initial kernel claims of a blend opening; `None` for fewer than two
+/// scalars or a term whose point does not have `num_vars` coordinates.
+fn blend_weights_and_claims(
+    num_vars: usize,
+    scalars: &[GoldilocksExt4],
+    terms: &[WeightedPoint],
+) -> Option<(Vec<[GoldilocksExt4; 2]>, Vec<KernelClaim>)> {
+    if scalars.len() < 2 || terms.iter().any(|t| t.point.len() != num_vars) {
+        return None;
     }
-    let weights: Vec<[GoldilocksExt4; 2]> =
-        scalars.iter().map(|&s| [s, GoldilocksExt4::ZERO]).collect();
+    let weights = scalars.iter().map(|&s| [s, GoldilocksExt4::ZERO]).collect();
     let claims = terms
         .iter()
         .map(|t| KernelClaim::Point {
@@ -5743,8 +5962,229 @@ pub fn whir_verify_blend(
             overflow: [GoldilocksExt4::ZERO; 2],
         })
         .collect();
-    whir_verify_core_claims(
-        comm_0, &weights, num_vars, claims, claim, proof, transcript, schedule,
+    Some((weights, claims))
+}
+
+/// Number of Stage-0 leaves of a commitment to tables of `num_vars` variables under `schedule`,
+/// which the caller has validated for `num_vars`.
+fn stage0_num_groups(num_vars: usize, schedule: &WhirSchedule) -> usize {
+    let st0 = schedule.stages[0];
+    ((1usize << num_vars) * st0.blowup) >> st0.step_vars
+}
+
+/// Is `fibers` a possible Stage-0 query set over `num_groups` leaves: nonempty, strictly
+/// ascending, in range and no larger than the schedule's Stage-0 query count?
+fn stage0_fibers_wellformed(fibers: &[usize], num_groups: usize, schedule: &WhirSchedule) -> bool {
+    !fibers.is_empty()
+        && fibers.len() <= schedule.stages[0].num_queries.min(num_groups)
+        && fibers.windows(2).all(|w| w[0] < w[1])
+        && fibers.last().is_some_and(|&g| g < num_groups)
+}
+
+/// Local, per committer: open this committer's Stage-0 leaves at the queried `fibers`
+/// (ascending, without repeats, as [`whir_open_blend_split`] hands them to its `open_stage0`).
+///
+/// The answer reveals the committer's symbols at those fibers and nothing else. A committer
+/// answers one query set per commitment: the hiding of its tables is budgeted for the Stage-0
+/// query count of the schedule, and this function cannot know what the state has opened before.
+///
+/// # Panics
+/// If `fibers` is empty, not strictly ascending, out of range, or longer than the Stage-0 query
+/// count of the state's schedule.
+pub fn whir_stage0_open_share(state: &HemWhirProverState, fibers: &[usize]) -> Stage0ShareOpening {
+    assert!(
+        stage0_fibers_wellformed(fibers, state.num_groups_0(), &state.schedule),
+        "malformed Stage-0 query set"
+    );
+    open_stage0_leaves(state, fibers)
+}
+
+/// Does `opening` open the Stage-0 leaves `fibers` of `root`, a commitment to `num_polys`
+/// tables of `num_vars` variables under `schedule`? This is the check
+/// [`whir_verify_blend_split`] makes on every share, so the party that collects the openings can
+/// name the committer whose answer is bad before it assembles a proof.
+pub fn whir_stage0_share_verifies(
+    root: &CanopyCommitment,
+    num_vars: usize,
+    num_polys: usize,
+    schedule: &WhirSchedule,
+    fibers: &[usize],
+    opening: &Stage0ShareOpening,
+) -> bool {
+    if !pcs_num_vars_supported(num_vars)
+        || !schedule.validate_structural(num_vars)
+        || num_polys == 0
+        || num_polys > MAX_BATCH_POLYS
+        || root.log_leaves > 28
+    {
+        return false;
+    }
+    let num_groups = stage0_num_groups(num_vars, schedule);
+    if (1usize << (root.log_leaves as usize)) != num_groups
+        || !stage0_fibers_wellformed(fibers, num_groups, schedule)
+    {
+        return false;
+    }
+    stage0_share_authenticates(
+        CanopyHash::for_stage(schedule.regime, 0),
+        &Stage0ShareRef::new(root, opening),
+        &fibers.into(),
+        num_polys,
+        num_polys << schedule.stages[0].step_vars,
+    )
+}
+
+/// [`whir_open_blend`] for a commitment that is the list `roots`, each root one committer's
+/// commitment ([`whir_commit_batch_secret_with_schedule`]) to its additive share of the
+/// `scalars.len()` tables. This is the public part of the opening: it is run by any party that
+/// knows the blended word $U = \sum_i \text{scalars}[i] \cdot W_i$, and reads no table.
+///
+/// `blend_monomials` are the $2^{\text{num\_vars}}$ monomial coefficients of $U$; `kernel` and
+/// `claim` are as in [`whir_open_blend`]. `open_stage0` is called exactly once, with the Stage-0
+/// fiber indices the transcript selects (ascending, without repeats), and returns one
+/// [`Stage0ShareOpening`] per root, in root order: the caller fetches each from its committer
+/// ([`whir_stage0_open_share`]).
+///
+/// The caller binds the list of roots, the scalars, the functional and the claim into
+/// `transcript` beforehand. From there the transcript is the one [`whir_open_blend`] drives for
+/// the same word: of Stage 0 it absorbs the folds of the summed fibers (`WHIR_SHIFT_VALS`, when
+/// the schedule has a later stage) and nothing per share. A share's salts, symbols and
+/// multiproof are bound by its root alone.
+///
+/// The working copies of `blend_monomials` are wiped. With several stages a `blend_monomials`
+/// that is not the blend of the committed shares yields a proof that does not verify; it is
+/// not detected here.
+///
+/// # Panics
+/// On malformed arguments, if `open_stage0` does not return one opening per root, or if an
+/// opening does not authenticate against its root (the message names the share). A caller that
+/// takes openings from parties it does not trust checks each with
+/// [`whir_stage0_share_verifies`] inside `open_stage0`.
+#[allow(clippy::too_many_arguments)]
+pub fn whir_open_blend_split(
+    roots: &[CanopyCommitment],
+    num_vars: usize,
+    schedule: &WhirSchedule,
+    scalars: &[GoldilocksExt4],
+    mut blend_monomials: Vec<GoldilocksExt4>,
+    kernel: Vec<GoldilocksExt4>,
+    claim: GoldilocksExt4,
+    transcript: &mut FiatShamirTranscript<InstanceBound>,
+    open_stage0: &mut dyn FnMut(&[usize]) -> Vec<Stage0ShareOpening>,
+) -> HemWhirSplitOpeningProof {
+    assert!((1..=MAX_STAGE0_SHARES).contains(&roots.len()));
+    assert!((2..=MAX_BATCH_POLYS).contains(&scalars.len()));
+    assert!(pcs_num_vars_supported(num_vars) && schedule.validate_structural(num_vars));
+    let core_len = 1usize << num_vars;
+    assert_eq!(blend_monomials.len(), core_len);
+    assert_eq!(kernel.len(), core_len + 2);
+    let num_groups = stage0_num_groups(num_vars, schedule);
+    assert!(
+        roots
+            .iter()
+            .all(|root| root.log_leaves <= 28
+                && (1usize << (root.log_leaves as usize)) == num_groups),
+        "a root is not a Stage-0 commitment of this size"
+    );
+
+    let mut coeffs = Vec::with_capacity(core_len + 2);
+    coeffs.extend_from_slice(&blend_monomials);
+    coeffs.extend_from_slice(&[GoldilocksExt4::ZERO; 2]);
+    dregg_sig_asm::volatile_fill(&mut blend_monomials, GoldilocksExt4::ZERO);
+    drop(blend_monomials);
+
+    let weights: Vec<[GoldilocksExt4; 2]> =
+        scalars.iter().map(|&s| [s, GoldilocksExt4::ZERO]).collect();
+    let hash = CanopyHash::for_stage(schedule.regime, 0);
+    let per_query = scalars.len() << schedule.stages[0].step_vars;
+    let mut shares = Vec::new();
+    let stages = whir_open_stages(
+        schedule,
+        num_vars,
+        true,
+        None,
+        coeffs,
+        kernel,
+        claim,
+        transcript,
+        &mut |queries| {
+            let opened = open_stage0(&queries.indices);
+            assert_eq!(opened.len(), roots.len(), "one Stage-0 opening per root");
+            let refs: Vec<Stage0ShareRef<'_>> = roots
+                .iter()
+                .zip(&opened)
+                .map(|(root, opening)| Stage0ShareRef::new(root, opening))
+                .collect();
+            let q_indices: alloc::sync::Arc<[usize]> = queries.indices.as_slice().into();
+            for (index, share) in refs.iter().enumerate() {
+                assert!(
+                    stage0_share_authenticates(hash, share, &q_indices, scalars.len(), per_query),
+                    "Stage-0 opening {index} does not authenticate against its root"
+                );
+            }
+            let fibers = blend_stage0_fibers(&sum_stage0_share_vals(&refs), &weights, queries);
+            drop(refs);
+            shares = opened;
+            fibers
+        },
+    );
+    HemWhirSplitOpeningProof {
+        stage0_ood_evals: stages.stage0_ood_evals,
+        fold_sumcheck_polys: stages.fold_sumcheck_polys,
+        fold_pow_nonces: stages.fold_pow_nonces,
+        folded_layers: stages.folded_layers,
+        final_coeffs: stages.final_coeffs,
+        pow_nonce: stages.pow_nonce,
+        shares,
+    }
+}
+
+/// Verify a [`whir_open_blend_split`] proof for the functional
+/// $\sum_t \text{terms}[t].\text{weight} \cdot U(\text{terms}[t].\text{point})$ against the
+/// list `roots`, which the caller has bound into `transcript`.
+///
+/// This is [`whir_verify_blend`] with one change at Stage 0: `proof.shares[j]` must open the
+/// queried leaves of `roots[j]`, for every `j`, and the symbols that are blended and folded are
+/// the field sums over `j` of the opened symbols. It rejects a share count other than
+/// `roots.len()` and any share with the wrong number of salts or values.
+#[allow(clippy::too_many_arguments)]
+pub fn whir_verify_blend_split(
+    roots: &[CanopyCommitment],
+    num_vars: usize,
+    scalars: &[GoldilocksExt4],
+    terms: &[WeightedPoint],
+    claim: GoldilocksExt4,
+    proof: &HemWhirSplitOpeningProof,
+    transcript: &mut FiatShamirTranscript<InstanceBound>,
+    schedule: &WhirSchedule,
+) -> bool {
+    if roots.is_empty() || roots.len() > MAX_STAGE0_SHARES || proof.shares.len() != roots.len() {
+        return false;
+    }
+    let Some((weights, claims)) = blend_weights_and_claims(num_vars, scalars, terms) else {
+        return false;
+    };
+    let stage0: Vec<Stage0ShareRef<'_>> = roots
+        .iter()
+        .zip(&proof.shares)
+        .map(|(root, opening)| Stage0ShareRef::new(root, opening))
+        .collect();
+    whir_verify_view_claims(
+        &weights,
+        num_vars,
+        claims,
+        claim,
+        &WhirOpeningView {
+            stage0_ood_evals: proof.stage0_ood_evals,
+            fold_sumcheck_polys: &proof.fold_sumcheck_polys,
+            fold_pow_nonces: &proof.fold_pow_nonces,
+            folded_layers: &proof.folded_layers,
+            final_coeffs: &proof.final_coeffs,
+            pow_nonce: proof.pow_nonce,
+            stage0: &stage0,
+        },
+        transcript,
+        schedule,
     )
 }
 
@@ -5771,6 +6211,38 @@ fn whir_verify_core(
     )
 }
 
+/// One committer's Stage-0 opening together with the root it is checked against.
+#[derive(Clone, Copy)]
+struct Stage0ShareRef<'a> {
+    root: &'a CanopyCommitment,
+    salts: &'a [[u8; 16]],
+    vals: &'a [Goldilocks],
+    multiproof: &'a CanopyMultiProof,
+}
+
+impl<'a> Stage0ShareRef<'a> {
+    fn new(root: &'a CanopyCommitment, opening: &'a Stage0ShareOpening) -> Self {
+        Self {
+            root,
+            salts: &opening.salts,
+            vals: &opening.vals,
+            multiproof: &opening.multiproof,
+        }
+    }
+}
+
+/// An opening proof as the verifier reads it: the stage fields and the Stage-0 openings, one
+/// per root. [`HemWhirOpeningProof`] is the case of one root.
+struct WhirOpeningView<'a> {
+    stage0_ood_evals: [GoldilocksExt4; 2],
+    fold_sumcheck_polys: &'a [[GoldilocksExt4; 5]],
+    fold_pow_nonces: &'a [u64],
+    folded_layers: &'a [WhirStageProof],
+    final_coeffs: &'a [GoldilocksExt4],
+    pow_nonce: u64,
+    stage0: &'a [Stage0ShareRef<'a>],
+}
+
 /// [`whir_verify_core`] for an initial claim that is a weighted sum of evaluation functionals.
 #[allow(clippy::too_many_arguments)]
 fn whir_verify_core_claims(
@@ -5783,12 +6255,49 @@ fn whir_verify_core_claims(
     transcript: &mut FiatShamirTranscript<InstanceBound>,
     sched: &WhirSchedule,
 ) -> bool {
+    whir_verify_view_claims(
+        weights,
+        num_vars,
+        init_claims,
+        init_sum_claim,
+        &WhirOpeningView {
+            stage0_ood_evals: proof.stage0_ood_evals,
+            fold_sumcheck_polys: &proof.fold_sumcheck_polys,
+            fold_pow_nonces: &proof.fold_pow_nonces,
+            folded_layers: &proof.folded_layers,
+            final_coeffs: &proof.final_coeffs,
+            pow_nonce: proof.pow_nonce,
+            stage0: &[Stage0ShareRef {
+                root: comm_0,
+                salts: &proof.round0_salts,
+                vals: &proof.round0_vals,
+                multiproof: &proof.round0_multiproof,
+            }],
+        },
+        transcript,
+        sched,
+    )
+}
+
+/// Verify the opening `proof` of $\sum_i \text{weights}[i] \cdot W_i$, where table $W_i$ is the
+/// sum over `proof.stage0` of the table `i` committed under that share's root.
+fn whir_verify_view_claims(
+    weights: &[[GoldilocksExt4; 2]],
+    num_vars: usize,
+    init_claims: Vec<KernelClaim>,
+    init_sum_claim: GoldilocksExt4,
+    proof: &WhirOpeningView<'_>,
+    transcript: &mut FiatShamirTranscript<InstanceBound>,
+    sched: &WhirSchedule,
+) -> bool {
     let num_polys = weights.len();
     if !pcs_num_vars_supported(num_vars)
         || num_polys == 0
         || num_polys > MAX_BATCH_POLYS
         || init_claims.is_empty()
-        || comm_0.log_leaves > 28
+        || proof.stage0.is_empty()
+        || proof.stage0.len() > MAX_STAGE0_SHARES
+        || proof.stage0.iter().any(|share| share.root.log_leaves > 28)
     {
         return false;
     }
@@ -5812,7 +6321,11 @@ fn whir_verify_core_claims(
     let arity_0 = 1usize << st0.step_vars;
     let domain_0 = (1usize << num_vars) * st0.blowup;
     let num_groups_0 = domain_0 / arity_0;
-    if (1usize << (comm_0.log_leaves as usize)) != num_groups_0 {
+    if proof
+        .stage0
+        .iter()
+        .any(|share| (1usize << (share.root.log_leaves as usize)) != num_groups_0)
+    {
         return false;
     }
 
@@ -5911,7 +6424,7 @@ fn whir_verify_core_claims(
             let shift_claims = if stage_idx == 0 {
                 verify_and_fold_stage0_fibers(
                     CanopyHash::for_stage(sched.regime, 0),
-                    comm_0,
+                    proof.stage0,
                     num_polys,
                     weights,
                     domain_0,
@@ -5920,7 +6433,6 @@ fn whir_verify_core_claims(
                     stage_chals,
                     inv_two,
                     &inv_zetas,
-                    proof,
                     None,
                     transcript,
                 )
@@ -5975,7 +6487,7 @@ fn whir_verify_core_claims(
             }
 
             let mut final_bytes = Vec::with_capacity(32 * proof.final_coeffs.len());
-            for &v in &proof.final_coeffs {
+            for &v in proof.final_coeffs {
                 final_bytes.extend_from_slice(&v.to_le_bytes());
             }
             transcript.absorb(b"WHIR_FINAL_POLY", &final_bytes);
@@ -5987,7 +6499,7 @@ fn whir_verify_core_claims(
                 &phis,
                 early_stop,
                 core::mem::take(&mut kernel_claims),
-                &proof.final_coeffs,
+                proof.final_coeffs,
             );
             let Some(last) = last_bridge.as_ref() else {
                 return false;
@@ -6008,7 +6520,7 @@ fn whir_verify_core_claims(
             ) {
                 return false;
             }
-            let terminal_coeffs = alloc::sync::Arc::new(to_verified_coeffs(&proof.final_coeffs));
+            let terminal_coeffs = alloc::sync::Arc::new(to_verified_coeffs(proof.final_coeffs));
 
             let final_pow_nonce = if stage_idx == 0 {
                 proof.pow_nonce
@@ -6023,7 +6535,7 @@ fn whir_verify_core_claims(
             let final_claims = if stage_idx == 0 {
                 verify_and_fold_stage0_fibers(
                     CanopyHash::for_stage(sched.regime, 0),
-                    comm_0,
+                    proof.stage0,
                     num_polys,
                     weights,
                     domain_0,
@@ -6032,7 +6544,6 @@ fn whir_verify_core_claims(
                     stage_chals,
                     inv_two,
                     &inv_zetas,
-                    proof,
                     Some(&terminal_coeffs),
                     transcript,
                 )
@@ -6118,12 +6629,127 @@ fn accepted_fiber_claims(folded: Vec<FoldedFiber>) -> Option<Vec<(Goldilocks, Go
         .collect()
 }
 
+/// `vals` cut into `<= 32 KiB` pages of `queries_per_page` queries (aligned to 4-query batches)
+/// so every `Arc` stays strictly inside glibc per-thread `tcache` (`< 128 KiB`
+/// `MMAP_THRESHOLD`, zero IPI TLB shootdowns).
+fn stage0_val_pages(
+    vals: &[Goldilocks],
+    queries_per_page: usize,
+    per_query: usize,
+) -> alloc::sync::Arc<[alloc::sync::Arc<[Goldilocks]>]> {
+    vals.chunks(queries_per_page * per_query)
+        .map(alloc::sync::Arc::<[Goldilocks]>::from)
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Leaf digests of the up-to-four queried Stage-0 leaves `indices`, the first of which is query
+/// number `start`; their contents start at `page[page_off]`, `per_query` values each.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn stage0_batch_leaves(
+    hash: CanopyHash,
+    indices: &[usize],
+    start: usize,
+    salts: &[[u8; 16]],
+    num_polys: usize,
+    page: &[Goldilocks],
+    page_off: usize,
+    per_query: usize,
+) -> [(usize, [u8; 32]); 4] {
+    let mut leaves = [(0usize, [0u8; 32]); 4];
+    if indices.len() == 4
+        && let Some(turbo) = hash.byte_turbo_mode()
+    {
+        let hashes = queried_round0_hash_x4_mode(
+            turbo,
+            indices,
+            &salts[start..],
+            num_polys,
+            &page[page_off..],
+            per_query,
+        );
+        for (slot, (&index, hash)) in leaves.iter_mut().zip(indices.iter().zip(hashes)) {
+            *slot = (index, hash);
+        }
+    } else {
+        for (lane, &g) in indices.iter().enumerate() {
+            let off = page_off + lane * per_query;
+            leaves[lane] = (
+                g,
+                round0_leaf_digest(
+                    hash,
+                    g as u32,
+                    &salts[start + lane],
+                    num_polys,
+                    &page[off..off + per_query],
+                ),
+            );
+        }
+    }
+    leaves
+}
+
+/// Does `share` open the Stage-0 leaves `q_indices` (ascending, no repeats) of its own root,
+/// with `per_query` values in each?
+fn stage0_share_authenticates(
+    hash: CanopyHash,
+    share: &Stage0ShareRef<'_>,
+    q_indices: &alloc::sync::Arc<[usize]>,
+    num_polys: usize,
+    per_query: usize,
+) -> bool {
+    let q_len = q_indices.len();
+    if share.salts.len() != q_len || share.vals.len() != q_len * per_query {
+        return false;
+    }
+    let batches_per_page = (32_768 / (4 * per_query * core::mem::size_of::<Goldilocks>())).max(1);
+    let val_pages = stage0_val_pages(share.vals, batches_per_page * 4, per_query);
+    let salts: alloc::sync::Arc<[[u8; 16]]> = share.salts.into();
+    let q_indices = q_indices.clone();
+    let results = map_query_indices(q_len.div_ceil(4), 2, move |batch| {
+        let start = batch * 4;
+        let end = (start + 4).min(q_len);
+        let leaves = stage0_batch_leaves(
+            hash,
+            &q_indices[start..end],
+            start,
+            &salts,
+            num_polys,
+            &val_pages[batch / batches_per_page],
+            (batch % batches_per_page) * 4 * per_query,
+            per_query,
+        );
+        (leaves, end - start)
+    });
+    let mut sorted_leaves = Vec::with_capacity(q_len);
+    for (leaves, len) in results {
+        sorted_leaves.extend_from_slice(&leaves[..len]);
+    }
+    verify_canopy_multiproof_with(hash, share.root, &sorted_leaves, share.multiproof)
+}
+
+/// Field sum over `shares` of their opened Stage-0 leaf contents. The caller has checked that
+/// all shares hold the same number of values.
+fn sum_stage0_share_vals(shares: &[Stage0ShareRef<'_>]) -> Vec<Goldilocks> {
+    let mut sum = shares[0].vals.to_vec();
+    for share in &shares[1..] {
+        for (acc, &v) in sum.iter_mut().zip(share.vals) {
+            *acc += v;
+        }
+    }
+    sum
+}
+
 /// Authenticate and fold the Round-0 fibers. With `terminal` set (final stage) every folded
 /// value must also equal the terminal polynomial at its shift point.
+///
+/// Every share is authenticated against its own root at the same queried leaves, and the
+/// folded symbols are the field sums over the shares. One share is the single-commitment case.
 #[allow(clippy::too_many_arguments)]
 fn verify_and_fold_stage0_fibers(
     hash: CanopyHash,
-    comm_0: &CanopyCommitment,
+    shares: &[Stage0ShareRef<'_>],
     num_polys: usize,
     weights: &[[GoldilocksExt4; 2]],
     domain_0: usize,
@@ -6132,7 +6758,6 @@ fn verify_and_fold_stage0_fibers(
     stage_chals: &[[GoldilocksExt4; 3]],
     inv_two: Goldilocks,
     inv_zetas: &[Goldilocks; MAX_FOLD_STEP_VARS + 1],
-    proof: &HemWhirOpeningProof,
     terminal: Option<&alloc::sync::Arc<Vec<dregg_sig_whir_verified::Ext4>>>,
     transcript: &mut FiatShamirTranscript<InstanceBound>,
 ) -> Option<Vec<(Goldilocks, GoldilocksExt4)>> {
@@ -6140,9 +6765,10 @@ fn verify_and_fold_stage0_fibers(
     let num_groups_0 = domain_0 / arity_0;
     let q_indices = sample_stage_queries(transcript, 0, num_groups_0, num_queries);
     let per_query = num_polys * arity_0;
-    if proof.round0_salts.len() != q_indices.len()
-        || proof.round0_vals.len() != q_indices.len() * per_query
-    {
+    let (first, rest) = shares.split_first()?;
+    if shares.iter().any(|share| {
+        share.salts.len() != q_indices.len() || share.vals.len() != q_indices.len() * per_query
+    }) {
         return None;
     }
 
@@ -6153,18 +6779,24 @@ fn verify_and_fold_stage0_fibers(
     let (y0s, inv_y0s) = batch_coset_points_and_inverses(omega_0, &q_indices);
 
     let q_len = q_indices.len();
-    // Partition `round0_vals` into `<= 32 KiB` pages (aligned to 4-query batches) so every `Arc`
-    // stays strictly inside glibc per-thread `tcache` (`< 128 KiB` `MMAP_THRESHOLD`, zero IPI TLB shootdowns).
     let batches_per_page = (32_768 / (4 * per_query * core::mem::size_of::<Goldilocks>())).max(1);
     let queries_per_page = batches_per_page * 4;
-    let val_pages: alloc::sync::Arc<[alloc::sync::Arc<[Goldilocks]>]> = proof
-        .round0_vals
-        .chunks(queries_per_page * per_query)
-        .map(alloc::sync::Arc::<[Goldilocks]>::from)
-        .collect::<Vec<_>>()
-        .into();
     let q_indices: alloc::sync::Arc<[usize]> = q_indices.into();
-    let salts: alloc::sync::Arc<[[u8; 16]]> = proof.round0_salts.as_slice().into();
+    // The shares after the first are only authenticated here; the first is hashed in the pass
+    // that folds, which reads the summed symbols.
+    if !rest
+        .iter()
+        .all(|share| stage0_share_authenticates(hash, share, &q_indices, num_polys, per_query))
+    {
+        return None;
+    }
+    let val_pages = stage0_val_pages(first.vals, queries_per_page, per_query);
+    let fold_pages = if rest.is_empty() {
+        val_pages.clone()
+    } else {
+        stage0_val_pages(&sum_stage0_share_vals(shares), queries_per_page, per_query)
+    };
+    let salts: alloc::sync::Arc<[[u8; 16]]> = first.salts.into();
     let y0s: alloc::sync::Arc<[Goldilocks]> = y0s.into();
     let inv_y0s: alloc::sync::Arc<[Goldilocks]> = inv_y0s.into();
     let weights: alloc::sync::Arc<[[GoldilocksExt4; 2]]> = weights.into();
@@ -6177,40 +6809,18 @@ fn verify_and_fold_stage0_fibers(
     let results = map_query_indices(batches, 2, move |batch| {
         let start = batch * 4;
         let end = (start + 4).min(q_len);
-        let indices = &q_indices[start..end];
-        let page = &val_pages[batch / batches_per_page];
         let page_off = (batch % batches_per_page) * 4 * per_query;
-        let mut leaves = [(0usize, [0u8; 32]); 4];
-        if indices.len() == 4
-            && let Some(turbo) = hash.byte_turbo_mode()
-        {
-            let hashes = queried_round0_hash_x4_mode(
-                turbo,
-                indices,
-                &salts[start..],
-                num_polys,
-                &page[page_off..],
-                per_query,
-            );
-            for (slot, (&index, hash)) in leaves.iter_mut().zip(indices.iter().zip(hashes)) {
-                *slot = (index, hash);
-            }
-        } else {
-            for (lane, &g) in indices.iter().enumerate() {
-                let i = start + lane;
-                let off = page_off + lane * per_query;
-                leaves[lane] = (
-                    g,
-                    round0_leaf_digest(
-                        hash,
-                        g as u32,
-                        &salts[i],
-                        num_polys,
-                        &page[off..off + per_query],
-                    ),
-                );
-            }
-        }
+        let leaves = stage0_batch_leaves(
+            hash,
+            &q_indices[start..end],
+            start,
+            &salts,
+            num_polys,
+            &val_pages[batch / batches_per_page],
+            page_off,
+            per_query,
+        );
+        let page = &fold_pages[batch / batches_per_page];
         let mut folded = [(Goldilocks::ZERO, GoldilocksExt4::ZERO, false); 4];
         for (lane, (slot, i)) in folded.iter_mut().zip(start..end).enumerate() {
             let off = page_off + lane * per_query;
@@ -6263,7 +6873,7 @@ fn verify_and_fold_stage0_fibers(
         sorted_leaves.extend_from_slice(&leaves[..len]);
         folded.extend_from_slice(&values[..len]);
     }
-    if !verify_canopy_multiproof_with(hash, comm_0, &sorted_leaves, &proof.round0_multiproof) {
+    if !verify_canopy_multiproof_with(hash, first.root, &sorted_leaves, first.multiproof) {
         return None;
     }
     accepted_fiber_claims(folded)
@@ -6635,11 +7245,13 @@ mod pcs_unit_tests {
                 iy.to_canonical_u64(),
                 to_verified_ext4(horner_expected),
             ));
-            assert!(!dregg_sig_whir_verified::verify_ext4_univariate_at_base_pin(
-                &poly_v,
-                iy.to_canonical_u64(),
-                to_verified_ext4(horner_expected + GoldilocksExt4::V),
-            ));
+            assert!(
+                !dregg_sig_whir_verified::verify_ext4_univariate_at_base_pin(
+                    &poly_v,
+                    iy.to_canonical_u64(),
+                    to_verified_ext4(horner_expected + GoldilocksExt4::V),
+                )
+            );
             let simple = odd + alpha * even;
             assert!(dregg_sig_whir_verified::verify_affine_duet_fold_step(
                 to_verified_ext4(v0),
@@ -7484,12 +8096,8 @@ mod pcs_unit_tests {
                 "TurboSHAKE batch commit fell back to CPU"
             );
             let mut btr_gpu = regime_transcript(&schedule, b"turbo-gpu-batch");
-            let bproof_gpu = whir_open_batch(
-                &bstate_gpu,
-                &[&pt0, &pt1],
-                &[val0, val1],
-                &mut btr_gpu,
-            );
+            let bproof_gpu =
+                whir_open_batch(&bstate_gpu, &[&pt0, &pt1], &[val0, val1], &mut btr_gpu);
             drop(bstate_gpu);
             let after_b = crate::acceleration::vulkan_execution_counts().unwrap();
             assert_eq!(
@@ -7500,12 +8108,8 @@ mod pcs_unit_tests {
             let (bcomm_cpu, bstate_cpu) = cpu_state(alloc::vec![p0, p1], &[0x5A; 32], &schedule);
             assert_eq!(bcomm_gpu, bcomm_cpu);
             let mut btr_cpu = regime_transcript(&schedule, b"turbo-gpu-batch");
-            let bproof_cpu = whir_open_batch(
-                &bstate_cpu,
-                &[&pt0, &pt1],
-                &[val0, val1],
-                &mut btr_cpu,
-            );
+            let bproof_cpu =
+                whir_open_batch(&bstate_cpu, &[&pt0, &pt1], &[val0, val1], &mut btr_cpu);
             drop(bstate_cpu);
             assert_eq!(bproof_gpu, bproof_cpu);
             let mut btr_ver = regime_transcript(&schedule, b"turbo-gpu-batch");
@@ -7565,6 +8169,510 @@ mod pcs_unit_tests {
                 after.0 - before.0,
                 after.1 - before.1
             );
+        }
+    }
+
+    /// `n_shares` committers holding additive shares of `n_tables` tables, each with its own
+    /// Stage-0 commitment, and a blend opening statement on the summed tables.
+    struct SplitFixture {
+        schedule: WhirSchedule,
+        nv: usize,
+        roots: Vec<CanopyCommitment>,
+        states: Vec<HemWhirProverState>,
+        scalars: Vec<GoldilocksExt4>,
+        terms: Vec<WeightedPoint>,
+        claim: GoldilocksExt4,
+        blend_monomials: Vec<GoldilocksExt4>,
+    }
+
+    impl SplitFixture {
+        fn new(regime: WhirSecurityRegime, nv: usize, n_shares: usize, n_tables: usize) -> Self {
+            let schedule = regime.schedule(nv);
+            let tables: Vec<Vec<Goldilocks>> = (0..n_tables as u64)
+                .map(|j| regime_test_poly(nv, 900 + j))
+                .collect();
+            // Shares `1..` are arbitrary; share 0 is what is left of each table.
+            let mut share_tables: Vec<Vec<Vec<Goldilocks>>> = (1..n_shares as u64)
+                .map(|i| {
+                    (0..n_tables as u64)
+                        .map(|j| regime_test_poly(nv, 7_000 + 131 * i + j))
+                        .collect()
+                })
+                .collect();
+            let first: Vec<Vec<Goldilocks>> = tables
+                .iter()
+                .enumerate()
+                .map(|(j, table)| {
+                    let mut rest = table.clone();
+                    for other in &share_tables {
+                        for (acc, &v) in rest.iter_mut().zip(&other[j]) {
+                            *acc -= v;
+                        }
+                    }
+                    rest
+                })
+                .collect();
+            share_tables.insert(0, first);
+
+            let (roots, states): (Vec<_>, Vec<_>) = share_tables
+                .into_iter()
+                .enumerate()
+                .map(|(i, polys)| {
+                    whir_commit_batch_secret_with_schedule(polys, &[i as u8 + 1; 32], &schedule)
+                })
+                .unzip();
+
+            let scalars = regime_test_point(n_tables, 60);
+            let mut blend_monomials = vec![GoldilocksExt4::ZERO; 1 << nv];
+            for (&scalar, table) in scalars.iter().zip(&tables) {
+                for (acc, c) in blend_monomials
+                    .iter_mut()
+                    .zip(hypercube_to_monomial_coeffs(table))
+                {
+                    *acc += scalar.mul_base(c);
+                }
+            }
+            let terms: Vec<WeightedPoint> = (0..2u64)
+                .map(|t| WeightedPoint {
+                    weight: regime_test_point(1, 70 + t)[0],
+                    point: regime_test_point(nv, 80 + t),
+                })
+                .collect();
+            let mut claim = GoldilocksExt4::ZERO;
+            for term in &terms {
+                for (&scalar, table) in scalars.iter().zip(&tables) {
+                    claim += term.weight
+                        * scalar
+                        * crate::field::mle_eval_base_at_ext4(table, &term.point);
+                }
+            }
+            Self {
+                schedule,
+                nv,
+                roots,
+                states,
+                scalars,
+                terms,
+                claim,
+                blend_monomials,
+            }
+        }
+
+        fn kernel(&self) -> Vec<GoldilocksExt4> {
+            let mut kernel = vec![GoldilocksExt4::ZERO; (1 << self.nv) + 2];
+            for term in &self.terms {
+                add_point_kernel(&mut kernel, term.weight, &term.point);
+            }
+            kernel
+        }
+
+        fn transcript(&self) -> FiatShamirTranscript<InstanceBound> {
+            regime_transcript(&self.schedule, b"split")
+        }
+
+        /// Split opening in which every committer answers the Stage-0 queries from its own state.
+        fn prove(&self) -> HemWhirSplitOpeningProof {
+            let mut calls = 0;
+            let proof = whir_open_blend_split(
+                &self.roots,
+                self.nv,
+                &self.schedule,
+                &self.scalars,
+                self.blend_monomials.clone(),
+                self.kernel(),
+                self.claim,
+                &mut self.transcript(),
+                &mut |fibers| {
+                    calls += 1;
+                    self.states
+                        .iter()
+                        .map(|state| whir_stage0_open_share(state, fibers))
+                        .collect()
+                },
+            );
+            assert_eq!(calls, 1);
+            proof
+        }
+
+        fn accepts_with(
+            &self,
+            roots: &[CanopyCommitment],
+            claim: GoldilocksExt4,
+            proof: &HemWhirSplitOpeningProof,
+        ) -> bool {
+            whir_verify_blend_split(
+                roots,
+                self.nv,
+                &self.scalars,
+                &self.terms,
+                claim,
+                proof,
+                &mut self.transcript(),
+                &self.schedule,
+            )
+        }
+
+        fn accepts(&self, proof: &HemWhirSplitOpeningProof) -> bool {
+            self.accepts_with(&self.roots, self.claim, proof)
+        }
+    }
+
+    /// Sizes with one, two and three WHIR stages: Stage 0 is the final stage in the first.
+    const SPLIT_TEST_NUM_VARS: [usize; 3] = [5, 10, 12];
+
+    #[test]
+    fn split_blend_opening_verifies_for_each_share_count() {
+        assert_eq!(
+            SPLIT_TEST_NUM_VARS.map(|nv| whir_stage_schedule(nv).stages.len()),
+            [1, 2, 3]
+        );
+        for nv in SPLIT_TEST_NUM_VARS {
+            for n_shares in [1, 2, 3, 5] {
+                let fx = SplitFixture::new(WhirSecurityRegime::default(), nv, n_shares, 5);
+                let proof = fx.prove();
+                assert_eq!(proof.shares.len(), n_shares);
+                assert!(fx.accepts(&proof), "nv={nv} shares={n_shares}");
+                // The statement is on the sum of the shares: each committed share alone, and the
+                // shares without the last one, are different tables.
+                if n_shares > 1 {
+                    let mut partial = proof.clone();
+                    partial.shares.pop();
+                    assert!(!fx.accepts_with(&fx.roots[..n_shares - 1], fx.claim, &partial));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_blend_opening_verifies_under_every_canopy_hash() {
+        for regime in [
+            WhirSecurityRegime::TurboShakeBciksJohnsonQrom128,
+            WhirSecurityRegime::Poseidon2Cdhz25JohnsonQrom128,
+            WhirSecurityRegime::Cdhz25ZeroPowQrom128,
+        ] {
+            for nv in [5, 10] {
+                let fx = SplitFixture::new(regime, nv, 3, 2);
+                let proof = fx.prove();
+                assert!(fx.accepts(&proof), "{regime:?} nv={nv}");
+                let mut bad = proof.clone();
+                bad.shares[2].vals[1] += Goldilocks::ONE;
+                assert!(!fx.accepts(&bad), "{regime:?} nv={nv}");
+            }
+        }
+    }
+
+    /// With one root the split opening is the single-commitment opening: same stage fields, same
+    /// Stage-0 opening, same transcript, and the same bytes around the share count.
+    #[test]
+    fn split_opening_of_one_share_matches_the_single_commitment_opening() {
+        for nv in SPLIT_TEST_NUM_VARS {
+            let fx = SplitFixture::new(WhirSecurityRegime::default(), nv, 1, 5);
+            let state = &fx.states[0];
+            let monos: Vec<Vec<Goldilocks>> = state
+                .hypercube_evals
+                .iter()
+                .map(|table| hypercube_to_monomial_coeffs(table))
+                .collect();
+            let mut single_tr = fx.transcript();
+            let single = whir_open_blend(
+                state,
+                &fx.scalars,
+                &monos,
+                fx.kernel(),
+                fx.claim,
+                &mut single_tr,
+            );
+            assert!(whir_verify_blend(
+                &fx.roots[0],
+                nv,
+                &fx.scalars,
+                &fx.terms,
+                fx.claim,
+                &single,
+                &mut fx.transcript(),
+                &fx.schedule,
+            ));
+
+            let mut split_tr = fx.transcript();
+            let split = whir_open_blend_split(
+                &fx.roots,
+                nv,
+                &fx.schedule,
+                &fx.scalars,
+                fx.blend_monomials.clone(),
+                fx.kernel(),
+                fx.claim,
+                &mut split_tr,
+                &mut |fibers| vec![whir_stage0_open_share(state, fibers)],
+            );
+            assert!(fx.accepts(&split));
+            assert_eq!(split.stage0_ood_evals, single.stage0_ood_evals);
+            assert_eq!(split.fold_sumcheck_polys, single.fold_sumcheck_polys);
+            assert_eq!(split.fold_pow_nonces, single.fold_pow_nonces);
+            assert_eq!(split.folded_layers, single.folded_layers);
+            assert_eq!(split.final_coeffs, single.final_coeffs);
+            assert_eq!(split.pow_nonce, single.pow_nonce);
+            assert_eq!(split.shares.len(), 1);
+            assert_eq!(split.shares[0].salts, single.round0_salts);
+            assert_eq!(split.shares[0].vals, single.round0_vals);
+            assert_eq!(split.shares[0].multiproof, single.round0_multiproof);
+            assert_eq!(
+                split_tr.squeeze_ext4(b"AFTER"),
+                single_tr.squeeze_ext4(b"AFTER")
+            );
+
+            let mut single_bytes = Vec::new();
+            single.push_bytes(&mut single_bytes);
+            let mut split_bytes = Vec::new();
+            split.push_bytes(&mut split_bytes);
+            let count_at = split_share_count_offset(&split);
+            assert_eq!(split_bytes[count_at], 1);
+            assert_eq!(split_bytes[..count_at], single_bytes[..count_at]);
+            assert_eq!(split_bytes[count_at + 1..], single_bytes[count_at..]);
+        }
+    }
+
+    /// Offset of the share-count byte in the encoding of `proof`.
+    fn split_share_count_offset(proof: &HemWhirSplitOpeningProof) -> usize {
+        let mut prefix = Vec::new();
+        push_whir_stage_fields(
+            proof.stage0_ood_evals,
+            &proof.fold_sumcheck_polys,
+            &proof.fold_pow_nonces,
+            &proof.folded_layers,
+            &proof.final_coeffs,
+            proof.pow_nonce,
+            &mut prefix,
+        );
+        prefix.len()
+    }
+
+    #[test]
+    fn split_verifier_rejects_tampered_shares() {
+        // Stage 0 is the final stage at `nv = 5` and an intermediate one at `nv = 10`.
+        for nv in [5, 10] {
+            let fx = SplitFixture::new(WhirSecurityRegime::default(), nv, 3, 5);
+            let proof = fx.prove();
+            assert!(fx.accepts(&proof));
+            let last = proof.shares[0].vals.len() - 1;
+
+            for at in [0, last] {
+                let mut bad = proof.clone();
+                bad.shares[1].vals[at] += Goldilocks::ONE;
+                assert!(!fx.accepts(&bad), "one opened symbol changed");
+
+                // The sum of the opened symbols is what the honest proof has, so only the
+                // per-root multiproofs can reject this.
+                let mut bad = proof.clone();
+                bad.shares[1].vals[at] += Goldilocks::from_u64_reduced(77);
+                bad.shares[2].vals[at] -= Goldilocks::from_u64_reduced(77);
+                let sums = |p: &HemWhirSplitOpeningProof| -> Vec<Goldilocks> {
+                    (0..=last)
+                        .map(|i| {
+                            p.shares
+                                .iter()
+                                .fold(Goldilocks::ZERO, |acc, s| acc + s.vals[i])
+                        })
+                        .collect()
+                };
+                assert_eq!(sums(&bad), sums(&proof));
+                assert_ne!(bad, proof);
+                assert!(!fx.accepts(&bad), "compensated symbols accepted");
+            }
+
+            let mut bad = proof.clone();
+            bad.shares.swap(0, 1);
+            assert!(!fx.accepts(&bad), "swapped shares");
+            let mut swapped_roots = fx.roots.clone();
+            swapped_roots.swap(0, 1);
+            assert!(!fx.accepts_with(&swapped_roots, fx.claim, &proof));
+            // Roots and shares permuted together open the same sum.
+            assert!(fx.accepts_with(&swapped_roots, fx.claim, &bad));
+
+            let mut bad = proof.clone();
+            bad.shares.pop();
+            assert!(!fx.accepts(&bad), "dropped share");
+            let mut bad = proof.clone();
+            bad.shares.push(proof.shares[0].clone());
+            assert!(!fx.accepts(&bad), "extra share");
+            assert!(!fx.accepts_with(&[], fx.claim, &proof));
+
+            assert!(!fx.accepts_with(&fx.roots, fx.claim + GoldilocksExt4::ONE, &proof));
+
+            let mut bad = proof.clone();
+            bad.shares[2].salts[0][3] ^= 1;
+            assert!(!fx.accepts(&bad), "salt");
+            // At `nv = 5` every leaf is queried and the multiproofs are empty.
+            let mut bad = proof.clone();
+            let siblings = &mut bad.shares[2].multiproof.auth_siblings;
+            assert_eq!(siblings.is_empty(), nv == 5);
+            match siblings.first_mut() {
+                Some(sibling) => sibling[0] ^= 1,
+                None => siblings.push([0; 32]),
+            }
+            assert!(!fx.accepts(&bad), "multiproof");
+            if nv != 5 {
+                let mut bad = proof.clone();
+                bad.shares[1].multiproof = proof.shares[0].multiproof.clone();
+                assert!(!fx.accepts(&bad), "another share's multiproof");
+            }
+
+            // Wrong shapes are rejected, not indexed.
+            let mut bad = proof.clone();
+            bad.shares[1].vals.pop();
+            assert!(!fx.accepts(&bad));
+            let mut bad = proof.clone();
+            bad.shares[1].salts.pop();
+            assert!(!fx.accepts(&bad));
+            let mut bad = proof.clone();
+            for share in &mut bad.shares {
+                share.vals.push(Goldilocks::ZERO);
+            }
+            assert!(!fx.accepts(&bad));
+
+            let mut bad = proof.clone();
+            bad.final_coeffs[0] += GoldilocksExt4::ONE;
+            assert!(!fx.accepts(&bad));
+        }
+    }
+
+    #[test]
+    fn split_share_check_names_the_bad_committer() {
+        let fx = SplitFixture::new(WhirSecurityRegime::default(), 10, 3, 5);
+        let mut asked = Vec::new();
+        let proof = whir_open_blend_split(
+            &fx.roots,
+            fx.nv,
+            &fx.schedule,
+            &fx.scalars,
+            fx.blend_monomials.clone(),
+            fx.kernel(),
+            fx.claim,
+            &mut fx.transcript(),
+            &mut |fibers| {
+                asked = fibers.to_vec();
+                fx.states
+                    .iter()
+                    .map(|state| whir_stage0_open_share(state, fibers))
+                    .collect()
+            },
+        );
+        let verifies = |root: usize, opening: &Stage0ShareOpening, fibers: &[usize]| {
+            whir_stage0_share_verifies(&fx.roots[root], fx.nv, 5, &fx.schedule, fibers, opening)
+        };
+        for (i, share) in proof.shares.iter().enumerate() {
+            assert!(verifies(i, share, &asked));
+            assert!(!verifies((i + 1) % 3, share, &asked));
+        }
+        let mut bad = proof.shares[1].clone();
+        bad.vals[0] += Goldilocks::ONE;
+        assert!(!verifies(1, &bad, &asked));
+        let mut shifted = asked.clone();
+        shifted[0] += 1;
+        assert_ne!(shifted[0], shifted[1], "pick fibers that stay ascending");
+        assert!(!verifies(1, &proof.shares[1], &shifted));
+        assert!(!verifies(1, &proof.shares[1], &asked[1..]));
+        let mut unsorted = asked.clone();
+        unsorted.swap(0, 1);
+        assert!(!verifies(1, &proof.shares[1], &unsorted));
+        assert!(!whir_stage0_share_verifies(
+            &fx.roots[1],
+            fx.nv,
+            4,
+            &fx.schedule,
+            &asked,
+            &proof.shares[1]
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Stage-0 opening 1 does not authenticate")]
+    fn split_prover_refuses_a_share_that_does_not_open_its_root() {
+        let fx = SplitFixture::new(WhirSecurityRegime::default(), 10, 2, 5);
+        whir_open_blend_split(
+            &fx.roots,
+            fx.nv,
+            &fx.schedule,
+            &fx.scalars,
+            fx.blend_monomials.clone(),
+            fx.kernel(),
+            fx.claim,
+            &mut fx.transcript(),
+            &mut |fibers| {
+                let mut shares: Vec<_> = fx
+                    .states
+                    .iter()
+                    .map(|state| whir_stage0_open_share(state, fibers))
+                    .collect();
+                shares[1].vals[0] += Goldilocks::ONE;
+                shares
+            },
+        );
+    }
+
+    #[test]
+    fn split_proof_wire_roundtrip_is_canonical() {
+        for (nv, n_shares) in [(5, 1), (10, 3), (12, 5)] {
+            let fx = SplitFixture::new(WhirSecurityRegime::default(), nv, n_shares, 5);
+            let proof = fx.prove();
+            let mut bytes = Vec::new();
+            proof.push_bytes(&mut bytes);
+            let (decoded, used) = HemWhirSplitOpeningProof::from_bytes_canonical(&bytes).unwrap();
+            assert_eq!(decoded, proof);
+            assert_eq!(used, bytes.len());
+            assert!(fx.accepts(&decoded));
+
+            // Trailing bytes are not consumed: the reported length is that of the proof.
+            let mut longer = bytes.clone();
+            longer.extend_from_slice(&[0, 0, 0, 0]);
+            let (decoded, used) = HemWhirSplitOpeningProof::from_bytes_canonical(&longer).unwrap();
+            assert_eq!((decoded, used), (proof.clone(), bytes.len()));
+
+            // Every truncation is rejected (all of the last 200 lengths, then a stride).
+            for cut in (0..bytes.len()).filter(|c| bytes.len() - c <= 200 || c % 97 == 0) {
+                assert!(
+                    HemWhirSplitOpeningProof::from_bytes_canonical(&bytes[..cut]).is_none(),
+                    "nv={nv} cut={cut}"
+                );
+            }
+
+            let count_at = split_share_count_offset(&proof);
+            assert_eq!(bytes[count_at] as usize, n_shares);
+            let mut bad = bytes.clone();
+            bad[count_at] = 0;
+            assert!(HemWhirSplitOpeningProof::from_bytes_canonical(&bad).is_none());
+            // One share more than the bytes hold.
+            let mut bad = bytes.clone();
+            bad[count_at] += 1;
+            assert!(HemWhirSplitOpeningProof::from_bytes_canonical(&bad).is_none());
+            // One share fewer: a shorter proof is parsed and the verifier refuses its share count.
+            if n_shares > 1 {
+                let mut fewer = bytes.clone();
+                fewer[count_at] -= 1;
+                let (decoded, used) =
+                    HemWhirSplitOpeningProof::from_bytes_canonical(&fewer).unwrap();
+                assert!(used < fewer.len());
+                assert!(!fx.accepts(&decoded));
+            }
+
+            // A non-canonical field element in the first share: its first value follows the
+            // share count, the query count, the salts and the value count.
+            let first_val = count_at + 1 + 4 + 16 * proof.shares[0].salts.len() + 4;
+            let mut bad = bytes.clone();
+            bad[first_val..first_val + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(HemWhirSplitOpeningProof::from_bytes_canonical(&bad).is_none());
+
+            // Shares must all have one shape.
+            if n_shares > 1 {
+                let mut ragged = proof.clone();
+                let per_query = ragged.shares[1].vals.len() / ragged.shares[1].salts.len();
+                ragged.shares[1].salts.pop();
+                let kept = per_query * ragged.shares[1].salts.len();
+                ragged.shares[1].vals.truncate(kept);
+                let mut bad = Vec::new();
+                ragged.push_bytes(&mut bad);
+                assert!(HemWhirSplitOpeningProof::from_bytes_canonical(&bad).is_none());
+            }
         }
     }
 
