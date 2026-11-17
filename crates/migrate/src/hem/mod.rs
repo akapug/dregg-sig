@@ -12,3 +12,4 @@ pub mod hash;
 #[cfg(feature = "std")]
 pub mod registry;
 pub mod relations;
+pub mod zcash;
