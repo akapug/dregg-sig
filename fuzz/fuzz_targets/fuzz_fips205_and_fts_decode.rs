@@ -9,11 +9,8 @@
 //! Every fixture is built in `LLVMFuzzerInitialize` (the `init:` block), before libFuzzer
 //! arms its per-input watchdog.
 
-use libfuzzer_sys::fuzz_target;
 use dregg_sig_accel::CpuReferenceBackend;
-use dregg_sig_core::fips205::{
-    Fips205Params, SlhPublicKey, decode_slh_sig, slh_verify,
-};
+use dregg_sig_core::fips205::{Fips205Params, SlhPublicKey, decode_slh_sig, slh_verify};
 use dregg_sig_core::tsw_baggy::decode_adrs;
 use dregg_sig_fts::parallel_mpc::{
     LeafBurnPersistence, ParallelSeededError, ParallelSeededParams, ParallelSeededPublicKey,
@@ -23,6 +20,7 @@ use dregg_sig_fts::{
     FrontierDpTable, FrontierFtsProfile, FrontierFtsPublicKey, FrontierFtsSignature,
     RotatedEpochVote, verify_frontier_fts,
 };
+use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
 /// The custody chain geometry on a two-leaf tree: the smallest tree whose codeword space
@@ -79,7 +77,13 @@ fn fixtures() -> &'static Fixtures {
         )
         .expect("two-party parallel-seeded setup");
         let sig = setup
-            .threshold_sign(0, SEEDED_MSG, [0x73; 32], &mut OneUseBurnLog::default(), &accel)
+            .threshold_sign(
+                0,
+                SEEDED_MSG,
+                [0x73; 32],
+                &mut OneUseBurnLog::default(),
+                &accel,
+            )
             .expect("threshold signature on leaf 0");
         verify_parallel_seeded_fts(&setup.pk, SEEDED_MSG, &sig, &accel)
             .expect("seed signature verifies");

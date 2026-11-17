@@ -649,7 +649,8 @@ mod tests {
         std::fs::rename(&lock, &parked).unwrap();
         std::fs::copy(&parked, &lock).unwrap();
         let mut forged = std::fs::read(&parked).unwrap();
-        let identity = dregg_sig_asm::durable::file_identity(&std::fs::symlink_metadata(&lock).unwrap());
+        let identity =
+            dregg_sig_asm::durable::file_identity(&std::fs::symlink_metadata(&lock).unwrap());
         forged[16..].copy_from_slice(&identity);
         std::fs::write(&lock, &forged).unwrap();
         match FsLedgerCheckpointAnchor::open_existing(&path, [9; 32], domain) {

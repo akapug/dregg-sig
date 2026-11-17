@@ -25,7 +25,6 @@
 
 use std::sync::OnceLock;
 
-use libfuzzer_sys::fuzz_target;
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::recursive::split::SplitSubtreeAggregate;
@@ -41,6 +40,7 @@ use dregg_sig_agg::zk_hem::protocol::{
     verify_public_hologram,
 };
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, poseidon2_perm};
+use libfuzzer_sys::fuzz_target;
 
 /// Regime of the fixture relations and the seed proof. Its proof-of-work grinds through
 /// the assembly Keccak kernel, which coverage instrumentation does not slow down.
@@ -69,7 +69,9 @@ struct Fixtures {
 
 /// A hologram-aligned relation with `publics` unconstrained public inputs and a few
 /// Poseidon2 permutations, and its satisfying assignment.
-fn small_relation(publics: &[Goldilocks]) -> (dregg_sig_agg::zk_hem::relation::Shape, Vec<Goldilocks>) {
+fn small_relation(
+    publics: &[Goldilocks],
+) -> (dregg_sig_agg::zk_hem::relation::Shape, Vec<Goldilocks>) {
     let f = Goldilocks::from_u64_reduced;
     let mut cs = ConstraintSystem::new_hologram_aligned();
     for &word in publics {
@@ -103,7 +105,12 @@ fn fixtures() -> &'static Fixtures {
         let f = Goldilocks::from_u64_reduced;
         let root_limbs = [f(0x1111), f(0x2222), f(0x3333), f(0x4444)];
         let mut roster_root = [0u8; 32];
-        for (chunk, limb) in roster_root.as_chunks_mut::<8>().0.iter_mut().zip(root_limbs) {
+        for (chunk, limb) in roster_root
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(root_limbs)
+        {
             chunk.copy_from_slice(&limb.to_le_bytes());
         }
         let public = SubtreePublic {
@@ -129,7 +136,12 @@ fn fixtures() -> &'static Fixtures {
             &[0x42; 32],
         )
         .expect("seed hologram proof");
-        assert!(verify_public_hologram(&vk, &public_words, SUBTREE_ROOT_LABEL, &proof));
+        assert!(verify_public_hologram(
+            &vk,
+            &public_words,
+            SUBTREE_ROOT_LABEL,
+            &proof
+        ));
         let proof_wire = proof.to_bytes();
         let aggregate = SuccinctSubtreeAggregate {
             total_active_signers: SIGNERS,
@@ -206,10 +218,20 @@ fn check_proof(fx: &Fixtures, bytes: &[u8]) -> Option<bool> {
     let verified = verify_public_hologram(&fx.vk, &fx.public_words, SUBTREE_ROOT_LABEL, proof);
     if verified {
         // The label and every public word are bound.
-        assert!(!verify_public_hologram(&fx.vk, &fx.public_words, b"another label", proof));
+        assert!(!verify_public_hologram(
+            &fx.vk,
+            &fx.public_words,
+            b"another label",
+            proof
+        ));
         let mut other_words = fx.public_words;
         other_words[10] += Goldilocks::ONE;
-        assert!(!verify_public_hologram(&fx.vk, &other_words, SUBTREE_ROOT_LABEL, proof));
+        assert!(!verify_public_hologram(
+            &fx.vk,
+            &other_words,
+            SUBTREE_ROOT_LABEL,
+            proof
+        ));
     }
     Some(verified)
 }

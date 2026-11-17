@@ -1358,8 +1358,9 @@ impl QuorumConfig {
             return Err(QuorumError::InvalidConfig("need 1 <= t and 1 <= n <= 64"));
         }
         // Production uses global BFT liveness, not the safety-only committee mode.
-        if !dregg_sig_verified::validate_belt_quorum_config(n as u32, t as u32, f as u32, q as u32, true)
-        {
+        if !dregg_sig_verified::validate_belt_quorum_config(
+            n as u32, t as u32, f as u32, q as u32, true,
+        ) {
             if 2 * q <= n + f {
                 return Err(QuorumError::QuorumTooSmall { q, n, f });
             }

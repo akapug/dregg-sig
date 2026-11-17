@@ -97,13 +97,8 @@ impl SplitSubtreeProof {
     ) -> Result<Self, FullShardError> {
         let (public, z) =
             relation.build_assignment(policies, epoch_floor, message, witnesses, seed)?;
-        let proof = prove_public_for_split(
-            &relation.shape,
-            &relation.hologram,
-            z,
-            SUBTREE_REC_TAG,
-        )
-        .map_err(|_| FullShardError::InvalidChild)?;
+        let proof = prove_public_for_split(&relation.shape, &relation.hologram, z, SUBTREE_REC_TAG)
+            .map_err(|_| FullShardError::InvalidChild)?;
         Ok(Self {
             public,
             proof,
@@ -130,13 +125,8 @@ impl SplitSubtreeProof {
             seed,
             Some(openings),
         )?;
-        let proof = prove_public_for_split(
-            &relation.shape,
-            &relation.hologram,
-            z,
-            SUBTREE_REC_TAG,
-        )
-        .map_err(|_| FullShardError::InvalidChild)?;
+        let proof = prove_public_for_split(&relation.shape, &relation.hologram, z, SUBTREE_REC_TAG)
+            .map_err(|_| FullShardError::InvalidChild)?;
         Ok(Self {
             public,
             proof,
@@ -377,10 +367,7 @@ impl SplitSubtreeRelation {
         let proof = prove_public_hologram(&self.shape, &self.hologram, z, SUBTREE_ROOT_LABEL, seed)
             .map_err(|_| FullShardError::InvalidChild)?;
 
-        let top_root = ledger
-            .last()
-            .ok_or(FullShardError::InvalidChild)?
-            .root();
+        let top_root = ledger.last().ok_or(FullShardError::InvalidChild)?.root();
         let mut pending: BTreeMap<[u64; 4], usize> = BTreeMap::new();
         let mut by_level: Vec<Vec<(&DeferredPcsClaim<F>, &SplitDeferredWitness)>> = Vec::new();
         for node in &ledger {

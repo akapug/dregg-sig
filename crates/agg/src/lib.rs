@@ -330,6 +330,7 @@ pub use arithmetize::{
     default_shard_signers, max_shard_signers, prove_shard_batch, verify_shard_batch,
     verify_shard_batch_with_regime,
 };
+pub use dregg_sig_core::tsw_baggy::{EpochLatchError, MonotonicEpochLatch, StatefulEpochLatch};
 pub use field::{Goldilocks, GoldilocksExt2, GoldilocksExt4, RoundPolyExt4};
 pub use pcs::{
     CanopyCommitment, CanopyMultiProof, EARLY_STOP_VARS, HemWhirBatchOpeningProof,
@@ -342,7 +343,6 @@ pub use pcs::{
     whir_commit_batch_owned_with_schedule, whir_commit_owned_with_schedule,
     whir_commit_with_schedule, whir_verify_batch_with_schedule, whir_verify_with_schedule,
 };
-pub use dregg_sig_core::tsw_baggy::{EpochLatchError, MonotonicEpochLatch, StatefulEpochLatch};
 pub use sig::{
     AggSigProfile, CORDUROY_MAX_STATELESS_SIGS_PER_KEY, Digest4, Digest5, EpochWalSink,
     JORTS_MAX_XMSS_HEIGHT, JORTS_MIN_XMSS_HEIGHT, JORTS_XMSS_HEIGHT, SigError, SignerBitmap,
@@ -2898,7 +2898,8 @@ mod tests {
         let n = env_usize("DREGG_SIG_BENCH_N", 128);
         let shard = env_usize("DREGG_SIG_BENCH_SHARD", DEFAULT_MAX_SHARD_SIGNERS_JORTS);
         let per_batch = env_usize("DREGG_SIG_BENCH_BATCH", 1);
-        let regime = WhirSecurityRegime::from_u8(env_usize("DREGG_SIG_BENCH_REGIME", 4) as u8).unwrap();
+        let regime =
+            WhirSecurityRegime::from_u8(env_usize("DREGG_SIG_BENCH_REGIME", 4) as u8).unwrap();
         let msg: &'static [u8] = b"consensus-scale-benchmark";
         let t = std::time::Instant::now();
         let (pks, sigs) = scale_keys_and_sigs(n, msg);

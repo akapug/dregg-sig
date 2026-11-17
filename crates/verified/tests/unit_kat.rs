@@ -605,8 +605,14 @@ fn test_dkg_frobenius_booleanity_and_crash_retry_epoch_latch() {
     assert!(!ct_eq_bytes32(&key_id, &bad_key));
 
     let r0 = derive_jorts_legacy_v1_det_r_rand(&sk_prf, &key_id, 0, &msg_a);
-    assert_eq!(r0, derive_jorts_legacy_v1_det_r_rand(&sk_prf, &key_id, 0, &msg_a));
-    assert_ne!(r0, derive_jorts_legacy_v1_det_r_rand(&sk_prf, &key_id, 1, &msg_a));
+    assert_eq!(
+        r0,
+        derive_jorts_legacy_v1_det_r_rand(&sk_prf, &key_id, 0, &msg_a)
+    );
+    assert_ne!(
+        r0,
+        derive_jorts_legacy_v1_det_r_rand(&sk_prf, &key_id, 1, &msg_a)
+    );
 
     let st0 = EpochLatch::new(2, key_id);
     // 1. Acquire epoch 0 fresh
@@ -951,10 +957,10 @@ fn test_fts_spn_deferred_mac_and_single_use_wots_cs_guard() {
 #[test]
 fn test_pants_and_quorum_guards_kat_and_adversarial() {
     use dregg_sig_verified::{
-        PantsGuardError, RssLatchStepInput, RssLatchStepOutput,
-        VerifiedRssPoisonLatch, VerifiedWaistbandRootGuard, VerifiedWotsC256Guard, WOTSC256_BASE_W,
-        WOTSC256_CHAINS, WOTSC256_TARGET_SUM, WaistbandDerivationRequest,
-        verified_wotsc256_extract_digits, verified_wotsc256_verify_sum, wotsc256_extract_digit,
+        PantsGuardError, RssLatchStepInput, RssLatchStepOutput, VerifiedRssPoisonLatch,
+        VerifiedWaistbandRootGuard, VerifiedWotsC256Guard, WOTSC256_BASE_W, WOTSC256_CHAINS,
+        WOTSC256_TARGET_SUM, WaistbandDerivationRequest, verified_wotsc256_extract_digits,
+        verified_wotsc256_verify_sum, wotsc256_extract_digit,
     };
 
     // =========================================================================
@@ -1037,7 +1043,10 @@ fn test_pants_and_quorum_guards_kat_and_adversarial() {
     let (h3, hopen) = h2.authorize_open();
     assert!(hopen.is_ok());
     let (_h4, hstep_open) = h3.step(RssLatchStepInput::AuthorizeOpen);
-    assert!(matches!(hstep_open, Ok(RssLatchStepOutput::OpenAuthorized(_))));
+    assert!(matches!(
+        hstep_open,
+        Ok(RssLatchStepOutput::OpenAuthorized(_))
+    ));
 
     // =========================================================================
     // 4. VerifiedWaistbandRootGuard: pk/params/child_root + first-signed lock

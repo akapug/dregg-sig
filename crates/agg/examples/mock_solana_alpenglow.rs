@@ -1524,7 +1524,8 @@ fn main() {
     let wal_dir = wal_root_dir();
     let wal_fstype = mount_fstype(&wal_dir).unwrap_or_else(|| "unknown".to_string());
 
-    let sections = std::env::var("DREGG_SIG_ALPENGLOW_SECTIONS").unwrap_or_else(|_| "1,2".to_string());
+    let sections =
+        std::env::var("DREGG_SIG_ALPENGLOW_SECTIONS").unwrap_or_else(|_| "1,2".to_string());
     let run_section = |n: &str| sections.split(',').any(|s| s.trim() == n);
 
     // The Jorts committee is the full 80% fast-finality committee that Section 2 certifies; its

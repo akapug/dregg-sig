@@ -660,11 +660,10 @@ impl ConstraintSystem {
             }
         };
         let remap_lc = |lc: Lc| -> Lc {
-            let mut terms: Vec<(u32, F)> = lc
-                .0
-                .into_iter()
-                .map(|(v, coeff)| (remap_var(v), coeff))
-                .collect();
+            let mut terms: Vec<(u32, F)> =
+                lc.0.into_iter()
+                    .map(|(v, coeff)| (remap_var(v), coeff))
+                    .collect();
             terms.sort_unstable_by_key(|&(v, _)| v);
             Lc(terms)
         };

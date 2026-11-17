@@ -1064,14 +1064,22 @@ fn linear_terms_slot_range(
                 });
             }
             for (pass, w) in sums.iter_mut().zip(weights) {
-                dregg_sig_asm::gf2_128_mul_acc_batch(&mut pass[0][2 * local_g + h], &*half, &w.plane);
+                dregg_sig_asm::gf2_128_mul_acc_batch(
+                    &mut pass[0][2 * local_g + h],
+                    &*half,
+                    &w.plane,
+                );
             }
             for (u, cell) in half.iter_mut().enumerate() {
                 let r = &pending.pad[s][base + u];
                 *cell = [r[2 * h], r[2 * h + 1]];
             }
             for (pass, w) in sums.iter_mut().zip(weights) {
-                dregg_sig_asm::gf2_128_mul_acc_batch(&mut pass[1][2 * local_g + h], &*half, &w.plane);
+                dregg_sig_asm::gf2_128_mul_acc_batch(
+                    &mut pass[1][2 * local_g + h],
+                    &*half,
+                    &w.plane,
+                );
             }
         }
     }
@@ -1463,7 +1471,11 @@ fn fold_round_sums(
                     &ex[p][cells.clone()],
                     &ey[q][cells.clone()],
                 );
-                dregg_sig_asm::gf2_128_mul_acc_batch(&mut acc, &ex[q][cells.clone()], &ey[p][cells]);
+                dregg_sig_asm::gf2_128_mul_acc_batch(
+                    &mut acc,
+                    &ex[q][cells.clone()],
+                    &ey[p][cells],
+                );
                 if batch_weights.is_some() {
                     pending[(p * points + e) * WEIGHTED_FLUSH + slot] = acc;
                 } else {
@@ -2094,9 +2106,18 @@ impl Rss256Engine {
                 }
             }
             for s in 0..3 {
-                dregg_sig_asm::volatile_fill(&mut self.bank.a[s][base..base + STATE_PLANES], [0; 4]);
-                dregg_sig_asm::volatile_fill(&mut self.bank.b[s][base..base + STATE_PLANES], [0; 4]);
-                dregg_sig_asm::volatile_fill(&mut self.bank.c[s][base..base + STATE_PLANES], [0; 4]);
+                dregg_sig_asm::volatile_fill(
+                    &mut self.bank.a[s][base..base + STATE_PLANES],
+                    [0; 4],
+                );
+                dregg_sig_asm::volatile_fill(
+                    &mut self.bank.b[s][base..base + STATE_PLANES],
+                    [0; 4],
+                );
+                dregg_sig_asm::volatile_fill(
+                    &mut self.bank.c[s][base..base + STATE_PLANES],
+                    [0; 4],
+                );
             }
             self.bank.cursor += STATE_PLANES;
             for (z, plane) in st.slot[0][..64].iter_mut().enumerate() {
@@ -2665,7 +2686,9 @@ impl Rss256Engine {
                         &bytes,
                         &salt,
                     );
-                    dregg_sig_verified::RssCutGateSession::new_round1_committed(session_id, commitment)
+                    dregg_sig_verified::RssCutGateSession::new_round1_committed(
+                        session_id, commitment,
+                    )
                 })
                 .collect();
             let mut echo: Vec<Plane> = share.to_vec();

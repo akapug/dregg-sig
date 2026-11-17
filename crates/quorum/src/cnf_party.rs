@@ -60,7 +60,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use dregg_sig_asm::{KECCAK_ROTATION_OFFSETS, KECCAK_ROUND_CONSTANTS, KeccakState8x, keccak_f1600_x8};
+use dregg_sig_asm::{
+    KECCAK_ROTATION_OFFSETS, KECCAK_ROUND_CONSTANTS, KeccakState8x, keccak_f1600_x8,
+};
 use dregg_sig_core::baggy::{BaggyEngine, BaggyError, TAG_BAGGY_OPT_RAND, TAG_BAGGY_R};
 use dregg_sig_core::cnf_rss::{
     BAGGY_F_SECRET_OFFSET, BAGGY_PRF_SECRET_OFFSET, BAGGY_SUITE_MIDSTATE, CnfRssConfig,
@@ -719,11 +721,14 @@ fn gf_mul(a: u128, b: u128) -> u128 {
 }
 
 fn public_gamma_pattern(gamma: &[[u64; 2]; 64]) -> dregg_sig_asm::XorCombinePattern {
-    core::array::from_fn(|bit| core::array::from_fn(|group| {
-        (0..4).fold(0, |nibble, offset| {
-            nibble | ((((gamma[4 * group + offset][bit / 64] >> (bit % 64)) & 1) as u8) << offset)
+    core::array::from_fn(|bit| {
+        core::array::from_fn(|group| {
+            (0..4).fold(0, |nibble, offset| {
+                nibble
+                    | ((((gamma[4 * group + offset][bit / 64] >> (bit % 64)) & 1) as u8) << offset)
+            })
         })
-    }))
+    })
 }
 
 /// `out[i] = XOR_b gamma[b] * bit_b(plane[i])`. Only the public gamma coefficients
@@ -3287,15 +3292,18 @@ mod tests {
             for (bit, word) in words.iter_mut().take(64).enumerate() {
                 *word = 1u64 << bit;
             }
-            let expected: Vec<[u64; 2]> = words.iter().map(|word| {
-                let mut value = 0u128;
-                for (bit, coefficient) in gamma.iter().enumerate() {
-                    if (word >> bit) & 1 != 0 {
-                        value ^= gf_from_words(*coefficient);
+            let expected: Vec<[u64; 2]> = words
+                .iter()
+                .map(|word| {
+                    let mut value = 0u128;
+                    for (bit, coefficient) in gamma.iter().enumerate() {
+                        if (word >> bit) & 1 != 0 {
+                            value ^= gf_from_words(*coefficient);
+                        }
                     }
-                }
-                gf_words(value)
-            }).collect();
+                    gf_words(value)
+                })
+                .collect();
             let mut actual = vec![[u64::MAX; 2]; len];
             bind_plane_gamma(&words, &gamma, &pattern, &mut actual);
             assert_eq!(actual, expected, "plane words={len}");
@@ -3306,9 +3314,7 @@ mod tests {
     fn ceremony_preserves_party_order_and_propagates_panics_after_joining() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let outputs = run_isolated_cnf_ceremony(vec![7, 11, 13], |index, value| {
-            (index, *value)
-        });
+        let outputs = run_isolated_cnf_ceremony(vec![7, 11, 13], |index, value| (index, *value));
         assert_eq!(outputs, vec![(0, 7), (1, 11), (2, 13)]);
 
         let entered = AtomicUsize::new(0);
@@ -3319,7 +3325,10 @@ mod tests {
                 *value
             })
         });
-        assert!(result.is_err(), "a missing party must not look like success");
+        assert!(
+            result.is_err(),
+            "a missing party must not look like success"
+        );
         assert_eq!(entered.load(Ordering::SeqCst), 3);
     }
 
@@ -4028,7 +4037,8 @@ mod tests {
                     for peer in topo.peers() {
                         let mut items = topo.common(peer);
                         items.push(held);
-                        let _ = recv_checked(&mut chan, peer, ROUND_CNF_DKG_COMMIT, 32 * items.len());
+                        let _ =
+                            recv_checked(&mut chan, peer, ROUND_CNF_DKG_COMMIT, 32 * items.len());
                     }
                     let mut bad_contrib = contrib;
                     bad_contrib[0] ^= 0x01;
@@ -4114,10 +4124,9 @@ mod tests {
                 let mut cache = WaistbandCache::disabled();
                 let mut ledger = MemoryFirstSigned::new();
                 let (pk, binding) = baggy_keygen_mpc(party, &params, &mut cache).unwrap();
-                let sig = baggy_sign_mpc(
-                    party, &params, &pk, &binding, &mut cache, &mut ledger, msg,
-                )
-                .unwrap();
+                let sig =
+                    baggy_sign_mpc(party, &params, &pk, &binding, &mut cache, &mut ledger, msg)
+                        .unwrap();
                 (pk, binding, sig)
             });
 
@@ -4169,9 +4178,13 @@ mod tests {
         for (t, n) in [(2usize, 3usize), (3, 5)] {
             let mut keys = custody_keys(t, n, 16, 0x68 + n as u8);
             let (sk_seed, sk_prf) = pooled_keypair(&keys);
-            let (ref_sk, ref_pk) =
-                slh_keygen_internal(&params, &sk_seed[..16], &sk_prf[..16], &keys[0].pk_seed[..16])
-                    .unwrap();
+            let (ref_sk, ref_pk) = slh_keygen_internal(
+                &params,
+                &sk_seed[..16],
+                &sk_prf[..16],
+                &keys[0].pk_seed[..16],
+            )
+            .unwrap();
             let ref_det_sig = slh_sign(&params, &msg, ctx, &ref_sk, None).unwrap();
 
             // Keygen + deterministic signing + hedged coin-toss signing.
@@ -4233,9 +4246,13 @@ mod tests {
 
         let mut base_keys = custody_keys(t, n, 16, 0x73);
         let (sk_seed, sk_prf) = pooled_keypair(&base_keys);
-        let (_, pk) =
-            slh_keygen_internal(&params, &sk_seed[..16], &sk_prf[..16], &base_keys[0].pk_seed[..16])
-                .unwrap();
+        let (_, pk) = slh_keygen_internal(
+            &params,
+            &sk_seed[..16],
+            &sk_prf[..16],
+            &base_keys[0].pk_seed[..16],
+        )
+        .unwrap();
         for k in &mut base_keys {
             k.bind_slh_params(&params, pk.pk_seed_slice()).unwrap();
         }
@@ -4458,7 +4475,8 @@ mod tests {
             )
             .unwrap();
             for k in &mut skeys {
-                k.bind_slh_params(&sparams, ref_spk.pk_seed_slice()).unwrap();
+                k.bind_slh_params(&sparams, ref_spk.pk_seed_slice())
+                    .unwrap();
             }
             let smsg = b"isolated CNF FIPS 205 SLH-DSA-SHAKE-128f benchmark";
             let sctx = b"bench";
@@ -4469,7 +4487,9 @@ mod tests {
             let t1 = Instant::now();
             let ssigs = run_isolated_cnf_ceremony(p_ssign, |_, party: &mut Party| {
                 let hedged = party.hedged_slh_randomizer(16).unwrap();
-                let det = party.slh_sign(&sparams, smsg, sctx, &ref_spk, None).unwrap();
+                let det = party
+                    .slh_sign(&sparams, smsg, sctx, &ref_spk, None)
+                    .unwrap();
                 (det, hedged)
             });
             let s_elapsed = t1.elapsed();

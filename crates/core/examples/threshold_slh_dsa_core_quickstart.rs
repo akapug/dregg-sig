@@ -1,6 +1,8 @@
 //! Reproducible threshold SLH-DSA keygen and signing with public demonstration seeds.
 //! Enable `std` for scoped CPU workers; pass `--gpu` to require Vulkan kernel parity first.
-use dregg_sig_core::fips205::{Fips205Params, SlhPublicKey, slh_keygen_mpc, slh_sign_mpc, slh_verify};
+use dregg_sig_core::fips205::{
+    Fips205Params, SlhPublicKey, slh_keygen_mpc, slh_sign_mpc, slh_verify,
+};
 use dregg_sig_core::keccak_mpc::{RssSlhMpcCluster, run_dealerless_rss_dkg_2of3};
 use dregg_sig_core::preprocessing::PartyPrivateRng;
 

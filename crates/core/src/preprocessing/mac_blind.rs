@@ -268,11 +268,13 @@ fn ole_blind_ext2_batch(
                     let selected = GoldilocksExt2::new(
                         Goldilocks::from_u64_reduced(
                             ct0.c0.to_canonical_u64()
-                                ^ (select & (ct0.c0.to_canonical_u64() ^ ct1.c0.to_canonical_u64())),
+                                ^ (select
+                                    & (ct0.c0.to_canonical_u64() ^ ct1.c0.to_canonical_u64())),
                         ),
                         Goldilocks::from_u64_reduced(
                             ct0.c1.to_canonical_u64()
-                                ^ (select & (ct0.c1.to_canonical_u64() ^ ct1.c1.to_canonical_u64())),
+                                ^ (select
+                                    & (ct0.c1.to_canonical_u64() ^ ct1.c1.to_canonical_u64())),
                         ),
                     );
                     raw[sender][bit] += mask;

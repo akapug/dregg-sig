@@ -2297,7 +2297,9 @@ impl FiatShamirTranscript<InstanceBound> {
 #[cfg(test)]
 mod internal_matrix_tests {
     use super::*;
-    use dregg_sig_accel::poseidon2::{POSEIDON2_INTERNAL_DIAG, poseidon2_perm12 as reference_perm12};
+    use dregg_sig_accel::poseidon2::{
+        POSEIDON2_INTERNAL_DIAG, poseidon2_perm12 as reference_perm12,
+    };
 
     fn expected_entry(row: usize, col: usize) -> u64 {
         let diag = if row == col {

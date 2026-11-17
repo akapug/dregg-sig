@@ -439,7 +439,8 @@ fn valid_policies(policies: &[ShardHemPolicy]) -> bool {
         minimums.push(min_u64);
     }
 
-    let Some(total_cap) = dregg_sig_whir_verified::checked_quorum_sum(&capacities, &minimums, 1) else {
+    let Some(total_cap) = dregg_sig_whir_verified::checked_quorum_sum(&capacities, &minimums, 1)
+    else {
         return false;
     };
     usize::try_from(total_cap).is_ok()
@@ -645,7 +646,8 @@ fn prove_hierarchical_hem_with_roots(
     let Some(total_u64) =
         dregg_sig_whir_verified::checked_quorum_sum(&counts_u64, &minimums_u64, min_global_u64)
     else {
-        let sum_no_global = dregg_sig_whir_verified::checked_quorum_sum(&counts_u64, &minimums_u64, 1);
+        let sum_no_global =
+            dregg_sig_whir_verified::checked_quorum_sum(&counts_u64, &minimums_u64, 1);
         return Err(if sum_no_global.is_some() {
             HemAggError::EmptySigners
         } else {

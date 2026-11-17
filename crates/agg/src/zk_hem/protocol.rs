@@ -45,9 +45,9 @@ use alloc::vec::Vec;
 
 use super::recursive_whir::{
     Backend as RecBackend, Base as RecBase, Correlated3WhirProof, Digest as RecDigest,
-    Ext as RecExt, FixedPathWhirParams, FoldedEdgeSpec, FoldedLevelWhirProof,
-    Native as RecNative, PublicRecursionCommitment, Transcript as RecTranscript,
-    commit_for_recursion, commit_levels_for_recursion, f as rec_f, open_correlated3_for_recursion,
+    Ext as RecExt, FixedPathWhirParams, FoldedEdgeSpec, FoldedLevelWhirProof, Native as RecNative,
+    PublicRecursionCommitment, Transcript as RecTranscript, commit_for_recursion,
+    commit_levels_for_recursion, f as rec_f, open_correlated3_for_recursion,
     prove_folded_level_for_recursion, verify_correlated3_gadget, verify_folded_level,
 };
 use super::relation::{HologramMeta, Poseidon2InteriorTemplate, Shape};

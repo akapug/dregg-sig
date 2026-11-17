@@ -364,7 +364,12 @@ mod framing_tests {
         for value in [0u128, 1, 255, 256, u64::MAX as u128, (u64::MAX as u128) * 8] {
             let (bytes, len) = super::sp800_185_left_encode_u128(value);
             assert_eq!(bytes[0] as usize + 1, len);
-            assert_eq!(bytes[1..len].iter().fold(0u128, |v, b| (v << 8) | u128::from(*b)), value);
+            assert_eq!(
+                bytes[1..len]
+                    .iter()
+                    .fold(0u128, |v, b| (v << 8) | u128::from(*b)),
+                value
+            );
             assert!(len == 2 || bytes[1] != 0);
         }
     }

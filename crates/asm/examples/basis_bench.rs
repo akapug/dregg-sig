@@ -20,7 +20,8 @@ fn main() {
         ),
         (
             "dispatched",
-            (|v: &mut [u128; 64]| dregg_sig_asm::tower128_to_poly128_batch_ct(v)) as fn(&mut [u128; 64]),
+            (|v: &mut [u128; 64]| dregg_sig_asm::tower128_to_poly128_batch_ct(v))
+                as fn(&mut [u128; 64]),
         ),
     ] {
         let start = Instant::now();

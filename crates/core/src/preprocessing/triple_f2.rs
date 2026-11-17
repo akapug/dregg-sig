@@ -3419,7 +3419,10 @@ mod tests {
             [v, !v ^ (s as u128)]
         });
         let mut out: CrhOut = [[0u64; RATE_WORDS * MAX_CRH_BLOCKS]; CRH_WIDTH];
-        for backend in [dregg_sig_asm::SimdBackend::Portable, dregg_sig_asm::detect_backend()] {
+        for backend in [
+            dregg_sig_asm::SimdBackend::Portable,
+            dregg_sig_asm::detect_backend(),
+        ] {
             crh_x8(&prefix, index, &rows, MAX_CRH_BLOCKS, backend, &mut out);
             for s in 0..CRH_WIDTH {
                 let mut msg = Vec::new();

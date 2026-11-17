@@ -345,7 +345,10 @@ global_asm!(
 unsafe extern "C" {
     pub(crate) fn dregg_sig_asm_enable_dit_aarch64();
     pub(crate) fn dregg_sig_asm_keccak_sha3_neon(out: *mut u8, b_row: *const u8, d_row: *const u8);
-    pub(crate) fn dregg_sig_asm_keccak_theta_rho_sha3_neon(b_out25x16: *mut u8, s_in25x16: *const u8);
+    pub(crate) fn dregg_sig_asm_keccak_theta_rho_sha3_neon(
+        b_out25x16: *mut u8,
+        s_in25x16: *const u8,
+    );
     pub(crate) fn dregg_sig_asm_tower128_bdoz_mac_pmull(
         out32: *mut u8,
         lhs32: *const u8,

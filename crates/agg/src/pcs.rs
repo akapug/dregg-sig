@@ -1366,7 +1366,8 @@ fn verify_canopy_multiproof_byte(
                     k += 1;
                     supplied
                 };
-                let Some(pair) = dregg_sig_whir_verified::step_merkle_pair_order(u as u64, 0, hu, hsib)
+                let Some(pair) =
+                    dregg_sig_whir_verified::step_merkle_pair_order(u as u64, 0, hu, hsib)
                 else {
                     return false;
                 };
@@ -4579,7 +4580,9 @@ fn word_to_gl_checked(w: u64) -> Result<Goldilocks, dregg_sig_accel::VulkanError
 
 #[cfg(feature = "vulkan")]
 #[inline]
-pub(crate) fn arr_to_ext4_checked(a: [u64; 4]) -> Result<GoldilocksExt4, dregg_sig_accel::VulkanError> {
+pub(crate) fn arr_to_ext4_checked(
+    a: [u64; 4],
+) -> Result<GoldilocksExt4, dregg_sig_accel::VulkanError> {
     let mut limbs = [Goldilocks::ZERO; 4];
     for (&w, dst) in a.iter().zip(&mut limbs) {
         *dst = word_to_gl_checked(w)?;
@@ -6621,11 +6624,13 @@ mod pcs_unit_tests {
                 iy.to_canonical_u64(),
                 to_verified_ext4(horner_expected),
             ));
-            assert!(!dregg_sig_whir_verified::verify_ext4_univariate_at_base_pin(
-                &poly_v,
-                iy.to_canonical_u64(),
-                to_verified_ext4(horner_expected + GoldilocksExt4::V),
-            ));
+            assert!(
+                !dregg_sig_whir_verified::verify_ext4_univariate_at_base_pin(
+                    &poly_v,
+                    iy.to_canonical_u64(),
+                    to_verified_ext4(horner_expected + GoldilocksExt4::V),
+                )
+            );
             let simple = odd + alpha * even;
             assert!(dregg_sig_whir_verified::verify_affine_duet_fold_step(
                 to_verified_ext4(v0),
@@ -7473,12 +7478,8 @@ mod pcs_unit_tests {
                 "TurboSHAKE batch commit fell back to CPU"
             );
             let mut btr_gpu = regime_transcript(&schedule, b"turbo-gpu-batch");
-            let bproof_gpu = whir_open_batch(
-                &bstate_gpu,
-                &[&pt0, &pt1],
-                &[val0, val1],
-                &mut btr_gpu,
-            );
+            let bproof_gpu =
+                whir_open_batch(&bstate_gpu, &[&pt0, &pt1], &[val0, val1], &mut btr_gpu);
             drop(bstate_gpu);
             let after_b = crate::acceleration::vulkan_execution_counts().unwrap();
             assert_eq!(
@@ -7489,12 +7490,8 @@ mod pcs_unit_tests {
             let (bcomm_cpu, bstate_cpu) = cpu_state(alloc::vec![p0, p1], &[0x5A; 32], &schedule);
             assert_eq!(bcomm_gpu, bcomm_cpu);
             let mut btr_cpu = regime_transcript(&schedule, b"turbo-gpu-batch");
-            let bproof_cpu = whir_open_batch(
-                &bstate_cpu,
-                &[&pt0, &pt1],
-                &[val0, val1],
-                &mut btr_cpu,
-            );
+            let bproof_cpu =
+                whir_open_batch(&bstate_cpu, &[&pt0, &pt1], &[val0, val1], &mut btr_cpu);
             drop(bstate_cpu);
             assert_eq!(bproof_gpu, bproof_cpu);
             let mut btr_ver = regime_transcript(&schedule, b"turbo-gpu-batch");

@@ -321,7 +321,10 @@ fn derive_sender_tree_roots(
     })
 }
 
-fn permute_ggm(states: &mut [[u64; 25]], backend: Option<&dyn dregg_sig_accel::AcceleratorBackend>) {
+fn permute_ggm(
+    states: &mut [[u64; 25]],
+    backend: Option<&dyn dregg_sig_accel::AcceleratorBackend>,
+) {
     if let Some(backend) = backend {
         backend.batch_keccak_f1600(states);
     } else {
@@ -3119,7 +3122,8 @@ mod tests {
     #[test]
     #[ignore = "Requires an audited Vulkan device"]
     fn dense_backend_vulkan_end_to_end_parity() {
-        let gpu = dregg_sig_accel::vulkan::VulkanSpirvBackend::try_new().expect("audited Vulkan device");
+        let gpu =
+            dregg_sig_accel::vulkan::VulkanSpirvBackend::try_new().expect("audited Vulkan device");
         std::eprintln!("GPU: {}", gpu.device_name());
         let before = gpu.gpu_submission_count();
         assert_backend_vault_parity(&gpu);

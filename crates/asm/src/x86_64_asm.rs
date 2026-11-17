@@ -1492,7 +1492,12 @@ unsafe extern "sysv64" {
     pub(crate) fn dregg_sig_asm_goldilocks_add_ct_x86_64(a: u64, b: u64) -> u64;
     pub(crate) fn dregg_sig_asm_goldilocks_sub_ct_x86_64(a: u64, b: u64) -> u64;
     pub(crate) fn dregg_sig_asm_goldilocks_pow7_ct_x86_64(x: u64) -> u64;
-    pub(crate) fn dregg_sig_asm_goldilocks_dot2_adx_x86_64(a0: u64, b0: u64, a1: u64, b1: u64) -> u64;
+    pub(crate) fn dregg_sig_asm_goldilocks_dot2_adx_x86_64(
+        a0: u64,
+        b0: u64,
+        a1: u64,
+        b1: u64,
+    ) -> u64;
     pub(crate) fn dregg_sig_asm_ct_eq_32_x86_64(a: *const u8, b: *const u8) -> u64;
     pub(crate) fn dregg_sig_asm_ct_eq_bytes_x86_64(a: *const u8, b: *const u8, len: usize) -> u64;
     pub(crate) fn dregg_sig_asm_ct_memzero_x86_64(ptr: *mut u8, len: usize);
@@ -1501,6 +1506,9 @@ unsafe extern "sysv64" {
 #[inline]
 pub(crate) unsafe fn run_keccak_f1600_avx2_4x(state: &mut KeccakState4x) {
     unsafe {
-        dregg_sig_asm_keccak_f1600_avx2_4x(state as *mut KeccakState4x, KECCAK_ROUND_CONSTANTS.as_ptr());
+        dregg_sig_asm_keccak_f1600_avx2_4x(
+            state as *mut KeccakState4x,
+            KECCAK_ROUND_CONSTANTS.as_ptr(),
+        );
     }
 }

@@ -2777,8 +2777,10 @@ impl PersonalMspInput {
     pub fn release_with_permit(
         self,
         permit: &crate::access::PersonalReleasePermit,
-    ) -> Result<SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>, PersonalMspInputError>
-    {
+    ) -> Result<
+        SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>,
+        PersonalMspInputError,
+    > {
         if permit.party() != self.party || !permit.signers().contains(&self.party) {
             return Err(PersonalMspInputError::Access(
                 crate::access::AccessError::Unauthorized,
@@ -2805,8 +2807,10 @@ impl PersonalMspInput {
         record: &dregg_sig_core::belt_latch::BeltLatchRecord,
         certificate: &crate::access::PersonalLatchCertificate,
         expected_signers: &crate::access::PartySet,
-    ) -> Result<SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>, PersonalMspInputError>
-    {
+    ) -> Result<
+        SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>,
+        PersonalMspInputError,
+    > {
         let permit = latch
             .authorize(record, certificate)
             .map_err(PersonalMspInputError::Policy)?;
@@ -2830,8 +2834,10 @@ impl PersonalMspInput {
         latch: &mut crate::access::PersonalBeltLatch<W>,
         record: &dregg_sig_core::belt_latch::BeltLatchRecord,
         certificate: &crate::access::PersonalLatchCertificate,
-    ) -> Result<SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>, PersonalMspInputError>
-    {
+    ) -> Result<
+        SecretBuffer<[dregg_sig_core::field::goldilocks::Goldilocks; 4]>,
+        PersonalMspInputError,
+    > {
         let permit = latch
             .authorize(record, certificate)
             .map_err(PersonalMspInputError::Policy)?;

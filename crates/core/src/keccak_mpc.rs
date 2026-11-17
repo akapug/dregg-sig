@@ -1655,7 +1655,11 @@ fn rss_dzk_pass(
                 }
                 // `x` is zero at the start of a pass. Fuse the fixed public
                 // group weight over all lanes in one hardware dispatch.
-                dregg_sig_asm::bitslice::gf2_128_scale_xor(x, &weighted, block_weights[first + k].0);
+                dregg_sig_asm::bitslice::gf2_128_scale_xor(
+                    x,
+                    &weighted,
+                    block_weights[first + k].0,
+                );
             }
         }
         dregg_sig_asm::volatile_fill(&mut rows, [0; 4]);

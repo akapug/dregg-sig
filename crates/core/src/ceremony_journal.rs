@@ -774,7 +774,8 @@ mod tests {
         std::fs::copy(src, dst).unwrap();
         std::fs::copy(lock(src), lock(dst)).unwrap();
         let mut sidecar = std::fs::read(lock(src)).unwrap();
-        let identity = dregg_sig_asm::durable::file_identity(&std::fs::metadata(lock(dst)).unwrap());
+        let identity =
+            dregg_sig_asm::durable::file_identity(&std::fs::metadata(lock(dst)).unwrap());
         sidecar[16..].copy_from_slice(&identity);
         std::fs::write(lock(dst), &sidecar).unwrap();
     }

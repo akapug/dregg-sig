@@ -6,7 +6,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use dregg_sig_accel::goldilocks::{GOLDILOCKS_PRIME, gl_reduce_u64, precompute_goldilocks_twiddles};
+use dregg_sig_accel::goldilocks::{
+    GOLDILOCKS_PRIME, gl_reduce_u64, precompute_goldilocks_twiddles,
+};
 use dregg_sig_accel::spirv_kernels::{
     prover_shader_source_filename, prover_spirv_kernel_bytes, shader_source_filename,
     spirv_kernel_bytes,

@@ -346,7 +346,8 @@ mod tests {
             PartyPrivateRng::from_seed([i as u8 + 18; 32], b"volatile-root-dkg")
         });
         let (keys, _) =
-            dregg_sig_core::keccak_mpc::run_dealerless_rss_dkg_2of3([39; 32], 32, &mut rngs).unwrap();
+            dregg_sig_core::keccak_mpc::run_dealerless_rss_dkg_2of3([39; 32], 32, &mut rngs)
+                .unwrap();
         let mut engine = dregg_sig_core::rss256::Rss256Engine::new([40; 32], keys, rngs).unwrap();
         // The root certificate is a PORS+FP signature.
         let params = BaggyParams::SHA3_128F;

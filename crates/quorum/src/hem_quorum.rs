@@ -31,7 +31,9 @@ use dregg_sig_core::dkg::{
     ShamirPoseidonSeedShare, epoch_latch_binding, run_dealerless_dkg_seed32_goldilocks,
     run_dealerless_refresh_seed32_goldilocks, run_dealerless_reshare_seed32_goldilocks,
 };
-use dregg_sig_core::field::goldilocks::{Goldilocks, GoldilocksExt2, lagrange_weights_zero_goldilocks};
+use dregg_sig_core::field::goldilocks::{
+    Goldilocks, GoldilocksExt2, lagrange_weights_zero_goldilocks,
+};
 use dregg_sig_core::poseidon2_mpc::{
     HEM_DOMAIN_SK_PRF_EXPAND, HEM_DOMAIN_SK_SEED_EXPAND, Poseidon2MpcError,
     authenticate_poseidon_dkg_shares_and_preprocess,

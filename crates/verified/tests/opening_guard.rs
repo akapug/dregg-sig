@@ -58,8 +58,11 @@ fn commitment_mismatch_and_wrong_count_are_refused() {
         .absorb_opening(&[2; 32], &[3; 32], [4, 4]);
     assert!(guard.verify_once(&SESSION, ROUND, &BINDING).1.is_none());
 
-    let short = ConsumingOpeningGuard2Lane::new(SESSION, ROUND, BINDING, 2)
-        .absorb_opening(&[1; 32], &[1; 32], [0, 0]);
+    let short = ConsumingOpeningGuard2Lane::new(SESSION, ROUND, BINDING, 2).absorb_opening(
+        &[1; 32],
+        &[1; 32],
+        [0, 0],
+    );
     assert_eq!(short.absorbed(), 1);
     assert!(short.verify_once(&SESSION, ROUND, &BINDING).1.is_none());
 

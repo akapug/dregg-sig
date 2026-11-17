@@ -25,7 +25,6 @@
 
 use std::sync::OnceLock;
 
-use libfuzzer_sys::fuzz_target;
 use dregg_sig_agg::field::{Goldilocks, GoldilocksExt4};
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::full_shard::{
@@ -42,6 +41,7 @@ use dregg_sig_agg::{
     AggSigProfile, SignerBitmap, ValidatorPublicKey, ValidatorSignature,
     verify_individual_signature,
 };
+use libfuzzer_sys::fuzz_target;
 
 struct FuzzFixtures {
     generic_shape: Shape,

@@ -1481,7 +1481,10 @@ pub fn verify_fixed_path(
 /// avoiding 3x transient coset/shifted allocations on 2^22+ domains.
 fn encode_base_single_buf(coeffs: &[F], blowup: usize, reuse: &mut Vec<F>) -> Vec<F> {
     if coeffs.len() >= (1 << 20) {
-        let domain_len = coeffs.len().checked_mul(blowup).expect("RS domain overflow");
+        let domain_len = coeffs
+            .len()
+            .checked_mul(blowup)
+            .expect("RS domain overflow");
         let mut buf = core::mem::take(reuse);
         buf.clear();
         if buf.capacity() < domain_len {
@@ -1754,7 +1757,11 @@ fn eval_univariate_fn(len: usize, z: E, coeff: impl Fn(usize) -> E + Sync) -> E 
 /// Stream Round-0 affine monomial fold directly from an implicit polynomial `coeff(i)` of length
 /// `len` into `out` of length `len / 2 + 1`, avoiding allocating the full `len`-element `Ext4`
 /// coefficient table before Round 0!
-fn fold_coeffs_from_fn(len: usize, [theta, alpha, beta]: [E; 3], coeff: impl Fn(usize) -> E + Sync) -> Vec<E> {
+fn fold_coeffs_from_fn(
+    len: usize,
+    [theta, alpha, beta]: [E; 3],
+    coeff: impl Fn(usize) -> E + Sync,
+) -> Vec<E> {
     let m = len / 2;
     if m == 0 {
         return vec![E::ZERO];
@@ -3672,7 +3679,12 @@ pub(crate) fn verify_folded_level(
         return false;
     }
 
-    let poly_evals_ext: Vec<Ext<F>> = proof.poly_evals.iter().copied().map(Ext::constant).collect();
+    let poly_evals_ext: Vec<Ext<F>> = proof
+        .poly_evals
+        .iter()
+        .copied()
+        .map(Ext::constant)
+        .collect();
     tr.absorb_exts(&mut b, 304, &poly_evals_ext);
     let roots0_words: Vec<F> = roots0.iter().flatten().copied().collect();
     tr.absorb(&mut b, 305, &roots0_words);
@@ -3727,7 +3739,12 @@ pub(crate) fn verify_folded_level(
         let last = stage + 1 == stages;
         let mut next_ood = None;
         let final_coeffs_w: Vec<Ext<F>> = if last {
-            let values: Vec<_> = proof.final_coeffs.iter().copied().map(Ext::constant).collect();
+            let values: Vec<_> = proof
+                .final_coeffs
+                .iter()
+                .copied()
+                .map(Ext::constant)
+                .collect();
             tr.absorb_exts(&mut b, 21, &values);
             let expected = terminal(&mut b, &values, &phis, &kernels);
             claim.equal(&mut b, &expected);
@@ -3794,7 +3811,9 @@ pub(crate) fn verify_folded_level(
                     let handles: Vec<_> = roots0
                         .iter()
                         .enumerate()
-                        .map(|(k, root_k)| crate::spawn_bounded(scope, move || verify_tree(k, root_k)))
+                        .map(|(k, root_k)| {
+                            crate::spawn_bounded(scope, move || verify_tree(k, root_k))
+                        })
                         .collect();
                     handles.into_iter().all(crate::join_worker)
                 })
@@ -4210,54 +4229,116 @@ mod tests {
         // Exercise the PCS verifier directly, so an outer digest/SNARK cannot mask a missing check.
         let nv = 12;
         let params = FixedPathWhirParams::new(REGIME, nv).unwrap();
-        let polys: Vec<Vec<F>> = (0..5).map(|k| (0..1 << nv)
-            .map(|i| f((i * i + 37 * k + 11) as u64)).collect()).collect();
-        let commits: Vec<_> = polys.iter().map(|p| commit_for_recursion(&params, p).unwrap()).collect();
-        let edges: Vec<_> = (0..2).map(|u| {
-            let points: [Vec<E>; 3] = core::array::from_fn(|j| (0..nv).map(|i| sample(i + 17*j + 31*u)).collect());
-            let indices = [2*u+1, 0, 2*u+2];
-            let claims = core::array::from_fn(|m| core::array::from_fn(|j|
-                Some(crate::field::mle_eval_base_at_ext4(&polys[indices[m]], &points[j]))));
-            FoldedEdgeSpec { regime: REGIME, num_vars: nv, claim_digest: [f(100 + u as u64); 4],
-                roots: indices.map(|i| commits[i].root()), points, claims }
-        }).collect();
+        let polys: Vec<Vec<F>> = (0..5)
+            .map(|k| {
+                (0..1 << nv)
+                    .map(|i| f((i * i + 37 * k + 11) as u64))
+                    .collect()
+            })
+            .collect();
+        let commits: Vec<_> = polys
+            .iter()
+            .map(|p| commit_for_recursion(&params, p).unwrap())
+            .collect();
+        let edges: Vec<_> = (0..2)
+            .map(|u| {
+                let points: [Vec<E>; 3] = core::array::from_fn(|j| {
+                    (0..nv).map(|i| sample(i + 17 * j + 31 * u)).collect()
+                });
+                let indices = [2 * u + 1, 0, 2 * u + 2];
+                let claims = core::array::from_fn(|m| {
+                    core::array::from_fn(|j| {
+                        Some(crate::field::mle_eval_base_at_ext4(
+                            &polys[indices[m]],
+                            &points[j],
+                        ))
+                    })
+                });
+                FoldedEdgeSpec {
+                    regime: REGIME,
+                    num_vars: nv,
+                    claim_digest: [f(100 + u as u64); 4],
+                    roots: indices.map(|i| commits[i].root()),
+                    points,
+                    claims,
+                }
+            })
+            .collect();
         let top = [f(777); 4];
-        let proof = prove_folded_level_for_recursion(0, top, &edges,
-            |k, dst| { dst.clear(); dst.extend_from_slice(&polys[k]); },
-            |k| commits[k].levels()).unwrap();
+        let proof = prove_folded_level_for_recursion(
+            0,
+            top,
+            &edges,
+            |k, dst| {
+                dst.clear();
+                dst.extend_from_slice(&polys[k]);
+            },
+            |k| commits[k].levels(),
+        )
+        .unwrap();
         assert!(verify_folded_level(0, top, &edges, &proof));
-        let reject = |bad: &FoldedLevelWhirProof| assert!(!verify_folded_level(0, top, &edges, bad));
+        let reject =
+            |bad: &FoldedLevelWhirProof| assert!(!verify_folded_level(0, top, &edges, bad));
         for k in 0..polys.len() {
-            let mut bad = proof.clone(); bad.stage0_fibers[k][0] += F::ONE; reject(&bad);
-            let mut bad = proof.clone(); bad.stage0_siblings[k].push([F::ZERO; 4]); reject(&bad);
+            let mut bad = proof.clone();
+            bad.stage0_fibers[k][0] += F::ONE;
+            reject(&bad);
+            let mut bad = proof.clone();
+            bad.stage0_siblings[k].push([F::ZERO; 4]);
+            reject(&bad);
             // Siblings are not absorbed into Fiat-Shamir. Changing one while keeping
             // the shape and transcript fixed specifically exercises root authentication.
             assert!(!proof.stage0_siblings[k].is_empty());
-            let mut bad = proof.clone(); bad.stage0_siblings[k][0][0] += F::ONE; reject(&bad);
-            let mut bad = proof.clone(); bad.poly_evals[k] += E::ONE; reject(&bad);
+            let mut bad = proof.clone();
+            bad.stage0_siblings[k][0][0] += F::ONE;
+            reject(&bad);
+            let mut bad = proof.clone();
+            bad.poly_evals[k] += E::ONE;
+            reject(&bad);
         }
         for stage in 0..proof.later_fibers.len() {
-            let mut bad = proof.clone(); bad.later_fibers[stage][0] += E::ONE; reject(&bad);
-            let mut bad = proof.clone(); bad.later_stage_roots[stage][0] += F::ONE; reject(&bad);
-            let mut bad = proof.clone(); bad.later_siblings[stage].push([F::ZERO; 4]); reject(&bad);
+            let mut bad = proof.clone();
+            bad.later_fibers[stage][0] += E::ONE;
+            reject(&bad);
+            let mut bad = proof.clone();
+            bad.later_stage_roots[stage][0] += F::ONE;
+            reject(&bad);
+            let mut bad = proof.clone();
+            bad.later_siblings[stage].push([F::ZERO; 4]);
+            reject(&bad);
             for sibling in 0..proof.later_siblings[stage].len() {
-                let mut bad = proof.clone(); bad.later_siblings[stage][sibling][0] += F::ONE; reject(&bad);
+                let mut bad = proof.clone();
+                bad.later_siblings[stage][sibling][0] += F::ONE;
+                reject(&bad);
             }
         }
-        assert!(!proof.later_fibers.is_empty(), "fixture must exercise a multistage opening");
+        assert!(
+            !proof.later_fibers.is_empty(),
+            "fixture must exercise a multistage opening"
+        );
         for round in 0..proof.point_rounds.len() {
-            let mut bad = proof.clone(); bad.point_rounds[round][0] += E::ONE; reject(&bad);
+            let mut bad = proof.clone();
+            bad.point_rounds[round][0] += E::ONE;
+            reject(&bad);
         }
         for round in 0..proof.fold_polys.len() {
             for coefficient in 0..5 {
-                let mut bad = proof.clone(); bad.fold_polys[round][coefficient] += E::ONE; reject(&bad);
+                let mut bad = proof.clone();
+                bad.fold_polys[round][coefficient] += E::ONE;
+                reject(&bad);
             }
         }
         for stage in 0..proof.ood_evals.len() {
-            let mut bad = proof.clone(); bad.ood_evals[stage][0] += E::ONE; reject(&bad);
+            let mut bad = proof.clone();
+            bad.ood_evals[stage][0] += E::ONE;
+            reject(&bad);
         }
-        let mut bad = proof.clone(); bad.final_coeffs[0] += E::ONE; reject(&bad);
-        let mut bad = proof.clone(); bad.stage0_fibers.pop(); reject(&bad);
+        let mut bad = proof.clone();
+        bad.final_coeffs[0] += E::ONE;
+        reject(&bad);
+        let mut bad = proof.clone();
+        bad.stage0_fibers.pop();
+        reject(&bad);
         assert!(!verify_folded_level(1, top, &edges, &proof));
         assert!(!verify_folded_level(0, [f(778); 4], &edges, &proof));
     }

@@ -1018,7 +1018,12 @@ fn dudect_bitslice_exported_kernels() {
     unsafe extern "C" {
         fn dregg_sig_asm_transpose64x256_avx2(rows: *mut u8);
         fn dregg_sig_asm_gf2_128_mul_acc_pclmul(acc: *mut u8, a: *const u8, b: *const u8, n: usize);
-        fn dregg_sig_asm_gf2_128_mul_acc_vpclmul(acc: *mut u8, a: *const u8, b: *const u8, pairs: usize);
+        fn dregg_sig_asm_gf2_128_mul_acc_vpclmul(
+            acc: *mut u8,
+            a: *const u8,
+            b: *const u8,
+            pairs: usize,
+        );
     }
     // Reference the crate so the assembly object is linked even with LTO.
     black_box(dregg_sig_asm::detect_backend());

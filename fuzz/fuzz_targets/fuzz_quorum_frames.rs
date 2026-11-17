@@ -22,7 +22,6 @@
 
 use std::sync::OnceLock;
 
-use libfuzzer_sys::fuzz_target;
 use dregg_sig_core::poseidon2_mpc::{
     HEM_JORTS_PK_BYTES, HemJortsPublicKey, HemJortsSignature, verify_hem_jorts_signature,
 };
@@ -30,6 +29,7 @@ use dregg_sig_quorum::access::PersonalLatchAck;
 use dregg_sig_quorum::dzk::{decode_elements, encode_elements};
 use dregg_sig_quorum::wire_channel::{FrameHeader, decode_frame, decode_header, encode_frame};
 use dregg_sig_quorum::{HemDynamicShamirQuorum, HemQuorumPublicDirectory, HemShamirCustodianShare};
+use libfuzzer_sys::fuzz_target;
 
 const QUORUM_MESSAGE: &[u8] = b"fuzz-hem-quorum-message";
 
@@ -60,7 +60,11 @@ fn fixtures() -> &'static Fixtures {
         let (_, signature) = quorum
             .sign_quorum(&[0, 2], &[0, 1, 2], QUORUM_MESSAGE)
             .expect("quorum signature");
-        assert!(verify_hem_jorts_signature(&public_key, QUORUM_MESSAGE, &signature));
+        assert!(verify_hem_jorts_signature(
+            &public_key,
+            QUORUM_MESSAGE,
+            &signature
+        ));
         let share_wire = quorum.custodian_shares()[1]
             .to_vault_bytes()
             .expect("custodian share vault bytes");
@@ -118,8 +122,16 @@ fn check_signature(fx: &Fixtures, bytes: &[u8]) {
     assert_eq!(signature.to_bytes(), bytes);
     // One signature was ever made with this key, on one message.
     let verified = verify_hem_jorts_signature(&fx.public_key, QUORUM_MESSAGE, &signature);
-    assert_eq!(verified, bytes == fx.signature_wire, "forged quorum signature");
-    assert!(!verify_hem_jorts_signature(&fx.public_key, b"another message", &signature));
+    assert_eq!(
+        verified,
+        bytes == fx.signature_wire,
+        "forged quorum signature"
+    );
+    assert!(!verify_hem_jorts_signature(
+        &fx.public_key,
+        b"another message",
+        &signature
+    ));
 }
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -165,7 +177,12 @@ mod coupon {
             let certificate_message = descriptor.certificate_message().expect("descriptor");
             let certificate = baggy_reference_sign(&PARAMS, &secret, &parent, &certificate_message)
                 .expect("root certificate");
-            assert!(verify_root(&PARAMS, &parent, &certificate_message, &certificate));
+            assert!(verify_root(
+                &PARAMS,
+                &parent,
+                &certificate_message,
+                &certificate
+            ));
             let certificate_wire = certificate.to_wire_bytes();
 
             // The coupon wire form, assembled as its documentation states it.
@@ -201,10 +218,23 @@ mod coupon {
                 return;
             };
             assert_eq!(certificate.to_wire_bytes(), bytes);
-            let verified =
-                verify_root(&PARAMS, &self.parent, &self.certificate_message, &certificate);
-            assert_eq!(verified, bytes == self.certificate_wire, "forged root certificate");
-            assert!(!verify_root(&PARAMS, &self.parent, COUPON_MESSAGE, &certificate));
+            let verified = verify_root(
+                &PARAMS,
+                &self.parent,
+                &self.certificate_message,
+                &certificate,
+            );
+            assert_eq!(
+                verified,
+                bytes == self.certificate_wire,
+                "forged root certificate"
+            );
+            assert!(!verify_root(
+                &PARAMS,
+                &self.parent,
+                COUPON_MESSAGE,
+                &certificate
+            ));
         }
 
         /// A coupon signature. Decoding already verifies the embedded certificate against
@@ -213,9 +243,16 @@ mod coupon {
             let Ok(signature) = BaggySig::from_wire_bytes(&self.parent, &PARAMS, bytes) else {
                 return;
             };
-            let reencoded = signature.to_wire_bytes().expect("decoded coupon re-encodes");
+            let reencoded = signature
+                .to_wire_bytes()
+                .expect("decoded coupon re-encodes");
             assert_eq!(reencoded, bytes);
-            assert!(!baggy_verify(&self.parent, &PARAMS, COUPON_MESSAGE, &signature));
+            assert!(!baggy_verify(
+                &self.parent,
+                &PARAMS,
+                COUPON_MESSAGE,
+                &signature
+            ));
             // A key that did not certify the coupon refuses it at decode.
             let stranger = BaggyPublicKey {
                 pk_seed: self.parent.pk_seed,

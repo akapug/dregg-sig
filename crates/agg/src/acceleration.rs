@@ -266,7 +266,9 @@ pub(crate) fn build_poseidon2_canopy_tree(
             device
                 .fallbacks
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            std::eprintln!("dregg_sig_accel: Poseidon2 Canopy tree failed ({err}); recomputing on CPU");
+            std::eprintln!(
+                "dregg_sig_accel: Poseidon2 Canopy tree failed ({err}); recomputing on CPU"
+            );
             return None;
         }
     };

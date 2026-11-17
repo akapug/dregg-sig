@@ -1702,7 +1702,11 @@ pub fn spot_check_merkle_layer(
         loop {
             let digest = cshake256_framed_32(
                 b"QSAG.ACCEL.MERKLE_SAMPLE.V1",
-                &[challenge, &(sample as u64).to_be_bytes(), &ctr.to_be_bytes()],
+                &[
+                    challenge,
+                    &(sample as u64).to_be_bytes(),
+                    &ctr.to_be_bytes(),
+                ],
             );
             let mut word = [0u8; 8];
             word.copy_from_slice(&digest[..8]);
@@ -1728,11 +1732,17 @@ pub fn spot_check_merkle_layer(
             let r = sample + draw_unbiased(sample, rem as u64);
             #[cfg(feature = "alloc")]
             let lookup = |k: usize, tbl: &[(usize, usize)]| -> usize {
-                tbl.iter().rev().find(|&&(a, _)| a == k).map_or(k, |&(_, b)| b)
+                tbl.iter()
+                    .rev()
+                    .find(|&&(a, _)| a == k)
+                    .map_or(k, |&(_, b)| b)
             };
             #[cfg(not(feature = "alloc"))]
             let lookup = |k: usize, tbl: &[(usize, usize)]| -> usize {
-                tbl.iter().rev().find(|&&(a, _)| a == k).map_or(k, |&(_, b)| b)
+                tbl.iter()
+                    .rev()
+                    .find(|&&(a, _)| a == k)
+                    .map_or(k, |&(_, b)| b)
             };
             #[cfg(feature = "alloc")]
             let (chosen, cur_slot) = (lookup(r, &swaps), lookup(sample, &swaps));
@@ -2098,15 +2108,35 @@ mod tests {
     fn correctly_maced_spirv_receipts_without_audit_are_rejected() {
         let key = BackendAttestationKey::derive(&[29; 32], b"missing-audit");
         let pin = spirv_kernels::canonical_spirv_pin(KernelSlot::BatchKeccakF1600);
-        let mut receipt = ExecutionReceipt::compute_audited(&key, &pin,
-            BatchJobDescriptor::KeccakF1600 { num_states: 1 }, [1; 32], [2; 32], [3; 32], [4; 32]).unwrap();
+        let mut receipt = ExecutionReceipt::compute_audited(
+            &key,
+            &pin,
+            BatchJobDescriptor::KeccakF1600 { num_states: 1 },
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        )
+        .unwrap();
         receipt.hardware_audit_digest = [0; 32];
         receipt.mac = receipt.mac_over_fields(&key);
         assert_eq!(receipt.verification_mask(&key, &pin), 0);
         let pin = spirv_kernels::canonical_prover_spirv_pin(ProverKernelSlot::WhirLdeCommitment);
-        let mut receipt = ProverExecutionReceipt::compute_audited(&key, &pin,
-            ProverJobDescriptor::WhirCommitRound0 { num_polys: 1, num_vars: 4, blowup: 4, group_arity: 4 },
-            [1; 32], [2; 32], [3; 32], [4; 32]).unwrap();
+        let mut receipt = ProverExecutionReceipt::compute_audited(
+            &key,
+            &pin,
+            ProverJobDescriptor::WhirCommitRound0 {
+                num_polys: 1,
+                num_vars: 4,
+                blowup: 4,
+                group_arity: 4,
+            },
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        )
+        .unwrap();
         receipt.hardware_audit_digest = [0; 32];
         receipt.mac = receipt.mac_over_fields(&key);
         assert_eq!(receipt.verification_mask(&key, &pin), 0);
@@ -2118,10 +2148,14 @@ mod tests {
         let children = [[7u64; 4]; 256];
         let mut parents = [[0u64; 4]; 128];
         merkle_layer_poseidon2_at_cpu(&children, &[1; 4], 0, 0, &mut parents).unwrap();
-        assert!(spot_check_merkle_layer(&children, &[1; 4], 0, 0, &parents, &[2; 32], 65));
+        assert!(spot_check_merkle_layer(
+            &children, &[1; 4], 0, 0, &parents, &[2; 32], 65
+        ));
         for i in 0..parents.len() {
             parents[i][0] ^= 1;
-            assert!(!spot_check_merkle_layer(&children, &[1; 4], 0, 0, &parents, &[2; 32], 65));
+            assert!(!spot_check_merkle_layer(
+                &children, &[1; 4], 0, 0, &parents, &[2; 32], 65
+            ));
             parents[i][0] ^= 1;
         }
     }

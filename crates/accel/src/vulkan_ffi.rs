@@ -1712,7 +1712,9 @@ impl RawVulkanEngine {
                 break;
             }
         }
-        if radv_lib.is_null() && std::env::var_os("DREGG_SIG_ALLOW_RELATIVE_VULKAN_LOADER").is_some() {
+        if radv_lib.is_null()
+            && std::env::var_os("DREGG_SIG_ALLOW_RELATIVE_VULKAN_LOADER").is_some()
+        {
             radv_lib = unsafe { dlopen(c"libvulkan_radeon.so".as_ptr(), RTLD_NOW | RTLD_LOCAL) };
         }
         if radv_lib.is_null() {
@@ -6775,7 +6777,12 @@ impl RawVulkanEngine {
         }
         let one = [1, 0, 0, 0];
         let mul = Self::fp4_mul_arr;
-        let pow256 = |mut x| { for _ in 0..8 { x = mul(x, x); } x };
+        let pow256 = |mut x| {
+            for _ in 0..8 {
+                x = mul(x, x);
+            }
+            x
+        };
         if src[0] == [0; 4] {
             if src[..256].iter().any(|x| *x != [0; 4]) {
                 return Err(crate::AccelError::LengthOverflow.into());
@@ -6791,7 +6798,9 @@ impl RawVulkanEngine {
             }
         }
         for block in [256, 512] {
-            if src[block] != one { return Err(crate::AccelError::LengthOverflow.into()); }
+            if src[block] != one {
+                return Err(crate::AccelError::LengthOverflow.into());
+            }
             for i in 2..256 {
                 if src[block + i] != mul(src[block + i - 1], src[block + 1]) {
                     return Err(crate::AccelError::LengthOverflow.into());
@@ -8256,7 +8265,11 @@ impl RawVulkanEngine {
                 return Err(crate::AccelError::LengthOverflow.into());
             }
             let dims = engine.prover_session()?;
-            let turbo_flag = if dims.turboshake_canopy { 0x80u32 } else { 0u32 };
+            let turbo_flag = if dims.turboshake_canopy {
+                0x80u32
+            } else {
+                0u32
+            };
             let num_groups = domain_len / group_arity;
             let log_d = domain_len.trailing_zeros();
             to_u32(domain_len)?;
@@ -10299,11 +10312,17 @@ mod tests {
         let full = crate::goldilocks::geometric_kronecker_1024([1, 0, 0, 0], [3, 5, 7, 11]);
         let mut table = full[..768].to_vec();
         assert!(RawVulkanEngine::validate_legacy_geometric(&table).is_ok());
-        for v in &mut table[..256] { *v = RawVulkanEngine::fp4_mul_arr(*v, [13, 17, 19, 23]); }
+        for v in &mut table[..256] {
+            *v = RawVulkanEngine::fp4_mul_arr(*v, [13, 17, 19, 23]);
+        }
         assert!(RawVulkanEngine::validate_legacy_geometric(&table).is_ok());
         for idx in [2, 127, 256, 257, 511, 512, 640, 767] {
-            let mut bad = table.clone(); bad[idx][0] ^= 1;
-            assert!(RawVulkanEngine::validate_legacy_geometric(&bad).is_err(), "index {idx}");
+            let mut bad = table.clone();
+            bad[idx][0] ^= 1;
+            assert!(
+                RawVulkanEngine::validate_legacy_geometric(&bad).is_err(),
+                "index {idx}"
+            );
         }
     }
 

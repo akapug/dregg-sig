@@ -1582,7 +1582,9 @@ impl ParallelSeededDkgUnverifiedOutput {
         let sum = openings.iter().fold([0u128; 2], |acc, open| {
             [acc[0] ^ open.tags[0], acc[1] ^ open.tags[1]]
         });
-        if !(dregg_sig_accel::ct::ct_eq_u128(sum[0], 0) & dregg_sig_accel::ct::ct_eq_u128(sum[1], 0)) {
+        if !(dregg_sig_accel::ct::ct_eq_u128(sum[0], 0)
+            & dregg_sig_accel::ct::ct_eq_u128(sum[1], 0))
+        {
             return self.fail(ParallelSeededError::BdozMacCheckFailed);
         }
         self.output.take().ok_or(ParallelSeededError::Poisoned)

@@ -346,7 +346,8 @@ fn derive_directional_key(
     from: usize,
     to: usize,
 ) -> [u8; 32] {
-    let mut xof = dregg_sig_core::sponge::keccak::Cshake256Xof::new(b"QSAG.QUORUM.WIRE_DIRECTION/v1");
+    let mut xof =
+        dregg_sig_core::sponge::keccak::Cshake256Xof::new(b"QSAG.QUORUM.WIRE_DIRECTION/v1");
     xof.absorb(pairwise_key);
     xof.absorb(session_id);
     xof.absorb(&(from as u16).to_be_bytes());

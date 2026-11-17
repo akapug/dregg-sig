@@ -1181,7 +1181,9 @@ pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     }
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
-        unsafe { x86_64_asm::dregg_sig_asm_ct_eq_bytes_x86_64(a.as_ptr(), b.as_ptr(), a.len()) == 1 }
+        unsafe {
+            x86_64_asm::dregg_sig_asm_ct_eq_bytes_x86_64(a.as_ptr(), b.as_ptr(), a.len()) == 1
+        }
     }
     #[cfg(any(miri, not(target_arch = "x86_64")))]
     {

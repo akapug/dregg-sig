@@ -757,7 +757,9 @@ fn measure_durable_attester_sign(samples: usize, workers: usize) -> DurableSignS
             .sign_stateful_with_wal(msg, 0, &mut sink)
             .expect("durable-WAL sign");
         fs_us.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
-        assert!(dregg_sig_agg::verify_individual_signature(&kp.pk, msg, &sig));
+        assert!(dregg_sig_agg::verify_individual_signature(
+            &kp.pk, msg, &sig
+        ));
     }
     std::fs::remove_dir_all(&dir).expect("remove durable WAL dir");
 

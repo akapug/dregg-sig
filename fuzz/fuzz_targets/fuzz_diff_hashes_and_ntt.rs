@@ -14,10 +14,6 @@
 //! quadratic and quartic extensions, written as `F_p[u]/(u^2 - 7)` and `F_p[v]/(v^4 - 7)`.
 
 use arbitrary::Arbitrary;
-use ghash::universal_hash::{KeyInit, UniversalHash};
-use libfuzzer_sys::fuzz_target;
-use p3_field::{AbstractField, Field as P3Field, PrimeField64};
-use p3_goldilocks::Goldilocks as P3Goldilocks;
 use dregg_sig_accel::goldilocks as accel_gl;
 use dregg_sig_accel::keccak::{cshake256_framed_xof, keccak256, sha3_256, shake256_xof};
 use dregg_sig_accel::sha2::sha256;
@@ -31,6 +27,10 @@ use dregg_sig_asm::{
 };
 use dregg_sig_core::field::goldilocks::{Goldilocks as CoreGl, GoldilocksExt2};
 use dregg_sig_core::field::tower::TowerGf256;
+use ghash::universal_hash::{KeyInit, UniversalHash};
+use libfuzzer_sys::fuzz_target;
+use p3_field::{AbstractField, Field as P3Field, PrimeField64};
+use p3_goldilocks::Goldilocks as P3Goldilocks;
 use sha2::Digest as _;
 use tiny_keccak::{CShake, Hasher as _, Shake as TinyShake, Xof as _};
 
@@ -217,7 +217,10 @@ fn ext4_powers(x: GoldilocksExt4) -> [u64; 4] {
 }
 
 fn ext2_of(l: [u64; 2]) -> GoldilocksExt2 {
-    GoldilocksExt2::new(CoreGl::from_u64_reduced(l[0]), CoreGl::from_u64_reduced(l[1]))
+    GoldilocksExt2::new(
+        CoreGl::from_u64_reduced(l[0]),
+        CoreGl::from_u64_reduced(l[1]),
+    )
 }
 
 fn ext2_limbs(x: GoldilocksExt2) -> [u64; 2] {
@@ -274,8 +277,14 @@ fn check_goldilocks_base(a: u64, b: u64, backend: SimdBackend) {
     assert_eq!(qa.square().to_canonical_u64(), r_mul(a, a));
     assert_eq!(qa.mul_by_7().to_canonical_u64(), r_mul(7, a));
     let wide = (a as u128) << 64 | b as u128;
-    assert_eq!(CoreGl::reduce128(wide).to_canonical_u64(), (wide % P128) as u64);
-    assert_eq!(CoreGl::from_u128_reduced(wide).to_canonical_u64(), (wide % P128) as u64);
+    assert_eq!(
+        CoreGl::reduce128(wide).to_canonical_u64(),
+        (wide % P128) as u64
+    );
+    assert_eq!(
+        CoreGl::from_u128_reduced(wide).to_canonical_u64(),
+        (wide % P128) as u64
+    );
     let core_inv = qa.inv().to_canonical_u64();
     assert_eq!(r_mul(a, core_inv), u64::from(!a.is_multiple_of(P)));
     assert_eq!(
@@ -319,10 +328,7 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
     assert_eq!(accel_gl::ext2_mul(a2, b2), prod2);
     assert_eq!(accel_gl::ext2_neg(a2), [r_sub(0, a2[0]), r_sub(0, a2[1])]);
     let accel_inv2 = accel_gl::ext2_inv_or_zero(a2);
-    assert_eq!(
-        r_binomial_mul(ra2, accel_inv2),
-        [u64::from(!is_zero2), 0]
-    );
+    assert_eq!(r_binomial_mul(ra2, accel_inv2), [u64::from(!is_zero2), 0]);
 
     // Quartic extension against the schoolbook product in `F_p[v]/(v^4 - 7)`.
     let (a4, b4) = (ext4_of(w), ext4_of(x));
@@ -331,8 +337,14 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
         tower_to_powers(x.map(|v| v % P)),
     );
     let prod4 = r_binomial_mul(pa4, pb4);
-    assert_eq!(ext4_powers(a4 + b4), core::array::from_fn(|i| r_add(pa4[i], pb4[i])));
-    assert_eq!(ext4_powers(a4 - b4), core::array::from_fn(|i| r_sub(pa4[i], pb4[i])));
+    assert_eq!(
+        ext4_powers(a4 + b4),
+        core::array::from_fn(|i| r_add(pa4[i], pb4[i]))
+    );
+    assert_eq!(
+        ext4_powers(a4 - b4),
+        core::array::from_fn(|i| r_sub(pa4[i], pb4[i]))
+    );
     assert_eq!(ext4_powers(-a4), pa4.map(|v| r_sub(0, v)));
     assert_eq!(ext4_powers(a4 * b4), prod4);
     assert_eq!(ext4_powers(a4.square()), r_binomial_mul(pa4, pa4));
@@ -353,7 +365,10 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
         [u64::from(!is_zero4), 0, 0, 0]
     );
     // Canonical 32-byte codec of the element.
-    assert_eq!(GoldilocksExt4::from_le_bytes_canonical(a4.to_le_bytes()), Some(a4));
+    assert_eq!(
+        GoldilocksExt4::from_le_bytes_canonical(a4.to_le_bytes()),
+        Some(a4)
+    );
 }
 
 /// `a * b` in `Z_q[X]/(X^256 + 1)`.
@@ -451,7 +466,10 @@ fuzz_target!(|input: DiffFuzzInput| {
     let mut states = vec![[0u64; 25]; batch_n];
     for (idx, st) in states.iter_mut().enumerate() {
         for (lane, w) in st.iter_mut().enumerate() {
-            let b = msg.get((idx * 25 + lane) % msg.len().max(1)).copied().unwrap_or(0);
+            let b = msg
+                .get((idx * 25 + lane) % msg.len().max(1))
+                .copied()
+                .unwrap_or(0);
             *w = (b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((idx * 31 + lane) as u64);
         }
     }

@@ -478,7 +478,11 @@ pub struct VulkanSpirvBackend {
         target_pointer_width = "64"
     ))]
     prover_session_in_use: AtomicBool,
-    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "macos"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    ))]
     prover_session_owner: std::sync::Mutex<Option<std::thread::ThreadId>>,
     /// `info.secret_slot_audit().is_ok()`, fixed at construction.
     #[cfg(all(
@@ -1341,7 +1345,10 @@ impl VulkanSpirvBackend {
                     "prover session requires audited zero-spill pipelines",
                 ));
             }
-            let mut owner = self.prover_session_owner.lock().map_err(|_| VulkanError::WorkspacePoisoned)?;
+            let mut owner = self
+                .prover_session_owner
+                .lock()
+                .map_err(|_| VulkanError::WorkspacePoisoned)?;
             if self
                 .prover_session_in_use
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1350,7 +1357,10 @@ impl VulkanSpirvBackend {
                 return Err(VulkanError::WorkspacePoisoned);
             }
             *owner = Some(std::thread::current().id());
-            Ok(ProverSessionGuard { backend: self, _thread_bound: core::marker::PhantomData })
+            Ok(ProverSessionGuard {
+                backend: self,
+                _thread_bound: core::marker::PhantomData,
+            })
         }
         #[cfg(not(all(
             feature = "std",
@@ -1372,7 +1382,10 @@ impl VulkanSpirvBackend {
             target_pointer_width = "64"
         ))]
         {
-            let mut owner = self.prover_session_owner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut owner = self
+                .prover_session_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *owner != Some(std::thread::current().id()) {
                 return;
             }
@@ -1407,7 +1420,12 @@ impl VulkanSpirvBackend {
             ));
         }
         if !self.prover_session_in_use.load(Ordering::Acquire)
-            || *self.prover_session_owner.lock().map_err(|_| VulkanError::WorkspacePoisoned)? != Some(std::thread::current().id()) {
+            || *self
+                .prover_session_owner
+                .lock()
+                .map_err(|_| VulkanError::WorkspacePoisoned)?
+                != Some(std::thread::current().id())
+        {
             return Err(VulkanError::WorkspacePoisoned);
         }
         Ok(())
@@ -4711,7 +4729,13 @@ mod tests {
     #[test]
     fn macos_moltenvk_search_paths_and_wave32_portability_gate() {
         let paths = VulkanSpirvBackend::macos_library_search_paths();
-        assert_eq!(paths, ["/opt/homebrew/lib/libvulkan.1.dylib", "/opt/homebrew/lib/libMoltenVK.dylib"]);
+        assert_eq!(
+            paths,
+            [
+                "/opt/homebrew/lib/libvulkan.1.dylib",
+                "/opt/homebrew/lib/libMoltenVK.dylib"
+            ]
+        );
         assert!(paths.iter().all(|p| p.starts_with('/')));
 
         let mut portability_info = audited_device_info();
@@ -4753,10 +4777,20 @@ mod tests {
         gpu.portability_public_enabled = true;
         let key = BackendAttestationKey::derive(&[7; 32], b"portability-gate-test");
         let reject = |slot| VulkanError::Accel(AccelError::ProverSlotUnaudited { slot });
-        assert!(matches!(gpu.try_acquire_prover_session(), Err(VulkanError::PipelineAuditFailed(_))));
-        assert!(matches!(gpu.try_acquire_secret_prover_session(), Err(VulkanError::PipelineAuditFailed(_))));
-        assert!(matches!(gpu.prover_whir_commit_round0_with(1, &[0; 32], 2, 4, 4, 0, 0, 0,
-            |_, _, _| panic!("unaudited prover read a witness")), Err(VulkanError::PipelineAuditFailed(_))));
+        assert!(matches!(
+            gpu.try_acquire_prover_session(),
+            Err(VulkanError::PipelineAuditFailed(_))
+        ));
+        assert!(matches!(
+            gpu.try_acquire_secret_prover_session(),
+            Err(VulkanError::PipelineAuditFailed(_))
+        ));
+        assert!(matches!(
+            gpu.prover_whir_commit_round0_with(1, &[0; 32], 2, 4, 4, 0, 0, 0, |_, _, _| panic!(
+                "unaudited prover read a witness"
+            )),
+            Err(VulkanError::PipelineAuditFailed(_))
+        ));
         assert_eq!(
             gpu.prover_whir_commit_round0_with_receipt(
                 &key,
@@ -4815,23 +4849,42 @@ mod tests {
         gpu.release_prover_session();
     }
 
-    #[cfg(all(feature = "std", any(target_os = "linux", target_os = "macos"), target_pointer_width = "64"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_os = "linux", target_os = "macos"),
+        target_pointer_width = "64"
+    ))]
     #[test]
     fn prover_guard_scrubs_on_unwind_and_rejects_another_thread() {
         let gpu = match VulkanSpirvBackend::try_new_audited() {
             Ok(gpu) => gpu,
             Err(e) => {
-                assert!(std::env::var_os("DREGG_SIG_REQUIRE_GPU_AUDIT").is_none(), "required GPU: {e}");
+                assert!(
+                    std::env::var_os("DREGG_SIG_REQUIRE_GPU_AUDIT").is_none(),
+                    "required GPU: {e}"
+                );
                 return;
             }
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _session = gpu.try_acquire_prover_session().unwrap();
-            gpu.prover_whir_commit_round0(&[&[1; 16]], &[2; 32], 4, 4, 4, 0, 0, 0).unwrap();
-            std::thread::scope(|scope| scope.spawn(|| {
-                assert!(matches!(gpu.try_acquire_prover_session(), Err(VulkanError::WorkspacePoisoned)));
-                assert_eq!(gpu.check_prover_session_active(), Err(VulkanError::WorkspacePoisoned));
-            }).join().unwrap());
+            gpu.prover_whir_commit_round0(&[&[1; 16]], &[2; 32], 4, 4, 4, 0, 0, 0)
+                .unwrap();
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        assert!(matches!(
+                            gpu.try_acquire_prover_session(),
+                            Err(VulkanError::WorkspacePoisoned)
+                        ));
+                        assert_eq!(
+                            gpu.check_prover_session_active(),
+                            Err(VulkanError::WorkspacePoisoned)
+                        );
+                    })
+                    .join()
+                    .unwrap()
+            });
             // Poison the engine mutex too: guard cleanup must recover it and still scrub.
             let _engine = gpu.engine.lock().unwrap();
             panic!("exercise unwind cleanup");
@@ -4839,7 +4892,10 @@ mod tests {
         assert!(outcome.is_err());
         assert!(!gpu.prover_session_in_use.load(Ordering::Acquire));
         assert!(gpu.prover_session_owner.lock().unwrap().is_none());
-        assert_eq!(gpu.check_prover_session_active(), Err(VulkanError::WorkspacePoisoned));
+        assert_eq!(
+            gpu.check_prover_session_active(),
+            Err(VulkanError::WorkspacePoisoned)
+        );
     }
 
     #[test]
