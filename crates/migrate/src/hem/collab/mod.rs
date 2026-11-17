@@ -177,7 +177,21 @@
 //!
 //! # Measured cost
 //!
-//! MEASURED-TABLE
+//! `prover::tests::measure_threshold_ownership` on hbox (16 cores), default regime, all
+//! custodians as threads of one process over channel links, dealer preprocessing, shares
+//! of the assignment dealt from a clear witness. Both relations have `2^17` rows and a
+//! committed table of `2^18` cells. Wall-clock includes dealing.
+//!
+//! | statement | N | triples per custodian | uniform values | sent per custodian | rounds | MAC checks | proof | wall | verify |
+//! |---|---|---|---|---|---|---|---|---|---|
+//! | Bitcoin HASH160 | 3 | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 1,282,759 B | 10.8 s | 0.23 s |
+//! | Ed25519 seed | 3 | 2,228,208 | 9,156 | 88.9 MB | 138 | 39 | 1,282,311 B | 12.4 s | 0.25 s |
+//! | Bitcoin HASH160 | 5 | 2,228,208 | 9,156 | 177.8 MB | 138 | 39 | 2,054,657 B | 18.9 s | - |
+//!
+//! "Sent" counts every broadcast once per recipient. The triples are Goldilocks triples:
+//! `2^17` for round 0 and sixteen per extension-field product after it. Not measured:
+//! witness generation. The ceremony for this many triples is extrapolated in
+//! "Preprocessing", not run.
 
 pub mod custody;
 pub mod engine;
