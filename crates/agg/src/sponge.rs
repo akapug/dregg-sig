@@ -1064,6 +1064,43 @@ pub fn cshake256_pow_u64_x8(midstate: &[u64; 25], chal: &[u8; 32], base_nonce: u
     st.0[0]
 }
 
+/// Four consecutive counter-mode blocks at once: lanes `0..4` of
+/// `cSHAKE256(customization, seed || le64(counter + k))` for `k in 0..4`, where `midstate`
+/// is `cshake256_static_midstate(customization)` and `seed` is given as its four
+/// little-endian words. `out[k]` read as little-endian bytes is exactly
+/// `cshake256_from_midstate_32(midstate, seed || le64(counter + k))`; the 40-byte input
+/// fits one rate block, so this is one 4-way permutation.
+#[inline]
+pub fn cshake256_seed_counter_words_x4(
+    midstate: &[u64; 25],
+    seed: &[u64; 4],
+    counter: u64,
+) -> [[u64; 4]; 4] {
+    let mut st = dregg_sig_asm::KeccakState4x([[0u64; 4]; 25]);
+    for (dst_lane, &ms_val) in st.0.iter_mut().zip(midstate.iter()) {
+        *dst_lane = [ms_val; 4];
+    }
+    for (lane, &w) in seed.iter().enumerate() {
+        for dst in &mut st.0[lane] {
+            *dst ^= w;
+        }
+    }
+    for (k, dst) in st.0[4].iter_mut().enumerate() {
+        *dst ^= counter.wrapping_add(k as u64);
+    }
+    // Byte 40 is byte 0 of lane 5 (`0x04`); byte 135 is byte 7 of lane 16 (`0x80`).
+    for k in 0..4 {
+        st.0[5][k] ^= 0x04;
+        st.0[16][k] ^= 0x8000_0000_0000_0000;
+    }
+    dregg_sig_asm::keccak_f1600_x4(&mut st);
+    let out = core::array::from_fn(|k| core::array::from_fn(|lane| st.0[lane][k]));
+    for lane in &mut st.0 {
+        dregg_sig_asm::volatile_fill(lane, 0u64);
+    }
+    out
+}
+
 /// Single-nonce verifier counterpart to [`cshake256_pow_u64_x4`].
 #[inline]
 pub fn cshake256_pow_u64_single(midstate: &[u64; 25], chal: &[u8; 32], nonce: u64) -> u64 {
