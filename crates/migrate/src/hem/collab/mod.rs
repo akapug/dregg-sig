@@ -152,8 +152,9 @@
 //! missing for every lock and key source). The subprotocols, their sources and what each
 //! opens are in the module documentation of [`witgen`]; malicious security is the
 //! engine's MAC check, run before every opening that is masked only if earlier openings
-//! were right. One predicate of the secret is revealed by design: a chord addition whose
-//! points have equal `x` aborts with `WitgenError::ZeroDenominator`.
+//! were right. No division reveals whether its denominator is zero for a secret that
+//! has a valid statement: an addition that can be a doubling selects chord or tangent on
+//! shares ([`witgen`], "Divisions by zero").
 //!
 //! Some relations take inputs beyond the bits of the secret: the length of a master seed,
 //! the steps of a hidden derivation path, a Taproot script-tree root. They are hidden

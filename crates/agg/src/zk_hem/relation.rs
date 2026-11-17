@@ -309,6 +309,18 @@ pub enum Source {
         den: Vec<IntCoef>,
         modulus: Vec<u8>,
     },
+    /// The slope of an affine addition that may be a doubling, as a canonical residue
+    /// modulo the prime `modulus`: `num / den` where `den` is not zero modulo the prime
+    /// (the chord), and `(sum_j a_j b_j + c) / tangent_den` where it is (the tangent).
+    /// The gadget guarantees that `tangent_den` is not zero in that case.
+    Slope {
+        num: Vec<IntCoef>,
+        den: Vec<IntCoef>,
+        tangent_products: Vec<(Vec<IntCoef>, Vec<IntCoef>)>,
+        tangent_linear: Vec<IntCoef>,
+        tangent_den: Vec<IntCoef>,
+        modulus: Vec<u8>,
+    },
     /// The integer `num / divisor`, where the odd `divisor` (little-endian bytes) divides
     /// `num` exactly and the quotient lies in `[0, 2^bits)`.
     Quotient {

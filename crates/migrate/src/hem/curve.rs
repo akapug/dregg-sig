@@ -2055,7 +2055,23 @@ fn add_step(cs: &mut Ctx, curve: &Curve, acc: &Acc, xt: &Poly, yt: &Poly, comple
     );
     cs.hints.divisions += 1;
     let a2 = Poly::constant_bytes(&curve.a2.to_le_bytes()[..3]);
-    let source = residue_source(cs, f, &[], &yt.sub(&acc.y), Some(&xt.sub(&acc.x)));
+    let source = if complete {
+        // Where the two points share `x` the slope is the tangent at the accumulator.
+        let tangent_linear = acc
+            .x
+            .mul_const(&(2 * curve.a2).to_le_bytes()[..3])
+            .add(&Poly::constant_bytes(&curve.a4.to_le_bytes()[..1]));
+        cs.source(|| Source::Slope {
+            num: int_coefs(&yt.sub(&acc.y)),
+            den: int_coefs(&xt.sub(&acc.x)),
+            tangent_products: vec![(int_coefs(&acc.x.scale(3)), int_coefs(&acc.x))],
+            tangent_linear: int_coefs(&tangent_linear),
+            tangent_den: int_coefs(&acc.y.scale(2)),
+            modulus: big_to_bytes(&f.p)[..f.limbs].to_vec(),
+        })
+    } else {
+        residue_source(cs, f, &[], &yt.sub(&acc.y), Some(&xt.sub(&acc.x)))
+    };
     let lam = alloc_int(cs, source, &big_to_bytes(&f.canon(&lam)), f.bits);
     let lam_p = lam.poly();
     let source = residue_source(

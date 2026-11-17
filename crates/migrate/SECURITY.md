@@ -255,9 +255,10 @@ independently reviewed.
 secret (`(k, n)` Shamir or XOR custody): the secret's bits enter as authenticated
 shares, `hem::collab::witgen` computes the rest of the assignment on shares, and the
 prover runs on those. The secret is not reconstructed anywhere. Witness generation
-uses statistical masking with 40 bits for range-limited openings and reveals one
-predicate of the key by aborting (an elliptic-curve addition of two points with equal
-`x`); its privacy argument is written in the module and is not machine-checked.
+uses statistical masking with 40 bits for range-limited openings. An elliptic-curve
+addition that can be a doubling selects chord or tangent on shares, so no abort depends
+on the key;
+its privacy argument is written in the module and is not machine-checked.
 Statements from a master seed, with a hidden derivation path or with a taproot script
 tree (their relations take inputs beyond the bits of one secret), and relations with
 lookups, are not supported by the threshold prover.
