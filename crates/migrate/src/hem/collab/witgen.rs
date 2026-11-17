@@ -405,8 +405,9 @@ fn pow2(i: usize) -> F {
 }
 
 /// The square root of a nonzero square, the same one for every caller (Tonelli-Shanks;
-/// `p - 1 = 2^32 (2^32 - 1)` and 7 generates the multiplicative group).
-fn sqrt(v: F) -> F {
+/// `p - 1 = 2^32 (2^32 - 1)` and 7 generates the multiplicative group). `None` for a
+/// value that is not a square.
+fn sqrt(v: F) -> Option<F> {
     const Q: u64 = (1 << 32) - 1;
     let mut x = v.pow(Q.div_ceil(2));
     let mut t = v.pow(Q);
@@ -417,6 +418,9 @@ fn sqrt(v: F) -> F {
         while tt != F::ONE {
             tt = tt * tt;
             i += 1;
+            if i == m {
+                return None;
+            }
         }
         let mut b = c;
         for _ in 0..m - i - 1 {
@@ -427,7 +431,7 @@ fn sqrt(v: F) -> F {
         t = t * c;
         m = i;
     }
-    x
+    Some(x)
 }
 
 /// Row `k`, column `j`: coefficient `k` of the Lagrange polynomial of point `j` among the
@@ -581,7 +585,14 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 if self.b.counting() {
                     out.push(a);
                 } else if v != F::ZERO {
-                    out.push(B::scale(a, sqrt(v).inv() * half) + self.b.public(half));
+                    let Some(root) = sqrt(v) else {
+                        // The square of a shared value was opened as a non-square: some
+                        // opening was wrong. The check names it; the value opened
+                        // depends on preprocessed values only.
+                        self.check()?;
+                        return Err(WitgenError::NotABit);
+                    };
+                    out.push(B::scale(a, root.inv() * half) + self.b.public(half));
                 }
             }
         }
@@ -1426,9 +1437,11 @@ pub(super) mod tests {
         for _ in 0..200 {
             let a = s.next_base();
             if a != F::ZERO {
-                let r = sqrt(a * a);
+                let r = sqrt(a * a).unwrap();
                 assert!(r == a || r == F::ZERO - a);
                 assert_eq!(sqrt(a * a), sqrt((F::ZERO - a) * (F::ZERO - a)));
+                // 7 generates the group, so 7 a^2 is not a square.
+                assert_eq!(sqrt(f(7) * a * a), None);
             }
         }
         for p in [SECP_P, ED_P] {
@@ -1744,6 +1757,218 @@ pub(super) mod tests {
                     .err(),
                 Some(WitgenError::Inputs)
             );
+        }
+    }
+
+    use super::super::engine::{Dealer, Engine, Preprocessing};
+    use super::super::net::{ChannelLink, Framed, NetError, channel_mesh};
+    use crate::hem::curve::{Lazy, Modulus as CurveModulus};
+    use crate::hem::hash::{add_wide, alloc_bits, maj, pack_bits, xor3};
+    use dregg_sig_agg::zk_hem::relation::ConstraintSystem;
+
+    /// A relation over a 4-byte secret that uses the hash and curve gadgets: Boolean
+    /// functions, a wide addition, and a product modulo the secp256k1 base prime.
+    fn small_recorded(secret: &[u8; 4]) -> (Shape, Vec<F>, Definitions) {
+        let mut cs = ConstraintSystem::new_recording();
+        let public: Lc = cs
+            .public_input(f(u64::from(secret[0]) * u64::from(secret[1])))
+            .into();
+        let bits = alloc_bits(&mut cs, secret);
+        let product = cs.mul(&pack_bits(&bits[..8]), &pack_bits(&bits[8..16]));
+        cs.enforce_equal(&product.into(), &public);
+        let sum = add_wide(&mut cs, &bits[..16], &bits[16..]);
+        let mixed: Vec<Lc> = (0..16)
+            .map(|i| {
+                let x = xor3(&mut cs, &bits[i], &bits[i + 16], &sum[i]);
+                maj(&mut cs, &x, &bits[i], &sum[i])
+            })
+            .collect();
+        let field = CurveModulus::secp256k1_base();
+        let reduced = field.mul(&mut cs, &Lazy::from_bits(&bits), &Lazy::from_bits(&mixed));
+        field.enforce_canonical(&mut cs, &reduced);
+        cs.finish_recorded()
+    }
+
+    /// A transport that flips one bit of its `at`-th outgoing message.
+    struct Faulty<T> {
+        inner: T,
+        sent: usize,
+        at: usize,
+    }
+
+    impl<T: Transport> Transport for Faulty<T> {
+        fn parties(&self) -> usize {
+            self.inner.parties()
+        }
+        fn me(&self) -> usize {
+            self.inner.me()
+        }
+        fn send(&mut self, to: usize, payload: &[u8]) -> Result<(), NetError> {
+            self.sent += 1;
+            if self.sent - 1 == self.at && !payload.is_empty() {
+                let mut wrong = payload.to_vec();
+                wrong[0] ^= 1;
+                return self.inner.send(to, &wrong);
+            }
+            self.inner.send(to, payload)
+        }
+        fn recv(&mut self, from: usize) -> Result<Vec<u8>, NetError> {
+            self.inner.recv(from)
+        }
+    }
+
+    /// Every custodian on its own thread; custodian 1 flips a bit of its `fault`-th
+    /// message. Returns each custodian's result with its round count.
+    fn run_engines<R: Send>(
+        preps: Vec<Preprocessing>,
+        fault: Option<usize>,
+        party: impl Fn(&mut Engine<Faulty<Framed<ChannelLink>>>) -> R + Sync,
+    ) -> Vec<(R, u64)> {
+        let session = [4u8; 32];
+        let mesh = channel_mesh(session, preps.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = mesh
+                .into_iter()
+                .zip(preps)
+                .enumerate()
+                .map(|(p, (net, prep))| {
+                    let party = &party;
+                    scope.spawn(move || {
+                        let net = Faulty {
+                            inner: net,
+                            sent: 0,
+                            at: fault.filter(|_| p == 1).unwrap_or(usize::MAX),
+                        };
+                        let mut e = Engine::new(net, prep, &session, &[p as u8 + 50; 32]);
+                        let out = party(&mut e);
+                        (out, e.stats.rounds)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    }
+
+    fn deal_bits(dealer: &mut Dealer, parties: usize, secret: &[u8]) -> Vec<Vec<Sb>> {
+        let mut out = vec![Vec::new(); parties];
+        for i in 0..8 * secret.len() {
+            let bit = f(u64::from((secret[i / 8] >> (i % 8)) & 1));
+            for (p, s) in dealer.share(bit).into_iter().enumerate() {
+                out[p].push(s);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn custodians_compute_the_assignment_on_shares() {
+        let secret = [0xa7, 0x3c, 0xf1, 0x5e];
+        let (shape, assignment, defs) = small_recorded(&secret);
+        assert!(shape.is_satisfied(&assignment));
+        assert_eq!(defs.undefined(), Vec::<usize>::new());
+        let need = demand(&shape, &defs).unwrap();
+        let publics = assignment[1..=shape.num_public].to_vec();
+        for parties in [2usize, 3] {
+            let mut dealer = Dealer::new(parties, &[parties as u8; 32]);
+            let inputs = deal_bits(&mut dealer, parties, &secret);
+            let preps = dealer.preprocessing(need.triples, need.randoms);
+            let out = run_engines(preps, None, |e| {
+                let z = generate(e, &shape, &defs, &publics, &[inputs[e.me()].clone()]).unwrap();
+                assert_eq!(e.remaining(), (0, 0), "demand is exact");
+                assert!(!e.has_pending());
+                z
+            });
+            for i in 0..shape.mask_var_base {
+                let value = out.iter().fold(F::ZERO, |acc, (z, _)| acc + z[i].v);
+                assert_eq!(value, assignment[i], "variable {i}");
+            }
+            // A single custodian's shares of the secret's bits are not the bits.
+            let first = 1 + shape.num_public;
+            let own = (first..first + 32)
+                .filter(|&i| out[1].0[i].v == assignment[i])
+                .count();
+            assert_eq!(own, 0);
+        }
+    }
+
+    #[test]
+    fn a_wrong_message_makes_every_honest_custodian_abort_at_the_same_point() {
+        let need = {
+            let (shape, _, defs) = small_recorded(&[1, 2, 3, 4]);
+            demand(&shape, &defs).unwrap()
+        };
+        // Message indices of custodian 1 (two peers, so two sends a round) spread over
+        // the run: random-bit squares, masked openings, Beaver openings, check rounds.
+        let total = 2 * need.rounds;
+        let mut aborted = 0;
+        for at in [
+            0,
+            1,
+            2,
+            5,
+            40,
+            41,
+            total / 7,
+            total / 3,
+            total / 2,
+            total - total / 5,
+        ] {
+            let mut rounds = Vec::new();
+            for secret in [[0xa7, 0x3c, 0xf1, 0x5e], [0x19, 0x80, 0x02, 0xff]] {
+                let (shape, assignment, defs) = small_recorded(&secret);
+                let publics = assignment[1..=shape.num_public].to_vec();
+                let mut dealer = Dealer::new(3, &[7; 32]);
+                let inputs = deal_bits(&mut dealer, 3, &secret);
+                let preps = dealer.preprocessing(need.triples, need.randoms);
+                let out = run_engines(preps, Some(at), |e| {
+                    generate(e, &shape, &defs, &publics, &[inputs[e.me()].clone()]).map(|_| ())
+                });
+                for p in [0, 2] {
+                    assert!(
+                        matches!(out[p].0, Err(WitgenError::Mpc(_))),
+                        "message {at}: custodian {p} got {:?}",
+                        out[p].0
+                    );
+                }
+                // The custodian that detects the fault first; the other may only see it
+                // leave.
+                let closed = |r: &Result<(), WitgenError>| {
+                    matches!(r, Err(WitgenError::Mpc(MpcError::Net(_))))
+                };
+                let first = if closed(&out[0].0) || (!closed(&out[2].0) && out[2].1 < out[0].1) {
+                    2
+                } else {
+                    0
+                };
+                assert!(!closed(&out[first].0));
+                rounds.push((out[first].1, out[first].0));
+            }
+            // Where and how the fault is detected does not depend on the secret.
+            assert_eq!(rounds[0], rounds[1], "message {at}");
+            aborted += 1;
+        }
+        assert_eq!(aborted, 10);
+    }
+
+    #[test]
+    fn a_wrong_input_share_is_caught_before_the_assignment_is_used() {
+        let secret = [0xa7, 0x3c, 0xf1, 0x5e];
+        let (shape, assignment, defs) = small_recorded(&secret);
+        let need = demand(&shape, &defs).unwrap();
+        let publics = assignment[1..=shape.num_public].to_vec();
+        let mut dealer = Dealer::new(3, &[8; 32]);
+        let inputs = deal_bits(&mut dealer, 3, &secret);
+        let preps = dealer.preprocessing(need.triples, need.randoms);
+        let out = run_engines(preps, None, |e| {
+            let mut mine = inputs[e.me()].clone();
+            if e.me() == 1 {
+                // A different value under the old MAC share.
+                mine[9].v += F::ONE;
+            }
+            generate(e, &shape, &defs, &publics, &[mine]).map(|_| ())
+        });
+        for (result, _) in &out {
+            assert_eq!(*result, Err(WitgenError::Mpc(MpcError::MacCheck)));
         }
     }
 }

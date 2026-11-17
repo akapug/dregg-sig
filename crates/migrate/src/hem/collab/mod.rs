@@ -203,7 +203,99 @@ pub mod witgen;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{ZkHemSplitProof, verify_split};
 
-use super::relations::{OwnershipStatement, ownership_shape, ownership_transcript};
+use super::relations::{
+    OwnershipStatement, ownership_definitions, ownership_shape, ownership_transcript,
+};
+use engine::{Engine, Stats};
+use net::Transport;
+
+/// Why a custodian's [`prove_ownership_party`] produced no proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThresholdError {
+    /// The statement is malformed, or its relation takes inputs other than one secret
+    /// of the length of the custody share.
+    Statement,
+    Input(custody::InputError),
+    Witness(witgen::WitgenError),
+    Prove(prover::ProveError),
+}
+
+/// The stages of [`prove_ownership_party`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Custody shares to authenticated shares of the secret's bits.
+    Input,
+    /// Shares of the secret's bits to shares of the assignment.
+    Witness,
+    /// The proof.
+    Proof,
+}
+
+/// Triples and uniform values one custodian consumes in [`prove_ownership_party`], by
+/// stage, for a secret of `secret_bytes` bytes. `None` for a statement it refuses.
+pub fn ownership_demand(
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    parties: usize,
+) -> Option<[(Stage, usize, usize); 3]> {
+    let (shape, defs) = ownership_definitions(statement)?;
+    let &[bits] = witgen::input_bits(&defs).as_slice() else {
+        return None;
+    };
+    let input = custody::input_demand(parties, bits / 8);
+    let witness = witgen::demand(&shape, &defs).ok()?;
+    let proof = prover::prover_demand(&shape, regime)?;
+    Some([
+        (Stage::Input, input.0, input.1),
+        (Stage::Witness, witness.triples, witness.randoms),
+        (Stage::Proof, proof.0, proof.1),
+    ])
+}
+
+/// One custodian's side of a threshold proof of `statement`, from its XOR share of the
+/// legacy secret (see [`custody::xor_share_from_shamir`]). No custodian holds the secret,
+/// any variable of the assignment or any share of another custodian at any point: the
+/// secret's bits enter as authenticated shares ([`custody`]), the assignment is computed
+/// on shares ([`witgen`]) and proved on shares ([`prover`]).
+pub fn prove_ownership_party<T: Transport>(
+    e: &mut Engine<T>,
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    xor_share: &[u8],
+) -> Result<ZkHemSplitProof, ThresholdError> {
+    prove_ownership_party_observed(e, statement, regime, xor_share, &mut |_, _| {})
+}
+
+/// [`prove_ownership_party`], reporting the engine's counters after each stage.
+pub fn prove_ownership_party_observed<T: Transport>(
+    e: &mut Engine<T>,
+    statement: &OwnershipStatement,
+    regime: WhirSecurityRegime,
+    xor_share: &[u8],
+    after: &mut dyn FnMut(Stage, Stats),
+) -> Result<ZkHemSplitProof, ThresholdError> {
+    let (shape, defs) = ownership_definitions(statement).ok_or(ThresholdError::Statement)?;
+    let public_inputs = statement.public_inputs().ok_or(ThresholdError::Statement)?;
+    if witgen::input_bits(&defs) != [8 * xor_share.len()] {
+        return Err(ThresholdError::Statement);
+    }
+    let bits = custody::input_secret_bits(e, xor_share).map_err(ThresholdError::Input)?;
+    after(Stage::Input, e.stats);
+    let z = witgen::generate(e, &shape, &defs, &public_inputs, &[bits])
+        .map_err(ThresholdError::Witness)?;
+    after(Stage::Witness, e.stats);
+    let proof = prover::prove_party(
+        e,
+        &shape,
+        &public_inputs,
+        &ownership_transcript(statement, regime),
+        regime,
+        z,
+    )
+    .map_err(ThresholdError::Prove)?;
+    after(Stage::Proof, e.stats);
+    Ok(proof)
+}
 
 /// Verify a threshold proof of an ownership statement: the ordinary zk-Hem verifier on
 /// the statement's relation, public inputs and transcript, with the Stage-0 fibers
@@ -523,5 +615,88 @@ mod tests {
             }
         }
         core::array::from_fn(|j| m[j][4])
+    }
+
+    /// Threshold proofs of real ownership statements from `(k, n)` Shamir shares of the
+    /// secret, with dealer preprocessing (test-only).
+    /// `cargo test --release -p dregg-sig-migrate --features std --lib --
+    /// hem::collab::tests::measure_threshold_ownership --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_threshold_ownership() {
+        use super::custody::tests::shamir;
+        use super::custody::xor_share_from_shamir;
+        use super::engine::Dealer;
+        use super::engine::tests::run_parties;
+        use super::witgen::tests::reference_cases;
+        use super::*;
+        let regime = WhirSecurityRegime::default();
+        let only = std::env::var("COLLAB_MEASURE_ONLY").ok();
+        for (parties, case) in [(3usize, 0usize), (3, 1), (5, 0)] {
+            let (st, _, secret) = reference_cases().swap_remove(case);
+            let label = std::format!("{:?} N={parties}", st.lock);
+            if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
+                continue;
+            }
+            // Custody: parties-of-(parties + 2); the quorum leaves custodians 1 and
+            // parties + 1 out.
+            let shares = shamir(&secret, parties, parties + 2, 9);
+            let quorum: Vec<usize> = (0..parties + 2).filter(|&p| p != 1).take(parties).collect();
+            let stages = ownership_demand(&st, regime, parties).unwrap();
+            let triples: usize = stages.iter().map(|s| s.1).sum();
+            let randoms: usize = stages.iter().map(|s| s.2).sum();
+            let preps = Dealer::new(parties, &[3; 32]).preprocessing(triples, randoms);
+            let t = std::time::Instant::now();
+            let out = run_parties(preps, |mut e| {
+                let me = quorum[e.me()];
+                let xor = xor_share_from_shamir(&quorum, me, &shares[me]).unwrap();
+                let mut marks = Vec::new();
+                let start = std::time::Instant::now();
+                let proof = prove_ownership_party_observed(
+                    &mut e,
+                    &st,
+                    regime,
+                    &xor,
+                    &mut |stage, stats| marks.push((stage, stats, start.elapsed().as_secs_f64())),
+                );
+                assert_eq!(e.remaining(), (0, 0), "demand is exact");
+                (proof, marks)
+            });
+            let total_s = t.elapsed().as_secs_f64();
+            let proof = out[0].0.clone().unwrap();
+            assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
+            let bytes = proof.to_bytes();
+            let t = std::time::Instant::now();
+            assert!(verify_threshold_ownership(&st, regime, &proof));
+            let verify_s = t.elapsed().as_secs_f64();
+            let mut other = st.clone();
+            other.epoch += 1;
+            assert!(!verify_threshold_ownership(&other, regime, &proof));
+            std::println!(
+                "{label}: proof={} bytes wall={total_s:.1}s verify={verify_s:.2}s",
+                bytes.len()
+            );
+            let mut before = (Stats::default(), 0.0);
+            for ((stage, stats, at), demand) in out[0].1.iter().zip(&stages) {
+                std::println!(
+                    "  {stage:?}: triples={} randoms={} sent={} bytes rounds={} mac_checks={} time={:.1}s",
+                    stats.triples_used - before.0.triples_used,
+                    stats.randoms_used - before.0.randoms_used,
+                    stats.bytes_sent - before.0.bytes_sent,
+                    stats.rounds - before.0.rounds,
+                    stats.mac_checks - before.0.mac_checks,
+                    at - before.1,
+                );
+                assert_eq!(
+                    (stats.triples_used - before.0.triples_used) as usize,
+                    demand.1
+                );
+                assert_eq!(
+                    (stats.randoms_used - before.0.randoms_used) as usize,
+                    demand.2
+                );
+                before = (*stats, *at);
+            }
+        }
     }
 }

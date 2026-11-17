@@ -726,9 +726,10 @@ pub(super) mod tests {
         cs.finish()
     }
 
-    /// Deal authenticated shares of `assignment` and the preprocessing, then run every
-    /// custodian. `tamper` may alter a custodian's shares before it starts.
-    pub(in super::super) fn threshold_prove(
+    /// Test helper that holds the assignment in the clear: deal authenticated shares of
+    /// it and the preprocessing, then run every custodian. The path without a clear
+    /// assignment is `super::super::prove_ownership_party`. `tamper` may alter a custodian's shares before it starts.
+    pub(in super::super) fn deal_clear_assignment_and_prove(
         shape: &Shape,
         assignment: &[F],
         statement: &[u8],
@@ -777,7 +778,7 @@ pub(super) mod tests {
         let (shape, assignment) = small_relation(5);
         let publics = assignment[1..=shape.num_public].to_vec();
         for parties in [2usize, 3, 5] {
-            let out = threshold_prove(
+            let out = deal_clear_assignment_and_prove(
                 &shape,
                 &assignment,
                 b"stmt",
@@ -816,7 +817,8 @@ pub(super) mod tests {
     fn an_unsatisfying_assignment_aborts_at_the_zero_test() {
         let (shape, _) = small_relation(5);
         let (_, bad) = small_relation(6);
-        let out = threshold_prove(&shape, &bad, b"stmt", 3, 2, |_, _| {}, |_, _| {});
+        let out =
+            deal_clear_assignment_and_prove(&shape, &bad, b"stmt", 3, 2, |_, _| {}, |_, _| {});
         for (result, _) in &out {
             assert_eq!(result.as_ref().err(), Some(&ProveError::Unsatisfied));
         }
@@ -878,7 +880,7 @@ pub(super) mod tests {
             for bit in [0u64, 1] {
                 let (shape, assignment) = two_witness_relation(bit);
                 let secret = shape.num_public + 1;
-                let out = threshold_prove(
+                let out = deal_clear_assignment_and_prove(
                     &shape,
                     &assignment,
                     b"stmt",
@@ -920,7 +922,15 @@ pub(super) mod tests {
             .into_iter()
             .map(|bit| {
                 let (shape, assignment) = two_witness_relation(bit);
-                let out = threshold_prove(&shape, &assignment, b"stmt", 3, 7, |_, _| {}, |_, _| {});
+                let out = deal_clear_assignment_and_prove(
+                    &shape,
+                    &assignment,
+                    b"stmt",
+                    3,
+                    7,
+                    |_, _| {},
+                    |_, _| {},
+                );
                 let proof = out[0].0.clone().unwrap();
                 assert!(verify_split(&shape, &[f(35)], b"stmt", regime, &proof));
                 (proof, pattern(out[0].1))
@@ -928,88 +938,5 @@ pub(super) mod tests {
             .collect();
         assert_eq!(runs[0].1, runs[1].1);
         assert_ne!(runs[0].0, runs[1].0);
-    }
-
-    /// Threshold proofs of real ownership statements with dealer preprocessing.
-    /// `cargo test --release -p dregg-sig-migrate --features std --lib --
-    /// hem::collab::prover::tests::measure_threshold_ownership --ignored --nocapture`
-    #[test]
-    #[ignore = "measurement"]
-    fn measure_threshold_ownership() {
-        use super::super::verify_threshold_ownership;
-        use crate::hem::relations::{
-            KeySource, Lock, OwnershipStatement, OwnershipWitness, ownership_transcript,
-            synthesize_ownership,
-        };
-        let regime = WhirSecurityRegime::default();
-        let cases = [
-            (
-                "bitcoin-hash160",
-                Lock::P2pkh,
-                KeySource::Secp256k1Key,
-                OwnershipWitness::secp256k1_key(&[0x11; 32]),
-                3usize,
-            ),
-            (
-                "ed25519-seed",
-                Lock::Ed25519,
-                KeySource::Ed25519Seed,
-                OwnershipWitness::ed25519_seed(&[0x22; 32]),
-                3,
-            ),
-            (
-                "bitcoin-hash160",
-                Lock::P2pkh,
-                KeySource::Secp256k1Key,
-                OwnershipWitness::secp256k1_key(&[0x11; 32]),
-                5,
-            ),
-        ];
-        let only = std::env::var("COLLAB_MEASURE_ONLY").ok();
-        for (name, lock, source, witness, parties) in &cases {
-            let label = std::format!("{name} N={parties}");
-            if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
-                continue;
-            }
-            let st = OwnershipStatement::derive(*lock, source.clone(), witness, [5; 32], [6; 32], 9).unwrap();
-            let (shape, assignment) = synthesize_ownership(&st, witness).unwrap();
-            let (triples, randoms) = prover_demand(&shape, regime).unwrap();
-            let layout = Layout::new(&shape, regime).unwrap();
-            let t = std::time::Instant::now();
-            let out = threshold_prove(
-                &shape,
-                &assignment,
-                &ownership_transcript(&st, regime),
-                *parties,
-                3,
-                |_, _| {},
-                |_, _| {},
-            );
-            let total_s = t.elapsed().as_secs_f64();
-            let proof = out[0].0.clone().unwrap();
-            assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
-            let bytes = proof.to_bytes();
-            let t = std::time::Instant::now();
-            assert!(verify_threshold_ownership(&st, regime, &proof));
-            let verify_s = t.elapsed().as_secs_f64();
-            let mut other = st.clone();
-            other.epoch += 1;
-            assert!(!verify_threshold_ownership(&other, regime, &proof));
-            let stats = out[0].1;
-            std::println!(
-                "{label}: rows=2^{} vars={} cells=2^{} triples/party={triples} randoms/party={randoms} \
-                 sent/party={} bytes rounds={} mac_checks={} proof={} bytes \
-                 deal+prove wall={total_s:.1}s verify={verify_s:.2}s",
-                shape.log_rows,
-                shape.num_vars,
-                layout.log_cells,
-                stats.bytes_sent,
-                stats.rounds,
-                stats.mac_checks,
-                bytes.len(),
-            );
-            assert_eq!(stats.triples_used as usize, triples);
-            assert_eq!(stats.randoms_used as usize, randoms);
-        }
     }
 }
