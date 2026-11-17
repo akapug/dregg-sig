@@ -228,13 +228,22 @@ Where this protocol departs from the theorem's construction:
 2^{(256 - 12.66)/3})`. The same value is the largest `kappa` with error at most
 `t / 2^kappa` for all `t <= 2^kappa`. The second term is `2^81.1` whatever the regime.
 
-*Is the digest term an attack?* A quantum collision costs about `2^85` queries (the
-review's figure). One collision lets the prover open one leaf two ways; that alone does
-not forge a proof. The proven bound charges it in full because extractability of the
-Merkle commitment fails at that point, and [CDHZ25] shows the property-level bound is
-tight. Nothing weaker than collision resistance is known to suffice for the Merkle trees
-or for the chain. The salts, the leaf-index binding and the node-index binding do not
-help against collisions in a tree the adversary builds itself.
+*What each digest must resist* [ours].
+
+| Use | Property needed | Why nothing weaker |
+| --- | --- | --- |
+| Merkle leaves and nodes, every stage | collision resistance | the prover builds the tree, so a second preimage of an honest node is not what it needs; two openings of one position under one root are a collision |
+| transcript chain | collision resistance | the prover chooses the absorbed messages; two prefixes with one chain value share every later challenge |
+| grinding | preimage of a `b`-bit pattern | `2^b` classical, `2^{b/2}` quantum evaluations |
+| Stage-0 salts, coin derivation | pseudorandomness under a secret 256-bit seed | hiding only; no binding role |
+
+A quantum collision costs about `2^85` queries at 256 bits (the review's figure). One
+collision lets the prover open one leaf two ways, which does not by itself forge a
+proof, so `2^85` is a lower bound on an attack through the digests. The theorem
+certifies `2^81`: it charges the first collision in full, because extraction from the
+Merkle commitment fails there, and [CDHZ25] shows that bound on the commitment property
+is tight. Leaf-index and node-index binding do not help against collisions in a tree the
+adversary builds itself.
 
 ## 3. Batching proximity loss
 
@@ -431,8 +440,8 @@ different relation tag. For the verifier's side:
   committer's opened symbols are uniform (any `|Q| <= N` symbols of the codeword of a
   uniform table are) and the last is fixed by the sum, to which Theorem 4 applies. One
   committer with uniform blinding cells makes the summed blinders uniform, as Lemma 4.1
-  needs. Each committer's unopened leaves are salted with its own seed; the hiding bound
-  of section 4.4 holds with `P` counting committers times proofs.
+  needs. Provided each committer salts its leaves from its own secret seed, the hiding
+  bound of section 4.4 holds with `P` counting committers times proofs.
 - The size model of `bounds.rs` covers single-root proofs. A split proof adds, per extra
   committer, the Stage-0 part: `q_0 (16 + 40 * 2^{s_0})` bytes and one multiproof.
 
@@ -555,25 +564,15 @@ functional of `Z`. Four more blinding cells and a rank lemma in the style of Lem
 (jointly for the opened symbols and that functional) are required first. Until then the
 scalar blend stays, and its loss is the number in section 5.1.
 
-**R5. Documentation of the regimes (pcs.rs, owned by lane COLLAB).** Exact changes:
+**R5. Documentation of the regimes. Done on this branch** (doc comments of pcs.rs only;
+lane COLLAB had merged and its worktree equalled `dev`). The enum, tag 2, tag 4, tag 9,
+`meets_unconditional_grover_128_floor` and `whir_stage_schedule` now state the levels of
+this document instead of "unconditional Johnson-radius QROM budget". Not done, because
+they change public names or wire-visible behaviour and are the owner's call:
 
-- enum doc: replace "These are per-stage query bounds, not a proof of total
-  Fiat-Shamir/QROM security" by a pointer to this document and
-  `zk_hem::bounds::pcs_report`;
-- `BciksJohnsonQrom128`: "Default: unconditional Johnson-radius QROM budget" becomes
-  "Default: `ceil(512 / log2 B) + 2` queries. Proven levels: 127 bits classical,
-  81 bits QROM (256-bit digests); see `crates/agg/SECURITY.md`";
-- `Cdhz25*`: add "the bounded-query figure credits grinding inside the CDHZ25 bound,
-  which no theorem supports; without it the public opening is `2^-114.5` at
-  `Q = 2^38`";
-- `meets_unconditional_grover_128_floor`: rename to
-  `nominal_round_search_bits_at_least_128` or state in its doc that it is not a
-  security level;
-- `whir_stage_schedule` doc: "unconditional Johnson proximity below `2^-256`" holds for
-  the query term of the public opening only; under the scalar blend the Stage-0 query
-  term is `2^-201`;
-- `BciksJohnsonClassical128`: `ceil(256 / log2 B) + 1` gives 124.5 bits per query round
-  at worst; `ceil(256 / log2 B) + 3` restores 128 at every stage for `2^17..2^24` cells
+- renaming the `*Qrom128` variants and `meets_unconditional_grover_128_floor`;
+- tag 2: `ceil(256 / log2 B) + 1` gives 124.5 bits per query round at worst;
+  `ceil(256 / log2 B) + 3` restores 128 at every stage for `2^17..2^24` cells
   (`bounds::min_queries`), if the tag is ever used outside tests.
 
 **Not a parameter: 128-bit QROM.** Under Theorem 3 it needs `eps_rbr' <= 2^-264.4` and

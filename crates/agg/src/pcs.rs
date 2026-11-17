@@ -126,8 +126,10 @@ pub struct WhirStageSpec {
 ///
 /// Capacity proximity-gap wire tags (`0`, `1`, `3`) are permanently retired and rejected on
 /// deserialization (`Crites & Stewart 2025/2046`, `Krachun-Kazanin-Habock 2026/782`). These are
-/// per-stage query bounds, not a proof of total Fiat–Shamir/QROM security (which also needs
-/// reduction, list-size, field-error, and union-bound accounting).
+/// per-stage query bounds. The composed bounds (round-by-round errors with list sizes and
+/// field errors, then BCS in the ROM and the QROM) are stated in `crates/agg/SECURITY.md` and
+/// computed by `zk_hem::bounds::pcs_report`: with the 256-bit digests used here every
+/// accepted regime gives 127 bits classically and 81 bits in the QROM.
 ///
 /// The `Cdhz25*` regimes use the per-stage query tables of
 /// `lean/Qsag/QromSaltedMerkleStateRestoration.lean` (`HemOptimizedQromSchedule.minQueries`):
@@ -140,12 +142,19 @@ pub struct WhirStageSpec {
 /// The `Qrom128` suffix on the CDHZ25 variants records a historical bounded-query target,
 /// not a 128-bit nominal Grover work factor: the PoW profiles have 108 nominal bits and
 /// require `Q <= 2^38`; the zero-PoW profiles have 107 nominal bits and require
-/// `Q + 1 <= 2^40`. Neither label establishes a composed 128-bit authorization bound.
+/// `Q + 1 <= 2^40`. The bounded-query target credits grinding inside the CDHZ25 bound, which
+/// no cited theorem supports; without that credit the public opening has error `2^-114.5`
+/// at `Q = 2^38` (tags 5, 7, 10) and `2^-122.3` at `Q = 2^40` (tags 6, 8). No `Qrom128`
+/// label, on any variant, is a 128-bit QROM security level (`crates/agg/SECURITY.md`,
+/// section 0).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WhirSecurityRegime {
+    /// `ceil(256/log2(B)) + 1` queries plus 16-bit PoW. Raw PCS tests only. Its weakest
+    /// query round has error `2^-124.5` before grinding, not `2^-128`.
     BciksJohnsonClassical128 = 2,
-    /// Default: unconditional Johnson-radius QROM budget (`ceil(512/log2(B)) + 2`).
+    /// Default: `ceil(512/log2(B)) + 2` queries at the Johnson radius plus 16-bit PoW.
+    /// Proven levels: 127 bits classical, 81 bits QROM (`crates/agg/SECURITY.md`).
     #[default]
     BciksJohnsonQrom128 = 4,
     /// `(202, 102, 70, 52)` queries at blowups `(4, 16, 64, 256)` plus 16-bit PoW, `cSHAKE256`.
@@ -160,7 +169,7 @@ pub enum WhirSecurityRegime {
     /// [`Self::Cdhz25ZeroPowQrom128`] query table over the Poseidon2 canopy and transcript.
     /// 107-bit nominal Grover work; bounded-query accounting assumes `Q + 1 <= 2^40`.
     Poseidon2Cdhz25ZeroPowQrom128 = 8,
-    /// Unconditional Johnson-radius QROM budget (`(258, 130, 88, 66)` + 16-bit PoW) over
+    /// [`Self::BciksJohnsonQrom128`] query table (`(258, 130, 88, 66)` + 16-bit PoW) over
     /// Role-1 12-round `TurboSHAKE256` Merkle-Canopy & PoW.
     TurboShakeBciksJohnsonQrom128 = 9,
     /// [`Self::Cdhz25JohnsonQrom128`] query table (`(202, 102, 70, 52)` + 16-bit PoW) over
@@ -197,7 +206,8 @@ impl WhirSecurityRegime {
     }
 
     /// Nominal single-round Grover search work is at least 128 bits.
-    /// This is a per-round work estimate, not a composed QROM security theorem.
+    /// This is a per-round work estimate, not a security level: the proven QROM level of
+    /// every regime is 81 bits (`crates/agg/SECURITY.md`, Theorem 3).
     /// Tag 2 has 72 bits, tags 4/9 have 136; tags 5/7/10 have 108 and 6/8 have 107.
     pub fn meets_unconditional_grover_128_floor(self) -> bool {
         self.qrom_grover_round_bits() >= 128
@@ -317,9 +327,10 @@ impl WhirSecurityRegime {
 }
 
 /// Default schedule: Johnson QROM (`BciksJohnsonQrom128`), `ceil(512/log2(B)) + 2` queries plus
-/// 16-bit PoW, i.e. `(258, 130, 88, 66)` at blowups `(4, 16, 64, 256)`. That gives unconditional
-/// Johnson proximity below $2^{-256}$ with positive proximity slack. Per-round query budgets
-/// alone do not prove total PCS/QROM security.
+/// 16-bit PoW, i.e. `(258, 130, 88, 66)` at blowups `(4, 16, 64, 256)`. That puts the query
+/// error of the public opening below $2^{-256}$ at a proven Johnson-radius threshold. Under
+/// the scalar blend of zk-Hem the Stage-0 query error is $2^{-201}$. The composed bounds are
+/// in `crates/agg/SECURITY.md` (`zk_hem::bounds`).
 pub fn whir_stage_schedule(num_vars: usize) -> WhirSchedule {
     WhirSecurityRegime::default().schedule(num_vars)
 }

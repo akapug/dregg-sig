@@ -36,7 +36,7 @@ The aggregate profile policy also accepts the historically named `Cdhz25*Qrom128
 
 The finite-witness regression checks all 46 non-exhaustive canonical Johnson QROM stages across `nv = 2..24`: exact Theorem 4.8 interpolation inequalities, Johnson list bounds, query error below `2^-256` including the stage fold-coordinate loss, and stage affine-combiner error below `2000/p^4` (more than 245 bits). Its dyadic probability calculation rounds upward at every division; it uses no floating-point approximations. The other stages are queried exhaustively.
 
-These implementation and arithmetic tests do not constitute a complete Fiat–Shamir or QROM security proof. Cascade coordinate losses and protocol-wide union bounds must still be composed separately. Formal security-budget sources outside this crate are not modified by this upgrade.
+These implementation and arithmetic tests are the per-stage part of the argument. The composition (fold and coordinate losses, list sizes, every verifier round, BCS in the ROM and the QROM) is in `SECURITY.md` sections 2 and 5, computed by `src/zk_hem/bounds.rs`. Formal security-budget sources outside this crate are not modified by this upgrade.
 
 ## Validation
 

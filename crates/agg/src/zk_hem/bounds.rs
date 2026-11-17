@@ -18,7 +18,7 @@
 //!   `(m + 1/2)^7 d n^2 / (3 rho^(3/2) |F|)`. Proven.
 //! * `[ACFY24b]` `whir`: Theorem 5.2, the shape of the RBR errors (fold, out-of-domain,
 //!   shift, final). Proven for WHIR as specified there; applying it to the affine fold of
-//!   this crate is this project's argument (SECURITY.md, section 2).
+//!   this crate is this project's argument (SECURITY.md, section 2.1).
 //! * `[CDHZ25]` `2025-cdhz-pq-snrdx-bcs-2025-2166`: Theorem 6.9 (RBR soundness implies
 //!   post-quantum state-restoration soundness with error
 //!   `80 (t + k + 1)(w + k) eps_rbr + (t + k + 1) k / 2^r_min`), Theorem 8.3 (Merkle
@@ -26,7 +26,7 @@
 //!
 //! What is this project's own argument and not a cited theorem: the per-round application of
 //! `[CWYZ26]` Theorem 5.1 to domain-halving folds (one fiber of agreement lost per fold), the
-//! state function of the composed protocol, and the simulator of SECURITY.md section 3.
+//! state function of the composed protocol, and the simulator of SECURITY.md section 4.
 
 use alloc::vec::Vec;
 
@@ -212,7 +212,7 @@ pub enum Blend {
     /// `U = sum_i (a_i + b_i X) W_i` with the weights of `pcs::affine::cascade_weights`, four
     /// applications of `[CWYZ26]` Theorem 5.1. Not implemented for the hiding protocol: its
     /// blended word reveals one `Ext4`-valued functional of `Z` and needs four more blinding
-    /// cells and its own simulation lemma (SECURITY.md, section 7).
+    /// cells and its own simulation lemma (SECURITY.md, section 6, R4).
     AffineCascade,
     /// No blend: the opening of a single public table (non-hiding Hem).
     Public,
@@ -429,7 +429,7 @@ pub struct RbrBound {
     pub blend_bits: Option<MilliBits>,
 }
 
-/// Zero-knowledge accounting (SECURITY.md sections 3 and 4).
+/// Zero-knowledge accounting (SECURITY.md section 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkBound {
     /// Uniform cells at the top of the assignment table.
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(stage0_queries_for(4, 80, 256), 259);
     }
 
-    /// The size model against the measured full-shard proof of SECURITY.md, section 8
+    /// The size model against the measured full-shard proof of SECURITY.md, section 9.2
     /// (780,091 bytes including eight bytes of framing; tag 8, `2^21` rows).
     #[test]
     fn proof_size_model_brackets_the_measured_full_shard_proof() {
