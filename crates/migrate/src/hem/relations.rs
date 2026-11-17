@@ -1,40 +1,104 @@
 //! Ownership statements over zk-Hem and their proofs.
 //!
-//! A statement says: the prover knows the secret behind a legacy credential, and binds
-//! that knowledge to a post-quantum address commitment, a migration domain and an epoch.
-//! Four legacy claims are supported ([`LegacyClaim`]):
+//! A statement says: the prover knows the secret behind one on-chain legacy credential,
+//! and binds that knowledge to a post-quantum address commitment, a migration domain and
+//! an epoch. It has two independent parts:
 //!
-//! | claim | secret | relation |
+//! * a [`Lock`]: how the chain derives the credential from a public key (P2PKH/P2WPKH,
+//!   uncompressed P2PKH, P2SH-wrapped P2WPKH, Ethereum address, Taproot output key with or
+//!   without a script tree, Ed25519 key);
+//! * a [`KeySource`]: what the prover knows about that key. Either the signing key itself
+//!   (`Secp256k1Key`), or a hash preimage the key is derived from: an RFC 8032 seed, a
+//!   BIP-32 master seed or extended key with a path, a SLIP-0010 seed with a path, a
+//!   BIP32-Ed25519 extended key with a path.
+//!
+//! Any lock of a curve combines with any source of that curve, so a seed proof can target
+//! every credential type of its key. [`BatchStatement`] proves many credentials below one
+//! BIP-32 node in one proof.
+//!
+//! # Which source is sound against which adversary
+//!
+//! A `Secp256k1Key` statement is sound only while the public key is not public: whoever
+//! computes the discrete logarithm satisfies it. It is the hidden-key mode
+//! (`KeyExposure::Hidden`). The one exception is a Taproot lock: the output key is public,
+//! but the statement is knowledge of an internal key `k` (and merkle root `m`) with
+//! `Q = lift_x([k]G) + H_TapTweak(x || m) G`. Knowing `log Q` does not give such a pair,
+//! because `k` is under the hash; that statement fails only if the internal key itself
+//! has been published (a script-path spend, an exported xpub), so it is also hidden-key
+//! mode, about the internal key.
+//!
+//! The other sources are sound for revealed keys (`KeyExposure::Revealed`): their witness
+//! is a preimage of the hash chain that produced the key.
+//!
+//! * `Ed25519Seed`, `Slip10`, `Bip32 { root: Seed }`: the chain starts at the seed.
+//! * `Bip32 { root: ExtendedKey }` and `Bip32Ed25519` start at an extended private key.
+//!   That is sound exactly when that node's chain code cannot be computed from public
+//!   data, i.e. no extended public key at or above the start node was ever exported: with
+//!   the chain code and the discrete logarithm of the node's public key an adversary has
+//!   the whole witness. This is the unsoundness of last-step proofs in ZKPoSP
+//!   (`2026-zkposp-pq-zk-proofs-hd-wallets-seed-provenance-2026-1508`, Proposition 6.1 and
+//!   Remark 4.4), which is why that paper always goes back to the seed for non-hardened
+//!   paths. The seed-rooted statement is the conservative choice; the extended-key root
+//!   exists because it is four SHA-512 compressions cheaper per omitted step and because
+//!   the root derivations deployed for BIP32-Ed25519 are not provable (Cardano's Icarus
+//!   root is PBKDF2 with 4096 iterations).
+//!
+//! # The credential identifier prevents double migration; the nullifier does not
+//!
+//! Requirement A: the nullifier of a revealed key must not be computable from public data
+//! plus discrete logarithms. Requirement B: a credential has one nullifier per domain
+//! whichever statement proves it. Both cannot hold across hidden-key and seed statements
+//! of the same key: a hidden-key statement's witness is the scalar alone, so its nullifier
+//! is a function of the scalar, and B then makes every statement's nullifier that
+//! function, which fails A for a revealed key.
+//!
+//! So uniqueness is carried by the on-chain credential, as in ePrint 2026/352 section 7.4
+//! (`2026-pq-migration-bitcoin-ethereum-hidden-key-proofs-finalization-enforcement-2026-352`,
+//! the registry record is keyed by the asset identifier): [`Credential::identifier`] is a
+//! digest of what the chain holds, the registry refuses a second binding for it
+//! (`LegacyConflict`), and every statement kind for one credential yields the same
+//! identifier. Two credentials of one key (its P2PKH hash and its Ethereum address) are
+//! two identifiers and migrate independently.
+//!
+//! The nullifier is the registry's record key and a commitment to the secret:
+//! `SHA256(tag || kind || 00 00 || domain || credential identifier || 0^32 || secret)`,
+//! tag `QSAG.MIGRATE.HEM.NULLIFIER/v2`. The first 128 bytes are public, so the verifier
+//! supplies their SHA-256 chaining value and the relation runs one compression. `secret`
+//! is, by source:
+//!
+//! | source | kind | secret |
 //! |---|---|---|
-//! | Bitcoin `HASH160` (hidden key) | scalar `k` | `1 <= k < n`, `HASH160(compressed([k]G)) = h` |
-//! | Ethereum address (hidden key) | scalar `k` | `1 <= k < n`, `Keccak256(x \|\| y)[12..] = a` |
-//! | Ed25519 public key (revealed) | RFC 8032 seed | `[clamp(SHA512(seed)[..32])]B = A` |
-//! | BIP-32 secp256k1 public key (revealed) | master seed | `m / path` has public key `P` |
+//! | `Secp256k1Key` | 1 | the key, big-endian |
+//! | `Bip32`, seed root | 2 | first 32 bytes of `SHA512((key ^ ipad) || seed)`, the inner digest of the master HMAC |
+//! | `Ed25519Seed`, `Slip10` | 3 | the RFC 8032 seed of the leaf |
+//! | `Bip32Ed25519` | 5 | the leaf's `k_R` |
+//! | `Bip32`, extended-key root | 7 | the root chain code |
 //!
-//! The two revealed-key relations take a hash preimage as their witness (the seed), so a
-//! party that can compute discrete logarithms of the public key still cannot satisfy them.
+//! For every revealed-key source the secret is not a function of public keys, chain codes
+//! of exported extended public keys or discrete logarithms, so requirement A holds. It is
+//! deterministic, so resubmitting a statement is idempotent, and a credential has one
+//! nullifier per domain within a source (an Ed25519 key proved from its seed or through
+//! SLIP-0010 has the same one). A hidden-key statement and a seed statement of the same
+//! credential have different nullifiers and the same identifier; the second one to reach
+//! a registry is refused by the identifier.
 //!
-//! # What is public
+//! # What is public and what is hidden
 //!
-//! The legacy value, the nullifier and a SHA-256 chaining value that carries the migration
-//! domain are public inputs of the relation, one input per bit (public inputs are Boolean
-//! because the verifier supplies them, so they cost no row). The post-quantum commitment
-//! and the epoch are not used inside the relation; they are bound through the transcript,
-//! which absorbs [`OwnershipStatement::to_bytes`] and the regime. For the BIP-32 claim the
-//! seed length and the derivation path are public and select the relation; chain codes and
-//! all keys along the path stay secret.
+//! Public inputs, one per bit: the credential value, the nullifier chaining value and the
+//! nullifier. The post-quantum commitment and the epoch are bound through the transcript.
+//! The seed length (16 to 64 bytes) is always hidden. A derivation path is public
+//! ([`PathSpec::Public`], it selects the relation) or hidden up to a public maximum depth
+//! ([`PathSpec::Hidden`]: indices, hardened flags and the actual depth are witness; every
+//! step then costs a hardened step plus a public-key multiplication). BIP32-Ed25519 paths
+//! are public only. Public keys, chain codes and all intermediate keys are never public.
 //!
-//! # Nullifier
+//! # BIP-39 is outside the relation
 //!
-//! `SHA256(tag || 00 00 || curve || domain || secret)` with the 29-byte tag
-//! `QSAG.MIGRATE.HEM.NULLIFIER/v1`, so that `tag .. domain` is exactly one block. The
-//! verifier computes the chaining value after that block ([`nullifier_midstate`]) and the
-//! relation runs the one remaining compression. `secret` is the signing scalar: the
-//! 32-byte big-endian secp256k1 key, or the 32-byte little-endian clamped Ed25519 scalar.
-//! Both are unique for their public key, so one legacy key has one nullifier per domain
-//! whichever statement is used to migrate it. For a revealed key the nullifier is
-//! computable by anyone who can compute the discrete logarithm; it is an identifier, not a
-//! secret, and registering it still needs a proof.
+//! A mnemonic maps to the seed by PBKDF2-HMAC-SHA512 with 2048 iterations (about 180
+//! million rows). Proving it would add nothing: the seed is already a secret that no
+//! public value determines, the statement is already unsatisfiable without a preimage of
+//! the master HMAC, and whoever holds the mnemonic holds the seed. [`bip39_seed`] is the
+//! native map a wallet runs before proving.
 //!
 //! # Relations contain multiplication rows only
 //!
@@ -45,7 +109,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use dregg_sig_accel::keccak::keccak256 as keccak256_native;
+use dregg_sig_accel::keccak::{cshake256_framed_32, keccak256 as keccak256_native};
 use dregg_sig_accel::sha2 as sha2_native;
 use dregg_sig_agg::field::Goldilocks;
 use dregg_sig_agg::pcs::WhirSecurityRegime;
@@ -53,77 +117,171 @@ use dregg_sig_agg::zk_hem::protocol::{self, ZkHemError, ZkHemProof};
 use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape};
 
 use super::curve::{
-    Element, Lazy, Modulus, ed25519_clamp, ed25519_fixed_base_mul, secp256k1_enforce_scalar_range,
-    secp256k1_fixed_base_mul,
+    AffinePoint, Element, Lazy, Modulus, ed25519_clamp, ed25519_fixed_base_mul,
+    secp256k1_enforce_scalar_range, secp256k1_fixed_base_mul, secp256k1_point_add,
 };
 use super::hash::{
-    Word, alloc_bits, const_bits, hash160, hmac_sha512, keccak256, pack_bits, sha256_from_midstate,
-    sha256_midstate, sha512,
+    HmacKey, Word, add_wide, alloc_bits, be_bits, be_words, const_bits, hash160, keccak256,
+    pack_bits, select, sha256_from_midstate, sha256_midstate, sha512, sha512_compress,
 };
 use crate::ed25519_ct::public_key_from_clamped_scalar;
-use crate::legacy::LegacyCommitmentKind;
 use crate::secp256k1_ct::{
     SecpPoint, secp_scalar_add_mod_n, secp_scalar_is_canonical, secp_scalar_is_valid_nonzero,
+    secp_scalar_neg_mod_n,
 };
 
 type F = Goldilocks;
 
-const NULLIFIER_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.NULLIFIER/v1";
-const STATEMENT_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.OWNERSHIP/v1";
-const PROOF_MAGIC: &[u8; 8] = b"QSHEMOW1";
+const NULLIFIER_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.NULLIFIER/v2";
+const STATEMENT_TAG: &[u8; 29] = b"QSAG.MIGRATE.HEM.OWNERSHIP/v2";
+const BATCH_TAG: &[u8; 25] = b"QSAG.MIGRATE.HEM.BATCH/v1";
+const PROOF_MAGIC: &[u8; 8] = b"QSHEMOW2";
+const BIP32_MASTER_KEY: &[u8] = b"Bitcoin seed";
+const SLIP10_ED25519_KEY: &[u8] = b"ed25519 seed";
 
 /// First hardened child index.
-pub const BIP32_HARDENED: u32 = 0x8000_0000;
-/// Longest derivation path a statement may carry.
-pub const MAX_BIP32_DEPTH: usize = 10;
-/// Master seed lengths BIP-32 admits, in bytes.
-pub const BIP32_SEED_BYTES: core::ops::RangeInclusive<usize> = 16..=64;
+pub const HARDENED: u32 = 0x8000_0000;
+/// Longest derivation path, public or hidden.
+pub const MAX_PATH_DEPTH: usize = 10;
+/// Master seed lengths, in bytes (BIP-32 and SLIP-0010).
+pub const SEED_BYTES: core::ops::RangeInclusive<usize> = 16..=64;
+/// Most credentials one batch may carry.
+pub const MAX_BATCH_ENTRIES: usize = 1024;
 
 fn wipe(bytes: &mut [u8]) {
     dregg_sig_asm::volatile_fill(bytes, 0);
 }
 
+fn fu(v: u64) -> F {
+    F::from_u64_reduced(v)
+}
+
+// ============================================================================
+// Credentials
+// ============================================================================
+
+/// What the chain holds for a legacy credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Credential {
+    /// The 20-byte public-key hash of a P2PKH or P2WPKH output.
+    BitcoinKeyHash([u8; 20]),
+    /// The 32-byte x-only output key of a Taproot output.
+    BitcoinTaproot([u8; 32]),
+    /// The 20-byte Ethereum address.
+    EthereumAddress([u8; 20]),
+    /// A 32-byte Ed25519 public key.
+    Ed25519Key([u8; 32]),
+    /// The 20-byte script hash of a P2SH output.
+    BitcoinScriptHash([u8; 20]),
+}
+
+/// Registry-wide identifier of a credential of type `tag` with on-chain bytes `value`.
+/// Tags 1 to 4 are those of `LegacyCommitmentKind`.
+pub fn credential_identifier(tag: u8, value: &[u8]) -> [u8; 32] {
+    cshake256_framed_32(b"QSAG.MIGRATE.REGISTRY.LEGACY.V1", &[&[tag], value])
+}
+
+impl Credential {
+    pub fn tag(&self) -> u8 {
+        match self {
+            Self::BitcoinKeyHash(_) => 1,
+            Self::BitcoinTaproot(_) => 2,
+            Self::EthereumAddress(_) => 3,
+            Self::Ed25519Key(_) => 4,
+            Self::BitcoinScriptHash(_) => 5,
+        }
+    }
+
+    /// The on-chain bytes.
+    pub fn value(&self) -> &[u8] {
+        match self {
+            Self::BitcoinKeyHash(v) | Self::EthereumAddress(v) | Self::BitcoinScriptHash(v) => v,
+            Self::BitcoinTaproot(v) | Self::Ed25519Key(v) => v,
+        }
+    }
+
+    /// The identifier the registry keeps unique: one per on-chain credential, whichever
+    /// statement migrates it.
+    pub fn identifier(&self) -> [u8; 32] {
+        credential_identifier(self.tag(), self.value())
+    }
+}
+
+/// How the chain derives a credential from a public key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Lock {
+    /// `HASH160(compressed key)`: P2PKH and P2WPKH.
+    P2pkh = 1,
+    /// `HASH160(04 || x || y)`: P2PKH of an uncompressed key.
+    P2pkhUncompressed = 2,
+    /// `HASH160(00 14 || HASH160(compressed key))`: P2SH-wrapped P2WPKH (BIP-49).
+    P2shP2wpkh = 3,
+    /// Last 20 bytes of `Keccak256(x || y)`.
+    Ethereum = 4,
+    /// BIP-341 output key without a script tree (BIP-86): `lift_x(P) + H_TapTweak(x(P)) G`.
+    TaprootKeyPath = 5,
+    /// BIP-341 output key with a script tree whose merkle root is part of the witness:
+    /// `lift_x(P) + H_TapTweak(x(P) || root) G`.
+    TaprootScriptTree = 6,
+    /// The Ed25519 public key itself.
+    Ed25519 = 7,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Curve {
+    Secp256k1,
+    Ed25519,
+}
+
+impl Lock {
+    fn from_tag(tag: u8) -> Option<Self> {
+        [
+            Self::P2pkh,
+            Self::P2pkhUncompressed,
+            Self::P2shP2wpkh,
+            Self::Ethereum,
+            Self::TaprootKeyPath,
+            Self::TaprootScriptTree,
+            Self::Ed25519,
+        ]
+        .into_iter()
+        .find(|l| *l as u8 == tag)
+    }
+
+    fn curve(self) -> Curve {
+        match self {
+            Self::Ed25519 => Curve::Ed25519,
+            _ => Curve::Secp256k1,
+        }
+    }
+
+    fn credential_bytes(self) -> usize {
+        match self {
+            Self::TaprootKeyPath | Self::TaprootScriptTree | Self::Ed25519 => 32,
+            _ => 20,
+        }
+    }
+
+    /// The credential type this lock produces, around its on-chain bytes.
+    fn credential(self, value: &[u8]) -> Option<Credential> {
+        Some(match self {
+            Self::P2pkh | Self::P2pkhUncompressed => {
+                Credential::BitcoinKeyHash(value.try_into().ok()?)
+            }
+            Self::P2shP2wpkh => Credential::BitcoinScriptHash(value.try_into().ok()?),
+            Self::Ethereum => Credential::EthereumAddress(value.try_into().ok()?),
+            Self::TaprootKeyPath | Self::TaprootScriptTree => {
+                Credential::BitcoinTaproot(value.try_into().ok()?)
+            }
+            Self::Ed25519 => Credential::Ed25519Key(value.try_into().ok()?),
+        })
+    }
+}
+
 // ============================================================================
 // Native reference functions
 // ============================================================================
-
-/// The curve of the signing scalar a nullifier is derived from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum NullifierCurve {
-    Secp256k1 = 1,
-    Ed25519 = 2,
-}
-
-/// The one-block prefix `tag || 00 00 || curve || domain` of the nullifier preimage.
-pub fn nullifier_prefix(curve: NullifierCurve, migration_domain: &[u8; 32]) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    out[..29].copy_from_slice(NULLIFIER_TAG);
-    out[31] = curve as u8;
-    out[32..].copy_from_slice(migration_domain);
-    out
-}
-
-/// SHA-256 chaining value after [`nullifier_prefix`]: the public input through which the
-/// migration domain enters a relation.
-pub fn nullifier_midstate(curve: NullifierCurve, migration_domain: &[u8; 32]) -> [u32; 8] {
-    sha256_midstate(&nullifier_prefix(curve, migration_domain))
-}
-
-/// The nullifier of a signing scalar (big-endian for secp256k1, the little-endian clamped
-/// scalar for Ed25519) in a migration domain.
-pub fn migration_nullifier(
-    curve: NullifierCurve,
-    scalar: &[u8; 32],
-    migration_domain: &[u8; 32],
-) -> [u8; 32] {
-    let mut preimage = [0u8; 96];
-    preimage[..64].copy_from_slice(&nullifier_prefix(curve, migration_domain));
-    preimage[64..].copy_from_slice(scalar);
-    let out = sha2_native::sha256(&preimage);
-    wipe(&mut preimage);
-    out
-}
 
 /// SEC1 compressed public key of a big-endian secp256k1 secret key; `None` unless
 /// `1 <= k < n`.
@@ -133,19 +291,73 @@ pub fn secp256k1_public_key(key_be: &[u8; 32]) -> Option<[u8; 33]> {
         .flatten()
 }
 
-/// `HASH160` of the compressed public key (P2PKH and P2WPKH).
-pub fn bitcoin_hash160(key_be: &[u8; 32]) -> Option<[u8; 20]> {
-    secp256k1_public_key(key_be).map(|pk| sha2_native::hash160(&pk))
+fn secp256k1_uncompressed(key_be: &[u8; 32]) -> Option<[u8; 64]> {
+    secp_scalar_is_valid_nonzero(key_be)
+        .then(|| SecpPoint::generator_mul_ct(key_be).to_uncompressed_64())
+        .flatten()
 }
 
-/// Ethereum address: the last 20 bytes of `Keccak256(x || y)`.
-pub fn ethereum_address(key_be: &[u8; 32]) -> Option<[u8; 20]> {
-    if !secp_scalar_is_valid_nonzero(key_be) {
+/// BIP-341 `H_TapTweak(x || merkle_root)`.
+pub fn taproot_tweak(internal_x: &[u8; 32], merkle_root: Option<&[u8; 32]>) -> [u8; 32] {
+    let mut msg = internal_x.to_vec();
+    if let Some(root) = merkle_root {
+        msg.extend_from_slice(root);
+    }
+    sha2_native::sha256_tagged(b"TapTweak", &msg)
+}
+
+/// BIP-341 x-only output key for the internal key `[k]G`: `lift_x(P) + t G`. `None` when
+/// the key is invalid, the tweak is not below the group order or the result is infinity.
+pub fn taproot_output_key(key_be: &[u8; 32], merkle_root: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+    let internal = secp256k1_public_key(key_be)?;
+    let x: [u8; 32] = internal[1..].try_into().ok()?;
+    // `lift_x` takes the even point: its secret is `k` or `n - k`.
+    let mut even = if internal[0] == 3 {
+        secp_scalar_neg_mod_n(key_be)
+    } else {
+        *key_be
+    };
+    let tweak = taproot_tweak(&x, merkle_root);
+    if !secp_scalar_is_canonical(&tweak) {
         return None;
     }
-    let xy = SecpPoint::generator_mul_ct(key_be).to_uncompressed_64()?;
-    let digest = keccak256_native(&xy);
-    digest[12..].try_into().ok()
+    let mut output = secp_scalar_add_mod_n(&even, &tweak);
+    wipe(&mut even);
+    let out = secp256k1_public_key(&output)?[1..].try_into().ok();
+    wipe(&mut output);
+    out
+}
+
+/// The credential a secp256k1 key has under `lock`. `merkle_root` is used by
+/// [`Lock::TaprootScriptTree`] only.
+pub fn secp256k1_credential(
+    lock: Lock,
+    key_be: &[u8; 32],
+    merkle_root: Option<&[u8; 32]>,
+) -> Option<Credential> {
+    let compressed = secp256k1_public_key(key_be)?;
+    Some(match lock {
+        Lock::P2pkh => Credential::BitcoinKeyHash(sha2_native::hash160(&compressed)),
+        Lock::P2pkhUncompressed => {
+            let mut sec1 = vec![4u8];
+            sec1.extend_from_slice(&secp256k1_uncompressed(key_be)?);
+            Credential::BitcoinKeyHash(sha2_native::hash160(&sec1))
+        }
+        Lock::P2shP2wpkh => {
+            let mut script = vec![0u8, 0x14];
+            script.extend_from_slice(&sha2_native::hash160(&compressed));
+            Credential::BitcoinScriptHash(sha2_native::hash160(&script))
+        }
+        Lock::Ethereum => {
+            let digest = keccak256_native(&secp256k1_uncompressed(key_be)?);
+            Credential::EthereumAddress(digest[12..].try_into().ok()?)
+        }
+        Lock::TaprootKeyPath => Credential::BitcoinTaproot(taproot_output_key(key_be, None)?),
+        Lock::TaprootScriptTree => {
+            Credential::BitcoinTaproot(taproot_output_key(key_be, Some(merkle_root?))?)
+        }
+        Lock::Ed25519 => return None,
+    })
 }
 
 /// RFC 8032 secret scalar of a seed: the clamped first half of `SHA512(seed)`,
@@ -169,40 +381,48 @@ pub fn ed25519_public_key(seed: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// A BIP-32 extended private key without its metadata. Erased on drop.
+fn split64(mut i: [u8; 64]) -> ([u8; 32], [u8; 32]) {
+    let (mut left, mut right) = ([0u8; 32], [0u8; 32]);
+    left.copy_from_slice(&i[..32]);
+    right.copy_from_slice(&i[32..]);
+    wipe(&mut i);
+    (left, right)
+}
+
+/// First 32 bytes of `SHA512((key ^ ipad) || seed)`: the inner digest of the master HMAC,
+/// the nullifier secret of a seed-rooted BIP-32 statement.
+fn master_inner_digest(hmac_key: &[u8], seed: &[u8]) -> [u8; 32] {
+    let mut message = vec![0x36u8; 128];
+    for (m, k) in message.iter_mut().zip(hmac_key) {
+        *m ^= k;
+    }
+    message.extend_from_slice(seed);
+    let mut digest = sha2_native::sha512(&message);
+    wipe(&mut message);
+    let out = digest[..32].try_into().expect("32 bytes");
+    wipe(&mut digest);
+    out
+}
+
+/// A private key with its chain code: a BIP-32 secp256k1 node (`private_key` big-endian)
+/// or a SLIP-0010 Ed25519 node (`private_key` is an RFC 8032 seed). Erased on drop.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Bip32Node {
+pub struct HdNode {
     pub private_key: [u8; 32],
     pub chain_code: [u8; 32],
 }
 
-impl Drop for Bip32Node {
+impl Drop for HdNode {
     fn drop(&mut self) {
         wipe(&mut self.private_key);
         wipe(&mut self.chain_code);
     }
 }
 
-impl Bip32Node {
-    fn split(mut i: [u8; 64]) -> ([u8; 32], [u8; 32]) {
-        let (mut left, mut right) = ([0u8; 32], [0u8; 32]);
-        left.copy_from_slice(&i[..32]);
-        right.copy_from_slice(&i[32..]);
-        wipe(&mut i);
-        (left, right)
-    }
-
-    /// The compressed public key of this node.
-    pub fn public_key(&self) -> [u8; 33] {
-        secp256k1_public_key(&self.private_key).expect("node keys are valid scalars")
-    }
-}
-
 /// BIP-32 master key of a seed; `None` when `I_L` is zero or not below the group order.
-pub fn bip32_master(seed: &[u8]) -> Option<Bip32Node> {
-    let (private_key, chain_code) =
-        Bip32Node::split(sha2_native::hmac_sha512(b"Bitcoin seed", seed));
-    let node = Bip32Node {
+pub fn bip32_master(seed: &[u8]) -> Option<HdNode> {
+    let (private_key, chain_code) = split64(sha2_native::hmac_sha512(BIP32_MASTER_KEY, seed));
+    let node = HdNode {
         private_key,
         chain_code,
     };
@@ -211,19 +431,18 @@ pub fn bip32_master(seed: &[u8]) -> Option<Bip32Node> {
 
 /// BIP-32 private child derivation (`CKDpriv`); `None` when `I_L` is not below the group
 /// order or the child key is zero.
-pub fn bip32_child(parent: &Bip32Node, index: u32) -> Option<Bip32Node> {
+pub fn bip32_child(parent: &HdNode, index: u32) -> Option<HdNode> {
     let mut data = [0u8; 37];
-    if index >= BIP32_HARDENED {
+    if index >= HARDENED {
         data[1..33].copy_from_slice(&parent.private_key);
     } else {
-        data[..33].copy_from_slice(&parent.public_key());
+        data[..33].copy_from_slice(&secp256k1_public_key(&parent.private_key)?);
     }
     data[33..].copy_from_slice(&index.to_be_bytes());
-    let (mut tweak, chain_code) =
-        Bip32Node::split(sha2_native::hmac_sha512(&parent.chain_code, &data));
+    let (mut tweak, chain_code) = split64(sha2_native::hmac_sha512(&parent.chain_code, &data));
     wipe(&mut data);
     let in_range = secp_scalar_is_canonical(&tweak);
-    let node = Bip32Node {
+    let node = HdNode {
         private_key: secp_scalar_add_mod_n(&tweak, &parent.private_key),
         chain_code,
     };
@@ -231,244 +450,538 @@ pub fn bip32_child(parent: &Bip32Node, index: u32) -> Option<Bip32Node> {
     (in_range && secp_scalar_is_valid_nonzero(&node.private_key)).then_some(node)
 }
 
-/// The node at `m / path`.
-pub fn bip32_derive(seed: &[u8], path: &[u32]) -> Option<Bip32Node> {
+/// The BIP-32 node at `path` below `root`.
+pub fn bip32_descend(root: HdNode, path: &[u32]) -> Option<HdNode> {
     path.iter()
-        .try_fold(bip32_master(seed)?, |node, &index| bip32_child(&node, index))
+        .try_fold(root, |node, &index| bip32_child(&node, index))
+}
+
+/// The BIP-32 node at `m / path`.
+pub fn bip32_derive(seed: &[u8], path: &[u32]) -> Option<HdNode> {
+    bip32_descend(bip32_master(seed)?, path)
+}
+
+/// SLIP-0010 Ed25519 node at `m / path`; `None` unless every index is hardened.
+pub fn slip10_ed25519_derive(seed: &[u8], path: &[u32]) -> Option<HdNode> {
+    let (private_key, chain_code) = split64(sha2_native::hmac_sha512(SLIP10_ED25519_KEY, seed));
+    let mut node = HdNode {
+        private_key,
+        chain_code,
+    };
+    for &index in path {
+        if index < HARDENED {
+            return None;
+        }
+        let mut data = [0u8; 37];
+        data[1..33].copy_from_slice(&node.private_key);
+        data[33..].copy_from_slice(&index.to_be_bytes());
+        let (private_key, chain_code) = split64(sha2_native::hmac_sha512(&node.chain_code, &data));
+        wipe(&mut data);
+        node = HdNode {
+            private_key,
+            chain_code,
+        };
+    }
+    Some(node)
+}
+
+/// A BIP32-Ed25519 extended private key `k_L || k_R || chain code` (Khovratovich and Law,
+/// `2017-khovratovich-law-bip32-ed25519-hierarchical-deterministic-keys-nonlinear-keyspace`,
+/// section V; the scheme Cardano deploys). Erased on drop.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Ed25519ExtendedKey(pub [u8; 96]);
+
+impl Drop for Ed25519ExtendedKey {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+impl Ed25519ExtendedKey {
+    /// `[k_L] B`.
+    pub fn public_key(&self) -> [u8; 32] {
+        public_key_from_clamped_scalar(self.0[..32].try_into().expect("32 bytes"))
+    }
+
+    /// Child derivation: `Z = HMAC(c, 00 || k_L || k_R || i)` for a hardened index and
+    /// `HMAC(c, 02 || A || i)` otherwise, `k_L' = k_L + 8 Z[0..28]`, `k_R' = k_R + Z[32..64]`
+    /// (both modulo `2^256`, little-endian), and the chain code is the right half of the
+    /// same HMAC with the tag `01` or `03`. The index is little-endian.
+    pub fn child(&self, index: u32) -> Self {
+        let (mut z_data, tag) = if index >= HARDENED {
+            (self.0[..64].to_vec(), 0u8)
+        } else {
+            (self.public_key().to_vec(), 2u8)
+        };
+        z_data.insert(0, tag);
+        z_data.extend_from_slice(&index.to_le_bytes());
+        let mut z = sha2_native::hmac_sha512(&self.0[64..], &z_data);
+        z_data[0] = tag + 1;
+        let mut c = sha2_native::hmac_sha512(&self.0[64..], &z_data);
+        wipe(&mut z_data);
+
+        let mut out = [0u8; 96];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let add = if i < 28 { u16::from(z[i]) << 3 } else { 0 };
+            let v = u16::from(self.0[i]) + add + carry;
+            out[i] = v as u8;
+            carry = v >> 8;
+        }
+        carry = 0;
+        for i in 32..64 {
+            let v = u16::from(self.0[i]) + u16::from(z[i]) + carry;
+            out[i] = v as u8;
+            carry = v >> 8;
+        }
+        out[64..].copy_from_slice(&c[32..]);
+        wipe(&mut z);
+        wipe(&mut c);
+        Self(out)
+    }
+
+    /// The key at `path` below this one.
+    pub fn descend(&self, path: &[u32]) -> Self {
+        path.iter().fold(self.clone(), |key, &i| key.child(i))
+    }
+}
+
+/// BIP-39 seed of a mnemonic sentence and passphrase:
+/// `PBKDF2-HMAC-SHA512(mnemonic, "mnemonic" || passphrase, 2048, 64)`. Both strings must
+/// already be in Unicode NFKD form (ASCII text is).
+pub fn bip39_seed(mnemonic_nfkd: &str, passphrase_nfkd: &str) -> [u8; 64] {
+    let mut salt = b"mnemonic".to_vec();
+    salt.extend_from_slice(passphrase_nfkd.as_bytes());
+    salt.extend_from_slice(&1u32.to_be_bytes());
+    let mut u = sha2_native::hmac_sha512(mnemonic_nfkd.as_bytes(), &salt);
+    let mut out = u;
+    for _ in 1..2048 {
+        u = sha2_native::hmac_sha512(mnemonic_nfkd.as_bytes(), &u);
+        for (o, x) in out.iter_mut().zip(&u) {
+            *o ^= x;
+        }
+    }
+    wipe(&mut u);
+    wipe(&mut salt);
+    out
+}
+
+/// The 128 public bytes that precede the secret in a nullifier preimage.
+pub fn nullifier_prefix(kind: u8, migration_domain: &[u8; 32], credential: &Credential) -> [u8; 128] {
+    let mut out = [0u8; 128];
+    out[..29].copy_from_slice(NULLIFIER_TAG);
+    out[29] = kind;
+    out[32..64].copy_from_slice(migration_domain);
+    out[64..96].copy_from_slice(&credential.identifier());
+    out
+}
+
+/// The nullifier of `secret` (see the module documentation for what the secret is for
+/// each `kind`) for one credential in one migration domain.
+pub fn migration_nullifier(
+    kind: u8,
+    secret: &[u8; 32],
+    migration_domain: &[u8; 32],
+    credential: &Credential,
+) -> [u8; 32] {
+    let mut preimage = nullifier_prefix(kind, migration_domain, credential).to_vec();
+    preimage.extend_from_slice(secret);
+    let out = sha2_native::sha256(&preimage);
+    wipe(&mut preimage);
+    out
 }
 
 // ============================================================================
 // Statements
 // ============================================================================
 
-/// What a statement claims about a legacy credential.
+/// A derivation path as part of a statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LegacyClaim {
-    /// Hidden key: `HASH160` of the compressed secp256k1 public key.
-    BitcoinHash160([u8; 20]),
-    /// Hidden key: Ethereum address of the secp256k1 public key.
-    EthereumAddress([u8; 20]),
-    /// Revealed key: an Ed25519 public key whose RFC 8032 seed the prover knows.
-    Ed25519Seed { public_key: [u8; 32] },
-    /// Revealed key: the compressed secp256k1 public key at `m / path` of a master seed of
-    /// `seed_len` bytes that the prover knows.
-    Bip32Secp256k1 {
-        public_key: [u8; 33],
-        seed_len: u8,
-        path: Vec<u32>,
-    },
+pub enum PathSpec {
+    /// The path is public and selects the relation.
+    Public(Vec<u32>),
+    /// The indices, their hardened flags and the depth (at most `max_depth`) are witness.
+    Hidden { max_depth: u8 },
 }
 
-/// The kind of claim to derive from a witness (see [`OwnershipStatement::derive`]).
+/// Where a BIP-32 statement starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Bip32Root {
+    /// The master seed (16 to 64 bytes, length hidden).
+    Seed = 0,
+    /// An extended private key (key and chain code). Sound only while no extended public
+    /// key at or above it has been exported; see the module documentation.
+    ExtendedKey = 1,
+}
+
+/// What the prover knows about the key behind the credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClaimKind {
-    BitcoinHash160,
-    EthereumAddress,
+pub enum KeySource {
+    /// The secp256k1 secret key (hidden-key mode).
+    Secp256k1Key,
+    /// A BIP-32 root and a path to the secp256k1 key.
+    Bip32 { root: Bip32Root, path: PathSpec },
+    /// The RFC 8032 seed of the Ed25519 key.
     Ed25519Seed,
-    Bip32Secp256k1 { path: Vec<u32> },
+    /// A SLIP-0010 master seed and an all-hardened path to the Ed25519 key.
+    Slip10 { path: PathSpec },
+    /// A BIP32-Ed25519 extended private key and a public path to the Ed25519 key.
+    Bip32Ed25519 { path: Vec<u32> },
 }
 
-/// What selects a relation: the claim without its values.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Relation {
-    BitcoinHash160,
-    EthereumAddress,
-    Ed25519Seed,
-    Bip32Secp256k1 { seed_len: usize, path: Vec<u32> },
-}
-
-impl Relation {
-    fn claim_bytes(&self) -> usize {
+impl KeySource {
+    fn tag(&self) -> u8 {
         match self {
-            Self::BitcoinHash160 | Self::EthereumAddress => 20,
-            Self::Ed25519Seed => 32,
-            Self::Bip32Secp256k1 { .. } => 33,
+            Self::Secp256k1Key => 1,
+            Self::Bip32 { .. } => 2,
+            Self::Ed25519Seed => 3,
+            Self::Slip10 { .. } => 4,
+            Self::Bip32Ed25519 { .. } => 5,
         }
     }
 
-    fn secret_bytes(&self) -> usize {
+    fn curve(&self) -> Curve {
         match self {
-            Self::Bip32Secp256k1 { seed_len, .. } => *seed_len,
-            _ => 32,
+            Self::Secp256k1Key | Self::Bip32 { .. } => Curve::Secp256k1,
+            _ => Curve::Ed25519,
         }
     }
 
-    fn curve(&self) -> NullifierCurve {
+    /// The `kind` byte of the nullifier preimage.
+    fn nullifier_kind(&self) -> u8 {
         match self {
-            Self::Ed25519Seed => NullifierCurve::Ed25519,
-            _ => NullifierCurve::Secp256k1,
+            Self::Secp256k1Key => 1,
+            Self::Bip32 {
+                root: Bip32Root::Seed,
+                ..
+            } => 2,
+            Self::Ed25519Seed | Self::Slip10 { .. } => 3,
+            Self::Bip32Ed25519 { .. } => 5,
+            Self::Bip32 {
+                root: Bip32Root::ExtendedKey,
+                ..
+            } => 7,
         }
     }
 
-    /// A valid secret of the right length, for building the shape without a witness.
-    fn placeholder_secret(&self) -> Vec<u8> {
-        let mut secret = vec![0u8; self.secret_bytes()];
-        if matches!(self, Self::BitcoinHash160 | Self::EthereumAddress) {
-            secret[31] = 1;
-        }
-        secret
-    }
-}
-
-impl LegacyClaim {
-    /// Wire tag of the claim kind.
-    pub fn tag(&self) -> u8 {
-        match self {
-            Self::BitcoinHash160(_) => 1,
-            Self::EthereumAddress(_) => 2,
-            Self::Ed25519Seed { .. } => 3,
-            Self::Bip32Secp256k1 { .. } => 4,
-        }
+    /// Whether the statement stays sound once the public key is public.
+    pub fn proves_seed_provenance(&self) -> bool {
+        !matches!(self, Self::Secp256k1Key)
     }
 
-    /// Whether the legacy public key itself is public (`KeyExposure::Revealed`).
-    pub fn key_is_revealed(&self) -> bool {
-        matches!(self, Self::Ed25519Seed { .. } | Self::Bip32Secp256k1 { .. })
-    }
-
-    /// The legacy commitment the registry indexes. A BIP-32 public key is recorded under
-    /// its Bitcoin `HASH160`, the same identifier as a hidden-key migration of that key.
-    pub fn legacy_commitment(&self) -> LegacyCommitmentKind {
-        match self {
-            Self::BitcoinHash160(h) => LegacyCommitmentKind::BitcoinHash160(*h),
-            Self::EthereumAddress(a) => LegacyCommitmentKind::EthereumKeccak20(*a),
-            Self::Ed25519Seed { public_key } => LegacyCommitmentKind::Slip0010Ed25519(*public_key),
-            Self::Bip32Secp256k1 { public_key, .. } => {
-                LegacyCommitmentKind::BitcoinHash160(sha2_native::hash160(public_key))
+    fn is_well_formed(&self) -> bool {
+        let spec_ok = |spec: &PathSpec, hardened_only: bool| match spec {
+            PathSpec::Public(path) => {
+                path.len() <= MAX_PATH_DEPTH && (!hardened_only || path.iter().all(|&i| i >= HARDENED))
             }
-        }
-    }
-
-    fn value(&self) -> &[u8] {
+            PathSpec::Hidden { max_depth } => (1..=MAX_PATH_DEPTH).contains(&usize::from(*max_depth)),
+        };
         match self {
-            Self::BitcoinHash160(v) | Self::EthereumAddress(v) => v,
-            Self::Ed25519Seed { public_key } => public_key,
-            Self::Bip32Secp256k1 { public_key, .. } => public_key,
+            Self::Secp256k1Key | Self::Ed25519Seed => true,
+            Self::Bip32 { path, .. } => spec_ok(path, false),
+            Self::Slip10 { path } => spec_ok(path, true),
+            Self::Bip32Ed25519 { path } => path.len() <= MAX_PATH_DEPTH,
         }
     }
 
-    fn relation(&self) -> Option<Relation> {
-        Some(match self {
-            Self::BitcoinHash160(_) => Relation::BitcoinHash160,
-            Self::EthereumAddress(_) => Relation::EthereumAddress,
-            Self::Ed25519Seed { .. } => Relation::Ed25519Seed,
-            Self::Bip32Secp256k1 {
-                public_key,
-                seed_len,
-                path,
-            } => {
-                let seed_len = usize::from(*seed_len);
-                if !BIP32_SEED_BYTES.contains(&seed_len)
-                    || path.len() > MAX_BIP32_DEPTH
-                    || !matches!(public_key[0], 2 | 3)
-                {
-                    return None;
-                }
-                Relation::Bip32Secp256k1 {
-                    seed_len,
-                    path: path.clone(),
+    fn encode(&self, out: &mut Vec<u8>) {
+        let spec = |out: &mut Vec<u8>, spec: &PathSpec| match spec {
+            PathSpec::Public(path) => {
+                out.push(0);
+                out.push(path.len() as u8);
+                for index in path {
+                    out.extend_from_slice(&index.to_be_bytes());
                 }
             }
+            PathSpec::Hidden { max_depth } => out.extend_from_slice(&[1, *max_depth]),
+        };
+        out.push(self.tag());
+        match self {
+            Self::Secp256k1Key | Self::Ed25519Seed => {}
+            Self::Bip32 { root, path } => {
+                out.push(*root as u8);
+                spec(out, path);
+            }
+            Self::Slip10 { path } => spec(out, path),
+            Self::Bip32Ed25519 { path } => spec(out, &PathSpec::Public(path.clone())),
+        }
+    }
+
+    fn decode(take: &mut dyn FnMut(usize) -> Option<Vec<u8>>) -> Option<Self> {
+        let spec = |take: &mut dyn FnMut(usize) -> Option<Vec<u8>>| -> Option<PathSpec> {
+            let head = take(2)?;
+            match head[0] {
+                0 => Some(PathSpec::Public(
+                    take(4 * usize::from(head[1]))?
+                        .chunks_exact(4)
+                        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                )),
+                1 => Some(PathSpec::Hidden { max_depth: head[1] }),
+                _ => None,
+            }
+        };
+        Some(match take(1)?[0] {
+            1 => Self::Secp256k1Key,
+            2 => {
+                let root = match take(1)?[0] {
+                    0 => Bip32Root::Seed,
+                    1 => Bip32Root::ExtendedKey,
+                    _ => return None,
+                };
+                Self::Bip32 {
+                    root,
+                    path: spec(take)?,
+                }
+            }
+            3 => Self::Ed25519Seed,
+            4 => Self::Slip10 { path: spec(take)? },
+            5 => match spec(take)? {
+                PathSpec::Public(path) => Self::Bip32Ed25519 { path },
+                PathSpec::Hidden { .. } => return None,
+            },
+            _ => return None,
         })
     }
 }
 
-/// The secret behind a legacy credential. Erased on drop.
+/// The secret behind a credential. Erased on drop.
 #[derive(Clone, PartialEq, Eq)]
-pub enum OwnershipWitness {
-    /// Big-endian secp256k1 secret key.
-    Secp256k1Key([u8; 32]),
-    /// RFC 8032 Ed25519 seed.
-    Ed25519Seed([u8; 32]),
-    /// BIP-32 master seed, 16 to 64 bytes.
-    Bip32Seed(Vec<u8>),
-}
-
-impl OwnershipWitness {
-    fn secret(&self) -> &[u8] {
-        match self {
-            Self::Secp256k1Key(k) => k,
-            Self::Ed25519Seed(s) => s,
-            Self::Bip32Seed(s) => s,
-        }
-    }
+pub struct OwnershipWitness {
+    secret: Vec<u8>,
+    path: Vec<u32>,
+    merkle_root: Option<[u8; 32]>,
 }
 
 impl Drop for OwnershipWitness {
     fn drop(&mut self) {
-        match self {
-            Self::Secp256k1Key(k) => wipe(k),
-            Self::Ed25519Seed(s) => wipe(s),
-            Self::Bip32Seed(s) => wipe(s),
+        wipe(&mut self.secret);
+        dregg_sig_asm::volatile_fill(&mut self.path, 0);
+        if let Some(root) = &mut self.merkle_root {
+            wipe(root);
         }
     }
 }
 
-/// The claim a witness supports and the signing scalar its nullifier is derived from.
-/// `None` when the witness is of the wrong type or is not a valid secret for `kind`.
-fn evaluate(kind: &ClaimKind, witness: &OwnershipWitness) -> Option<(LegacyClaim, [u8; 32])> {
-    match (kind, witness) {
-        (ClaimKind::BitcoinHash160, OwnershipWitness::Secp256k1Key(k)) => {
-            Some((LegacyClaim::BitcoinHash160(bitcoin_hash160(k)?), *k))
+impl OwnershipWitness {
+    fn new(secret: &[u8]) -> Self {
+        Self {
+            secret: secret.to_vec(),
+            path: Vec::new(),
+            merkle_root: None,
         }
-        (ClaimKind::EthereumAddress, OwnershipWitness::Secp256k1Key(k)) => {
-            Some((LegacyClaim::EthereumAddress(ethereum_address(k)?), *k))
+    }
+
+    /// A big-endian secp256k1 secret key, for [`KeySource::Secp256k1Key`].
+    pub fn secp256k1_key(key_be: &[u8; 32]) -> Self {
+        Self::new(key_be)
+    }
+
+    /// An RFC 8032 seed, for [`KeySource::Ed25519Seed`].
+    pub fn ed25519_seed(seed: &[u8; 32]) -> Self {
+        Self::new(seed)
+    }
+
+    /// A master seed of 16 to 64 bytes, for seed-rooted [`KeySource::Bip32`] and for
+    /// [`KeySource::Slip10`].
+    pub fn seed(seed: &[u8]) -> Self {
+        Self::new(seed)
+    }
+
+    /// A BIP-32 extended private key, for [`Bip32Root::ExtendedKey`].
+    pub fn extended_key(node: &HdNode) -> Self {
+        let mut secret = node.private_key.to_vec();
+        secret.extend_from_slice(&node.chain_code);
+        let out = Self::new(&secret);
+        wipe(&mut secret);
+        out
+    }
+
+    /// A BIP32-Ed25519 extended private key, for [`KeySource::Bip32Ed25519`].
+    pub fn ed25519_extended_key(key: &Ed25519ExtendedKey) -> Self {
+        Self::new(&key.0)
+    }
+
+    /// The derivation path, for a statement whose path is [`PathSpec::Hidden`].
+    pub fn with_path(mut self, path: &[u32]) -> Self {
+        self.path = path.to_vec();
+        self
+    }
+
+    /// The script tree's merkle root, for [`Lock::TaprootScriptTree`].
+    pub fn with_merkle_root(mut self, root: [u8; 32]) -> Self {
+        self.merkle_root = Some(root);
+        self
+    }
+}
+
+/// What a witness yields natively.
+struct Evaluated {
+    credential: Credential,
+    nullifier_secret: [u8; 32],
+}
+
+impl Drop for Evaluated {
+    fn drop(&mut self) {
+        wipe(&mut self.nullifier_secret);
+    }
+}
+
+/// The path a witness takes through `spec`; `None` when it does not fit.
+fn resolve_path<'a>(spec: &'a PathSpec, witness: &'a OwnershipWitness) -> Option<&'a [u32]> {
+    match spec {
+        PathSpec::Public(path) => Some(path),
+        PathSpec::Hidden { max_depth } => {
+            (witness.path.len() <= usize::from(*max_depth)).then_some(&witness.path)
         }
-        (ClaimKind::Ed25519Seed, OwnershipWitness::Ed25519Seed(seed)) => Some((
-            LegacyClaim::Ed25519Seed {
-                public_key: ed25519_public_key(seed),
-            },
-            ed25519_clamped_scalar(seed),
-        )),
-        (ClaimKind::Bip32Secp256k1 { path }, OwnershipWitness::Bip32Seed(seed)) => {
-            if !BIP32_SEED_BYTES.contains(&seed.len()) || path.len() > MAX_BIP32_DEPTH {
+    }
+}
+
+fn bip32_root_node(root: Bip32Root, secret: &[u8]) -> Option<HdNode> {
+    match root {
+        Bip32Root::Seed => SEED_BYTES
+            .contains(&secret.len())
+            .then(|| bip32_master(secret))
+            .flatten(),
+        Bip32Root::ExtendedKey => {
+            let node = HdNode {
+                private_key: secret.get(..32)?.try_into().ok()?,
+                chain_code: secret.get(32..)?.try_into().ok()?,
+            };
+            secp_scalar_is_valid_nonzero(&node.private_key).then_some(node)
+        }
+    }
+}
+
+fn bip32_nullifier_secret(root: Bip32Root, secret: &[u8]) -> [u8; 32] {
+    match root {
+        Bip32Root::Seed => master_inner_digest(BIP32_MASTER_KEY, secret),
+        Bip32Root::ExtendedKey => secret[32..64].try_into().expect("checked length"),
+    }
+}
+
+/// The credential and nullifier secret of a witness; `None` when the witness does not fit
+/// the lock and source or is not a valid secret for them.
+fn evaluate(lock: Lock, source: &KeySource, witness: &OwnershipWitness) -> Option<Evaluated> {
+    if lock.curve() != source.curve() || !source.is_well_formed() {
+        return None;
+    }
+    let secret = witness.secret.as_slice();
+    let root = witness.merkle_root.as_ref();
+    match source {
+        KeySource::Secp256k1Key => {
+            let key: [u8; 32] = secret.try_into().ok()?;
+            Some(Evaluated {
+                credential: secp256k1_credential(lock, &key, root)?,
+                nullifier_secret: key,
+            })
+        }
+        KeySource::Bip32 { root: start, path } => {
+            let node = bip32_descend(bip32_root_node(*start, secret)?, resolve_path(path, witness)?)?;
+            Some(Evaluated {
+                credential: secp256k1_credential(lock, &node.private_key, root)?,
+                nullifier_secret: bip32_nullifier_secret(*start, secret),
+            })
+        }
+        KeySource::Ed25519Seed => {
+            let seed: [u8; 32] = secret.try_into().ok()?;
+            Some(Evaluated {
+                credential: Credential::Ed25519Key(ed25519_public_key(&seed)),
+                nullifier_secret: seed,
+            })
+        }
+        KeySource::Slip10 { path } => {
+            if !SEED_BYTES.contains(&secret.len()) {
                 return None;
             }
-            let node = bip32_derive(seed, path)?;
-            Some((
-                LegacyClaim::Bip32Secp256k1 {
-                    public_key: node.public_key(),
-                    seed_len: seed.len() as u8,
-                    path: path.clone(),
-                },
-                node.private_key,
-            ))
+            let node = slip10_ed25519_derive(secret, resolve_path(path, witness)?)?;
+            Some(Evaluated {
+                credential: Credential::Ed25519Key(ed25519_public_key(&node.private_key)),
+                nullifier_secret: node.private_key,
+            })
         }
-        _ => None,
+        KeySource::Bip32Ed25519 { path } => {
+            let leaf = Ed25519ExtendedKey(secret.try_into().ok()?).descend(path);
+            // A scalar that is zero modulo the group order has no public key in the relation.
+            let public_key = leaf.public_key();
+            let identity = {
+                let mut id = [0u8; 32];
+                id[0] = 1;
+                id
+            };
+            (public_key != identity).then(|| Evaluated {
+                credential: Credential::Ed25519Key(public_key),
+                nullifier_secret: leaf.0[32..64].try_into().expect("32 bytes"),
+            })
+        }
     }
 }
 
 /// Public statement of an ownership proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipStatement {
-    pub claim: LegacyClaim,
+    pub lock: Lock,
+    pub source: KeySource,
+    /// The on-chain credential; its type is the one `lock` produces.
+    pub credential: Credential,
     /// Commitment to the post-quantum address the credential migrates to
     /// (`registry::pq_commitment`). Chosen by the caller; not derived from the secret.
     pub pq_commitment: [u8; 32],
     /// Replay domain of the migration campaign.
     pub migration_domain: [u8; 32],
     pub epoch: u64,
-    /// [`migration_nullifier`] of the signing scalar in `migration_domain`.
+    /// [`migration_nullifier`] for this credential and domain.
     pub nullifier: [u8; 32],
+}
+
+fn byte_bits(bytes: &[u8]) -> impl Iterator<Item = bool> + '_ {
+    bytes
+        .iter()
+        .flat_map(|&b| (0..8).map(move |i| (b >> i) & 1 == 1))
+}
+
+/// Public inputs of one credential: its value, the nullifier chaining value (eight words,
+/// each least significant bit first) and the nullifier. Bytes are least significant bit
+/// first.
+fn credential_public_bits(
+    out: &mut Vec<bool>,
+    kind: u8,
+    credential: &Credential,
+    migration_domain: &[u8; 32],
+    nullifier: &[u8; 32],
+) {
+    out.extend(byte_bits(credential.value()));
+    for word in sha256_midstate(&nullifier_prefix(kind, migration_domain, credential)) {
+        out.extend((0..32).map(|i| (word >> i) & 1 == 1));
+    }
+    out.extend(byte_bits(nullifier));
 }
 
 impl OwnershipStatement {
     /// The statement a holder derives from its secret. `None` when the witness does not
-    /// fit `kind` or is not a valid secret (a scalar outside `1..n`, a seed of the wrong
-    /// length, a path BIP-32 rejects or one longer than [`MAX_BIP32_DEPTH`]).
+    /// fit the lock and source or is not a valid secret for them (a scalar outside `1..n`,
+    /// a seed of the wrong length, a derivation BIP-32 rejects, a path longer than the
+    /// source admits, a missing merkle root).
     pub fn derive(
-        kind: &ClaimKind,
+        lock: Lock,
+        source: KeySource,
         witness: &OwnershipWitness,
         pq_commitment: [u8; 32],
         migration_domain: [u8; 32],
         epoch: u64,
     ) -> Option<Self> {
-        let (claim, mut scalar) = evaluate(kind, witness)?;
-        let curve = claim.relation()?.curve();
-        let nullifier = migration_nullifier(curve, &scalar, &migration_domain);
-        wipe(&mut scalar);
+        let evaluated = evaluate(lock, &source, witness)?;
+        let nullifier = migration_nullifier(
+            source.nullifier_kind(),
+            &evaluated.nullifier_secret,
+            &migration_domain,
+            &evaluated.credential,
+        );
         Some(Self {
-            claim,
+            lock,
+            credential: evaluated.credential,
+            source,
             pq_commitment,
             migration_domain,
             epoch,
@@ -476,124 +989,95 @@ impl OwnershipStatement {
         })
     }
 
-    /// Whether the claim's parameters are within the supported ranges.
+    /// Whether lock, source and credential type fit together and the source's parameters
+    /// are within the supported ranges.
     pub fn is_well_formed(&self) -> bool {
-        self.claim.relation().is_some()
+        self.lock.curve() == self.source.curve()
+            && self.source.is_well_formed()
+            && self.lock.credential(self.credential.value()) == Some(self.credential)
+    }
+
+    /// Whether the statement stays sound when the legacy public key is public
+    /// (`KeyExposure::Revealed`).
+    pub fn key_is_revealed(&self) -> bool {
+        self.source.proves_seed_provenance()
     }
 
     /// Canonical encoding; also the bytes the proof transcript absorbs.
     ///
-    /// `tag(29) || kind || exposure || epoch(8, BE) || domain(32) || pq(32) || nullifier(32)
-    /// || claim`, where the claim is its 20, 32 or 33 value bytes, followed for BIP-32 by
-    /// `seed_len || depth || depth * index(4, BE)`.
+    /// `tag(29) || lock || exposure || epoch(8, BE) || domain(32) || pq(32) || nullifier(32)
+    /// || credential value (20 or 32) || source`, where the source is its kind byte, for
+    /// BIP-32 the root byte, and for sources with a path `00 || depth || depth * index(4,
+    /// BE)` (public) or `01 || max_depth` (hidden).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(200);
         out.extend_from_slice(STATEMENT_TAG);
-        out.push(self.claim.tag());
-        out.push(u8::from(self.claim.key_is_revealed()));
+        out.push(self.lock as u8);
+        out.push(u8::from(self.key_is_revealed()));
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.migration_domain);
         out.extend_from_slice(&self.pq_commitment);
         out.extend_from_slice(&self.nullifier);
-        out.extend_from_slice(self.claim.value());
-        if let LegacyClaim::Bip32Secp256k1 { seed_len, path, .. } = &self.claim {
-            out.push(*seed_len);
-            out.push(path.len() as u8);
-            for index in path {
-                out.extend_from_slice(&index.to_be_bytes());
-            }
-        }
+        out.extend_from_slice(self.credential.value());
+        self.source.encode(&mut out);
         out
     }
 
     /// Strict inverse of [`Self::to_bytes`]: rejects unknown kinds, an exposure byte that
-    /// does not match the kind, parameters outside the supported ranges and any byte
-    /// missing or left over.
+    /// does not match the source, a lock and source of different curves, parameters
+    /// outside the supported ranges and any byte missing or left over.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut rest = bytes.strip_prefix(STATEMENT_TAG.as_slice())?;
-        let mut take = |n: usize| -> Option<&[u8]> {
+        let mut take = |n: usize| -> Option<Vec<u8>> {
             let (head, tail) = rest.split_at_checked(n)?;
             rest = tail;
-            Some(head)
+            Some(head.to_vec())
         };
-        let (kind, exposure) = (take(1)?[0], take(1)?[0]);
+        let lock = Lock::from_tag(take(1)?[0])?;
+        let exposure = take(1)?[0];
         let epoch = u64::from_be_bytes(take(8)?.try_into().ok()?);
         let migration_domain: [u8; 32] = take(32)?.try_into().ok()?;
         let pq_commitment: [u8; 32] = take(32)?.try_into().ok()?;
         let nullifier: [u8; 32] = take(32)?.try_into().ok()?;
-        let claim = match kind {
-            1 => LegacyClaim::BitcoinHash160(take(20)?.try_into().ok()?),
-            2 => LegacyClaim::EthereumAddress(take(20)?.try_into().ok()?),
-            3 => LegacyClaim::Ed25519Seed {
-                public_key: take(32)?.try_into().ok()?,
-            },
-            4 => {
-                let public_key: [u8; 33] = take(33)?.try_into().ok()?;
-                let (seed_len, depth) = (take(1)?[0], take(1)?[0]);
-                let path = take(4 * usize::from(depth))?
-                    .chunks_exact(4)
-                    .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                LegacyClaim::Bip32Secp256k1 {
-                    public_key,
-                    seed_len,
-                    path,
-                }
-            }
-            _ => return None,
-        };
+        let credential = lock.credential(&take(lock.credential_bytes())?)?;
+        let source = KeySource::decode(&mut take)?;
         let statement = Self {
-            claim,
+            lock,
+            source,
+            credential,
             pq_commitment,
             migration_domain,
             epoch,
             nullifier,
         };
         (rest.is_empty()
-            && exposure == u8::from(statement.claim.key_is_revealed())
+            && exposure == u8::from(statement.key_is_revealed())
             && statement.is_well_formed())
         .then_some(statement)
     }
 
-    /// The relation's public inputs, one per bit: the claim value, the nullifier chaining
-    /// value (eight words, each least significant bit first), the nullifier. Bytes are
-    /// least significant bit first. `None` for a malformed statement.
+    fn public_bits(&self) -> Vec<bool> {
+        let mut out = Vec::with_capacity(8 * self.lock.credential_bytes() + 512);
+        credential_public_bits(
+            &mut out,
+            self.source.nullifier_kind(),
+            &self.credential,
+            &self.migration_domain,
+            &self.nullifier,
+        );
+        out
+    }
+
+    /// The relation's public inputs, one per bit. `None` for a malformed statement.
     pub fn public_inputs(&self) -> Option<Vec<F>> {
-        let relation = self.claim.relation()?;
-        Some(
-            self.public_bits(&relation)
-                .into_iter()
-                .map(|b| F::from_u64_reduced(u64::from(b)))
-                .collect(),
-        )
-    }
-
-    fn public_bits(&self, relation: &Relation) -> Vec<bool> {
-        let byte_bits = |bytes: &[u8]| -> Vec<bool> {
-            bytes
-                .iter()
-                .flat_map(|&b| (0..8).map(move |i| (b >> i) & 1 == 1))
-                .collect()
-        };
-        let mut out = byte_bits(self.claim.value());
-        for word in nullifier_midstate(relation.curve(), &self.migration_domain) {
-            out.extend((0..32).map(|i| (word >> i) & 1 == 1));
-        }
-        out.extend(byte_bits(&self.nullifier));
-        out
-    }
-
-    /// The bytes absorbed by the proof transcript.
-    fn transcript(&self, regime: WhirSecurityRegime) -> Vec<u8> {
-        let mut out = self.to_bytes();
-        out.push(regime as u8);
-        out
+        self.is_well_formed()
+            .then(|| self.public_bits().into_iter().map(|b| fu(u64::from(b))).collect())
     }
 
     /// The exposure mode the registry records for this statement.
     #[cfg(feature = "std")]
     pub fn exposure(&self) -> super::registry::KeyExposure {
-        if self.claim.key_is_revealed() {
+        if self.key_is_revealed() {
             super::registry::KeyExposure::Revealed
         } else {
             super::registry::KeyExposure::Hidden
@@ -606,7 +1090,7 @@ impl OwnershipStatement {
         super::registry::MigrationBinding {
             nullifier: self.nullifier,
             migration_domain: self.migration_domain,
-            legacy_id: super::registry::legacy_identifier(&self.claim.legacy_commitment()),
+            legacy_id: self.credential.identifier(),
             pq_commitment: self.pq_commitment,
             epoch: self.epoch,
             exposure: self.exposure(),
@@ -615,7 +1099,7 @@ impl OwnershipStatement {
 }
 
 // ============================================================================
-// Relations
+// Relation gadgets
 // ============================================================================
 
 /// Reverse the byte order of a byte string: a big-endian integer's bytes become its
@@ -632,6 +1116,145 @@ fn pin(cs: &mut ConstraintSystem, got: &[Lc], want: &[Lc]) {
     }
 }
 
+fn alloc_bool(cs: &mut ConstraintSystem, value: bool) -> Lc {
+    let bit: Lc = cs.alloc(fu(u64::from(value))).into();
+    cs.enforce_boolean(&bit);
+    bit
+}
+
+fn select_bits(cs: &mut ConstraintSystem, bit: &Lc, on_one: &[Lc], on_zero: &[Lc]) -> Vec<Lc> {
+    assert_eq!(on_one.len(), on_zero.len());
+    on_one
+        .iter()
+        .zip(on_zero)
+        .map(|(a, b)| select(cs, bit, a, b))
+        .collect()
+}
+
+fn flat(bytes: Vec<[Lc; 8]>) -> Vec<Lc> {
+    bytes.into_iter().flatten().collect()
+}
+
+/// `bits <= n - 1` for little-endian bits and the secp256k1 group order.
+fn enforce_below_order(cs: &mut ConstraintSystem, order: &Modulus, bits_le: &[Lc]) -> Element {
+    let element = Element {
+        bytes_le: bits_le.chunks(8).map(pack_bits).collect(),
+        bits_le: bits_le.to_vec(),
+    };
+    order.enforce_canonical(cs, &element);
+    element
+}
+
+/// One derivation step's index.
+enum Step {
+    Public(u32),
+    /// `active` is zero for the unused tail of a hidden path; `bits` are the 32 index
+    /// bits, least significant first.
+    Hidden { active: Lc, bits: Vec<Lc> },
+}
+
+impl Step {
+    /// The index as four big-endian bytes.
+    fn be_bits(&self) -> Vec<Lc> {
+        match self {
+            Self::Public(index) => const_bits(&index.to_be_bytes()),
+            Self::Hidden { bits, .. } => reverse_bytes(bits),
+        }
+    }
+}
+
+/// The steps of a path. A hidden path's flags are a Boolean prefix indicator: once a step
+/// is inactive every later one is. With `hardened_only` the top index bit is the
+/// constant one.
+fn alloc_steps(
+    cs: &mut ConstraintSystem,
+    spec: &PathSpec,
+    witness_path: &[u32],
+    hardened_only: bool,
+) -> Vec<Step> {
+    match spec {
+        PathSpec::Public(path) => path.iter().map(|&i| Step::Public(i)).collect(),
+        PathSpec::Hidden { max_depth } => {
+            let mut previous: Option<Lc> = None;
+            (0..usize::from(*max_depth))
+                .map(|j| {
+                    let index = witness_path.get(j).copied().unwrap_or(0);
+                    let active = alloc_bool(cs, j < witness_path.len());
+                    if let Some(before) = &previous {
+                        cs.enforce_mul(
+                            active.clone(),
+                            Lc::constant(F::ONE).minus(before),
+                            Lc::zero(),
+                        );
+                    }
+                    previous = Some(active.clone());
+                    let mut bits: Vec<Lc> = (0..31)
+                        .map(|k| alloc_bool(cs, (index >> k) & 1 == 1))
+                        .collect();
+                    bits.push(if hardened_only {
+                        Lc::constant(F::ONE)
+                    } else {
+                        alloc_bool(cs, index >= HARDENED)
+                    });
+                    Step::Hidden { active, bits }
+                })
+                .collect()
+        }
+    }
+}
+
+/// `HMAC-SHA512(hmac_key, seed)` for a constant key and a seed of hidden length in
+/// [`SEED_BYTES`]: the 512 output bits and the 512 bits of the inner digest.
+///
+/// The seed is 64 witness bytes with every byte from its length on forced to zero, and a
+/// one-hot length selector. The padding bit and the length field of the single message
+/// block are linear in the selector, so hiding the length costs about a hundred rows.
+fn seed_master(cs: &mut ConstraintSystem, hmac_key: &[u8], seed: &[u8]) -> (Vec<Lc>, Vec<Lc>) {
+    let (min, max) = (*SEED_BYTES.start(), *SEED_BYTES.end());
+    let mut padded = [0u8; 64];
+    padded[..seed.len()].copy_from_slice(seed);
+    let bits = alloc_bits(cs, &padded);
+    wipe(&mut padded);
+    let one_hot: Vec<Lc> = (min..=max).map(|l| alloc_bool(cs, l == seed.len())).collect();
+    let ones: Vec<(F, &Lc)> = one_hot.iter().map(|b| (F::ONE, b)).collect();
+    cs.enforce_equal(&Lc::combine(&ones), &Lc::constant(F::ONE));
+
+    let mut block: Vec<Lc> = bits.clone();
+    block.resize(1024, Lc::zero());
+    // `longer` is one exactly when the length exceeds `j`.
+    let mut longer = Lc::zero();
+    for j in (min..max).rev() {
+        longer = longer.plus(&one_hot[j + 1 - min]);
+        cs.enforce_mul(
+            Lc::constant(F::ONE).minus(&longer),
+            pack_bits(&bits[8 * j..8 * j + 8]),
+            Lc::zero(),
+        );
+    }
+    // The `0x80` after the last seed byte; that byte is zero whenever its selector is set.
+    for (l, selected) in (min..=max).zip(&one_hot) {
+        block[8 * l + 7] = block[8 * l + 7].plus(selected);
+    }
+    // Bit length `1024 + 8 len` in the last two bytes, big-endian.
+    for k in 0..7 {
+        let parts: Vec<(F, &Lc)> = (min..=max)
+            .zip(&one_hot)
+            .filter(|(l, _)| (l >> k) & 1 == 1)
+            .map(|(_, b)| (F::ONE, b))
+            .collect();
+        let at = 3 + k;
+        let index = if at < 8 { 8 * 127 + at } else { 8 * 126 + at - 8 };
+        block[index] = Lc::combine(&parts);
+    }
+    block[8 * 126 + 2] = Lc::constant(F::ONE);
+
+    let key = HmacKey::sha512(cs, &const_bits(hmac_key));
+    let words = be_words(&block, 8);
+    let words: &[Word; 16] = words.as_slice().try_into().expect("one block");
+    let inner = be_bits(&sha512_compress(cs, key.inner_state(), words));
+    (key.finish(cs, &inner), inner)
+}
+
 /// BIP-32 `k_child = (I_L + k_par) mod n` on little-endian bits, with the rejection rules
 /// as constraints: `I_L <= n - 1` and `1 <= k_child <= n - 1`.
 fn bip32_child_key(
@@ -640,109 +1263,365 @@ fn bip32_child_key(
     tweak_le: &[Lc],
     parent_le: &[Lc],
 ) -> Vec<Lc> {
-    let tweak = Element {
-        bytes_le: tweak_le.chunks(8).map(pack_bits).collect(),
-        bits_le: tweak_le.to_vec(),
-    };
-    order.enforce_canonical(cs, &tweak);
+    let tweak = enforce_below_order(cs, order, tweak_le);
     let child = order.reduce(cs, &tweak.lazy().add(&Lazy::from_bits(parent_le)));
     secp256k1_enforce_scalar_range(cs, &child.bits_le);
     child.bits_le
 }
 
-/// The key at `m / path` as little-endian bits, from the master seed's byte string.
-fn bip32_key(cs: &mut ConstraintSystem, seed: &[Lc], path: &[u32]) -> Vec<Lc> {
-    let order = Modulus::secp256k1_order();
-    let i = hmac_sha512(cs, &const_bits(b"Bitcoin seed"), seed);
-    let mut key = reverse_bytes(&i[..256]);
-    secp256k1_enforce_scalar_range(cs, &key);
-    let mut chain_code = i[256..].to_vec();
-    for &index in path {
-        let mut data: Vec<Lc> = if index >= BIP32_HARDENED {
-            let mut data = const_bits(&[0]);
-            data.extend(reverse_bytes(&key));
-            data
-        } else {
-            let parent = secp256k1_fixed_base_mul(cs, &key);
-            parent.compressed_bits().into_iter().flatten().collect()
-        };
-        data.extend(const_bits(&index.to_be_bytes()));
-        let i = hmac_sha512(cs, &chain_code, &data);
-        key = bip32_child_key(cs, &order, &reverse_bytes(&i[..256]), &key);
-        chain_code = i[256..].to_vec();
-    }
-    key
+/// A BIP-32 secp256k1 node: the key as little-endian bits, the chain code as a byte
+/// string.
+#[derive(Clone)]
+struct SecpNode {
+    key: Vec<Lc>,
+    chain: Vec<Lc>,
 }
 
-/// The relation with its assignment, and the number of rows before padding.
-fn build(relation: &Relation, public_bits: &[bool], secret: &[u8]) -> (Shape, Vec<F>, usize) {
-    assert_eq!(secret.len(), relation.secret_bytes());
-    assert_eq!(public_bits.len(), 8 * relation.claim_bytes() + 512);
-    let mut cs = ConstraintSystem::new();
-    let public: Vec<Lc> = public_bits
-        .iter()
-        .map(|&b| cs.public_input(F::from_u64_reduced(u64::from(b))).into())
-        .collect();
-    let (claim, rest) = public.split_at(8 * relation.claim_bytes());
-    let (midstate, nullifier) = rest.split_at(256);
-    let secret = alloc_bits(&mut cs, secret);
+/// A node prepared for deriving children: its HMAC key state and, once a non-hardened or
+/// hidden step needs it, its compressed public key. Both are shared by all its children.
+struct SecpParent {
+    node: SecpNode,
+    hmac: HmacKey,
+    public_key: Option<Vec<Lc>>,
+}
 
-    // The signing scalar as the byte string the nullifier hashes.
-    let scalar_bytes = match relation {
-        Relation::BitcoinHash160 | Relation::EthereumAddress => {
-            let key = reverse_bytes(&secret);
-            secp256k1_enforce_scalar_range(&mut cs, &key);
-            let public_key = secp256k1_fixed_base_mul(&mut cs, &key);
-            if matches!(relation, Relation::BitcoinHash160) {
-                let encoding: Vec<Lc> =
-                    public_key.compressed_bits().into_iter().flatten().collect();
-                let digest = hash160(&mut cs, &encoding);
-                pin(&mut cs, &digest, claim);
-            } else {
-                let encoding: Vec<Lc> = public_key
-                    .uncompressed_bits()
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                let digest = keccak256(&mut cs, &encoding);
-                pin(&mut cs, &digest[96..], claim);
+impl SecpParent {
+    fn new(cs: &mut ConstraintSystem, node: SecpNode) -> Self {
+        let hmac = HmacKey::sha512(cs, &node.chain);
+        Self {
+            node,
+            hmac,
+            public_key: None,
+        }
+    }
+
+    fn public_key(&mut self, cs: &mut ConstraintSystem) -> Vec<Lc> {
+        let key = &self.node.key;
+        self.public_key
+            .get_or_insert_with(|| flat(secp256k1_fixed_base_mul(cs, key).compressed_bits()))
+            .clone()
+    }
+
+    fn child(&mut self, cs: &mut ConstraintSystem, order: &Modulus, step: &Step) -> SecpNode {
+        let hardened_data = |key: &[Lc]| {
+            let mut data = const_bits(&[0]);
+            data.extend(reverse_bytes(key));
+            data
+        };
+        let mut data = match step {
+            Step::Public(index) if *index >= HARDENED => hardened_data(&self.node.key),
+            Step::Public(_) => self.public_key(cs),
+            Step::Hidden { bits, .. } => {
+                let soft = self.public_key(cs);
+                select_bits(cs, &bits[31], &hardened_data(&self.node.key), &soft)
             }
-            secret
+        };
+        data.extend(step.be_bits());
+        let i = self.hmac.mac(cs, &data);
+        let key = bip32_child_key(cs, order, &reverse_bytes(&i[..256]), &self.node.key);
+        let chain = i[256..].to_vec();
+        match step {
+            Step::Public(_) => SecpNode { key, chain },
+            // An inactive step passes the node through. Its unused HMAC output is still
+            // subject to the rejection rules, which fail with probability about 2^-127.
+            Step::Hidden { active, .. } => SecpNode {
+                key: select_bits(cs, active, &key, &self.node.key),
+                chain: select_bits(cs, active, &chain, &self.node.chain),
+            },
         }
-        Relation::Ed25519Seed => {
-            let digest = sha512(&mut cs, &secret);
-            let scalar = ed25519_clamp(&digest[..256]);
-            let public_key = ed25519_fixed_base_mul(&mut cs, &scalar);
-            pin(&mut cs, &public_key.encoding_bits(), claim);
-            scalar
+    }
+}
+
+/// The root node of a BIP-32 statement and the nullifier secret of that root.
+fn bip32_root(cs: &mut ConstraintSystem, root: Bip32Root, secret: &[u8]) -> (SecpNode, Vec<Lc>) {
+    let (key, chain, nullifier_secret) = match root {
+        Bip32Root::Seed => {
+            let (i, inner) = seed_master(cs, BIP32_MASTER_KEY, secret);
+            (reverse_bytes(&i[..256]), i[256..].to_vec(), inner[..256].to_vec())
         }
-        Relation::Bip32Secp256k1 { path, .. } => {
-            let key = bip32_key(&mut cs, &secret, path);
-            let public_key = secp256k1_fixed_base_mul(&mut cs, &key);
-            let encoding: Vec<Lc> = public_key.compressed_bits().into_iter().flatten().collect();
-            pin(&mut cs, &encoding, claim);
-            reverse_bytes(&key)
+        Bip32Root::ExtendedKey => {
+            let bits = alloc_bits(cs, secret);
+            (reverse_bytes(&bits[..256]), bits[256..].to_vec(), bits[256..].to_vec())
         }
     };
+    secp256k1_enforce_scalar_range(cs, &key);
+    (SecpNode { key, chain }, nullifier_secret)
+}
 
+fn bip32_descend_gadget(
+    cs: &mut ConstraintSystem,
+    order: &Modulus,
+    mut node: SecpNode,
+    steps: &[Step],
+) -> SecpNode {
+    for step in steps {
+        node = SecpParent::new(cs, node).child(cs, order, step);
+    }
+    node
+}
+
+/// The credential bits of a secp256k1 key (little-endian bits, in `1..n`) under `lock`.
+fn secp_lock(cs: &mut ConstraintSystem, lock: Lock, key: &[Lc], merkle_root: &[u8; 32]) -> Vec<Lc> {
+    let public_key = secp256k1_fixed_base_mul(cs, key);
+    match lock {
+        Lock::P2pkh => hash160(cs, &flat(public_key.compressed_bits())),
+        Lock::P2pkhUncompressed => {
+            let mut sec1 = const_bits(&[4]);
+            sec1.extend(flat(public_key.uncompressed_bits()));
+            hash160(cs, &sec1)
+        }
+        Lock::P2shP2wpkh => {
+            let mut script = const_bits(&[0, 0x14]);
+            script.extend(hash160(cs, &flat(public_key.compressed_bits())));
+            hash160(cs, &script)
+        }
+        Lock::Ethereum => keccak256(cs, &flat(public_key.uncompressed_bits()))[96..].to_vec(),
+        Lock::TaprootKeyPath | Lock::TaprootScriptTree => {
+            let mut message = flat(public_key.x_only_bits());
+            if lock == Lock::TaprootScriptTree {
+                message.extend(alloc_bits(cs, merkle_root));
+            }
+            let tag = sha2_native::sha256(b"TapTweak");
+            let midstate = sha256_midstate(&[tag, tag].concat()).map(|w| Word::constant(u64::from(w), 32));
+            let tweak = reverse_bytes(&sha256_from_midstate(cs, &midstate, 64, &message));
+            // BIP-341 fails for a tweak that is not below the group order; a zero tweak or
+            // an output at infinity has no rows that hold.
+            enforce_below_order(cs, &Modulus::secp256k1_order(), &tweak);
+            let tweak_point = secp256k1_fixed_base_mul(cs, &tweak);
+            // `lift_x`: the internal point with even `y`, that is `(1 - 2 odd) y`.
+            let field = Modulus::secp256k1_base();
+            let sign = Lazy::constant(&[1]).sub(&Lazy::from_bits(&[public_key.y_is_odd()]).scale(2));
+            let even_y = field.mul(cs, &sign, &Lazy::from_bits(&public_key.y.bits_le));
+            let output = secp256k1_point_add(
+                cs,
+                &AffinePoint {
+                    x: Lazy::from_bits(&public_key.x.bits_le),
+                    y: even_y.lazy(),
+                },
+                &AffinePoint {
+                    x: Lazy::from_bits(&tweak_point.x.bits_le),
+                    y: Lazy::from_bits(&tweak_point.y.bits_le),
+                },
+            );
+            let x = field.reduce(cs, &output.x);
+            field.enforce_canonical(cs, &x);
+            reverse_bytes(&x.bits_le)
+        }
+        Lock::Ed25519 => unreachable!("an Ed25519 lock has an Ed25519 source"),
+    }
+}
+
+/// The Ed25519 public key of an RFC 8032 seed, as credential bits.
+fn ed25519_seed_lock(cs: &mut ConstraintSystem, seed: &[Lc]) -> Vec<Lc> {
+    let digest = sha512(cs, seed);
+    ed25519_fixed_base_mul(cs, &ed25519_clamp(&digest[..256])).encoding_bits()
+}
+
+/// The witness in the shape the relation consumes.
+struct RelationWitness<'a> {
+    secret: &'a [u8],
+    path: &'a [u32],
+    merkle_root: [u8; 32],
+}
+
+/// Key derivation and lock of one statement: the credential bits and the nullifier
+/// secret's bits.
+fn credential_gadget(
+    cs: &mut ConstraintSystem,
+    lock: Lock,
+    source: &KeySource,
+    witness: &RelationWitness<'_>,
+) -> (Vec<Lc>, Vec<Lc>) {
+    match source {
+        KeySource::Secp256k1Key => {
+            let secret = alloc_bits(cs, witness.secret);
+            let key = reverse_bytes(&secret);
+            secp256k1_enforce_scalar_range(cs, &key);
+            (secp_lock(cs, lock, &key, &witness.merkle_root), secret)
+        }
+        KeySource::Bip32 { root, path } => {
+            let (node, nullifier_secret) = bip32_root(cs, *root, witness.secret);
+            let steps = alloc_steps(cs, path, witness.path, false);
+            let order = Modulus::secp256k1_order();
+            let leaf = bip32_descend_gadget(cs, &order, node, &steps);
+            (
+                secp_lock(cs, lock, &leaf.key, &witness.merkle_root),
+                nullifier_secret,
+            )
+        }
+        KeySource::Ed25519Seed => {
+            let seed = alloc_bits(cs, witness.secret);
+            (ed25519_seed_lock(cs, &seed), seed)
+        }
+        KeySource::Slip10 { path } => {
+            let (i, _) = seed_master(cs, SLIP10_ED25519_KEY, witness.secret);
+            let (mut key, mut chain) = (i[..256].to_vec(), i[256..].to_vec());
+            for step in alloc_steps(cs, path, witness.path, true) {
+                let mut data = const_bits(&[0]);
+                data.extend(key.iter().cloned());
+                data.extend(step.be_bits());
+                let i = HmacKey::sha512(cs, &chain).mac(cs, &data);
+                match &step {
+                    Step::Public(_) => (key, chain) = (i[..256].to_vec(), i[256..].to_vec()),
+                    Step::Hidden { active, .. } => {
+                        key = select_bits(cs, active, &i[..256], &key);
+                        chain = select_bits(cs, active, &i[256..], &chain);
+                    }
+                }
+            }
+            (ed25519_seed_lock(cs, &key), key)
+        }
+        KeySource::Bip32Ed25519 { path } => {
+            let bits = alloc_bits(cs, witness.secret);
+            let (mut kl, mut kr, mut chain) = (
+                bits[..256].to_vec(),
+                bits[256..512].to_vec(),
+                bits[512..].to_vec(),
+            );
+            for &index in path {
+                let mut data = if index >= HARDENED {
+                    let mut data = const_bits(&[0]);
+                    data.extend(kl.iter().chain(&kr).cloned());
+                    data
+                } else {
+                    let mut data = const_bits(&[2]);
+                    data.extend(ed25519_fixed_base_mul(cs, &kl).encoding_bits());
+                    data
+                };
+                data.extend(const_bits(&index.to_le_bytes()));
+                let hmac = HmacKey::sha512(cs, &chain);
+                let z = hmac.mac(cs, &data);
+                // The chain-code tag is the scalar tag plus one: only bit 0 of byte 0 differs.
+                data[0] = Lc::constant(F::ONE);
+                let c = hmac.mac(cs, &data);
+                // `8 * Z[0..28]` as a 256-bit integer.
+                let mut eight_zl = vec![Lc::zero(); 3];
+                eight_zl.extend_from_slice(&z[..224]);
+                eight_zl.resize(256, Lc::zero());
+                kl = add_wide(cs, &kl, &eight_zl);
+                kr = add_wide(cs, &kr, &z[256..]);
+                chain = c[256..].to_vec();
+            }
+            (ed25519_fixed_base_mul(cs, &kl).encoding_bits(), kr)
+        }
+    }
+}
+
+/// Pin one credential's public inputs: its bits, and the nullifier of `nullifier_secret`
+/// under the public chaining value.
+fn bind_credential(
+    cs: &mut ConstraintSystem,
+    public: &[Lc],
+    credential: &[Lc],
+    nullifier_secret: &[Lc],
+) {
+    let (claimed, rest) = public.split_at(credential.len());
+    let (midstate, nullifier) = rest.split_at(256);
+    pin(cs, credential, claimed);
     let midstate: Vec<Word> = midstate
         .chunks(32)
         .map(|w| Word::from_bits(w.to_vec()))
         .collect();
     let midstate: &[Word; 8] = midstate.as_slice().try_into().expect("eight words");
-    let digest = sha256_from_midstate(&mut cs, midstate, 64, &scalar_bytes);
-    pin(&mut cs, &digest, nullifier);
+    let digest = sha256_from_midstate(cs, midstate, 128, nullifier_secret);
+    pin(cs, &digest, nullifier);
+}
 
+fn alloc_public(cs: &mut ConstraintSystem, bits: &[bool]) -> Vec<Lc> {
+    bits.iter()
+        .map(|&b| cs.public_input(fu(u64::from(b))).into())
+        .collect()
+}
+
+/// The relation of one statement with its assignment, and the row count before padding.
+fn build(
+    lock: Lock,
+    source: &KeySource,
+    public_bits: &[bool],
+    witness: &RelationWitness<'_>,
+) -> (Shape, Vec<F>, usize) {
+    assert_eq!(public_bits.len(), 8 * lock.credential_bytes() + 512);
+    let mut cs = ConstraintSystem::new();
+    let public = alloc_public(&mut cs, public_bits);
+    let (credential, nullifier_secret) = credential_gadget(&mut cs, lock, source, witness);
+    bind_credential(&mut cs, &public, &credential, &nullifier_secret);
     let rows = cs.num_rows();
     let (shape, assignment) = cs.finish();
     (shape, assignment, rows)
 }
 
+/// A valid secret for building a shape without a witness.
+fn placeholder_secret(source: &KeySource) -> Vec<u8> {
+    match source {
+        KeySource::Secp256k1Key => {
+            let mut key = vec![0u8; 32];
+            key[31] = 1;
+            key
+        }
+        KeySource::Bip32 {
+            root: Bip32Root::ExtendedKey,
+            ..
+        } => {
+            let mut key = vec![0u8; 64];
+            key[31] = 1;
+            key
+        }
+        KeySource::Bip32 { .. } | KeySource::Slip10 { .. } => vec![0u8; 16],
+        KeySource::Ed25519Seed => vec![0u8; 32],
+        KeySource::Bip32Ed25519 { .. } => {
+            let mut key = vec![0u8; 96];
+            key[0] = 8;
+            key
+        }
+    }
+}
+
+/// What selects a relation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Relation {
+    Single(Lock, KeySource),
+    Batch {
+        lock: Lock,
+        root: Bip32Root,
+        prefix: Vec<u32>,
+        tails: Vec<Vec<u32>>,
+    },
+}
+
 fn build_shape(relation: &Relation) -> Shape {
-    let public = vec![false; 8 * relation.claim_bytes() + 512];
-    let mut secret = relation.placeholder_secret();
-    let (shape, mut assignment, _) = build(relation, &public, &secret);
-    wipe(&mut secret);
+    let (shape, mut assignment, _) = match relation {
+        Relation::Single(lock, source) => {
+            let mut secret = placeholder_secret(source);
+            let built = build(
+                *lock,
+                source,
+                &vec![false; 8 * lock.credential_bytes() + 512],
+                &RelationWitness {
+                    secret: &secret,
+                    path: &[],
+                    merkle_root: [0; 32],
+                },
+            );
+            wipe(&mut secret);
+            built
+        }
+        Relation::Batch {
+            lock,
+            root,
+            prefix,
+            tails,
+        } => {
+            let source = KeySource::Bip32 {
+                root: *root,
+                path: PathSpec::Public(Vec::new()),
+            };
+            let mut secret = placeholder_secret(&source);
+            let public = vec![false; tails.len() * (8 * lock.credential_bytes() + 512)];
+            let built = build_batch(*lock, *root, prefix, tails, &public, &secret);
+            wipe(&mut secret);
+            built
+        }
+    };
     dregg_sig_asm::volatile_fill(&mut assignment, F::ZERO);
     shape
 }
@@ -751,7 +1630,7 @@ fn build_shape(relation: &Relation) -> Shape {
 #[cfg(feature = "std")]
 fn shape_of(relation: &Relation) -> Arc<Shape> {
     use std::sync::{Mutex, PoisonError};
-    const KEEP: usize = 8;
+    const KEEP: usize = 32;
     static CACHE: Mutex<Vec<(Relation, Arc<Shape>)>> = Mutex::new(Vec::new());
     let find = |cache: &[(Relation, Arc<Shape>)]| {
         cache
@@ -779,106 +1658,425 @@ fn shape_of(relation: &Relation) -> Arc<Shape> {
     Arc::new(build_shape(relation))
 }
 
-/// The public relation of a statement: it depends on the claim kind and, for BIP-32, on
-/// the seed length and the path, and on nothing else. `None` for a malformed statement.
+/// The public relation of a statement: it depends on the lock and the source (with its
+/// path specification) and on nothing else. `None` for a malformed statement.
 pub fn ownership_shape(statement: &OwnershipStatement) -> Option<Arc<Shape>> {
-    statement.claim.relation().map(|r| shape_of(&r))
+    statement
+        .is_well_formed()
+        .then(|| shape_of(&Relation::Single(statement.lock, statement.source.clone())))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnershipError {
-    /// The statement's parameters are outside the supported ranges.
+    /// The statement's parts do not fit together or are outside the supported ranges.
     MalformedStatement,
-    /// The witness does not produce the statement's claim and nullifier.
+    /// The witness does not produce the statement's credential and nullifier.
     WitnessMismatch,
     Proof(ZkHemError),
-}
-
-fn checked_relation(
-    statement: &OwnershipStatement,
-    witness: &OwnershipWitness,
-) -> Result<Relation, OwnershipError> {
-    let relation = statement
-        .claim
-        .relation()
-        .ok_or(OwnershipError::MalformedStatement)?;
-    let kind = match &statement.claim {
-        LegacyClaim::BitcoinHash160(_) => ClaimKind::BitcoinHash160,
-        LegacyClaim::EthereumAddress(_) => ClaimKind::EthereumAddress,
-        LegacyClaim::Ed25519Seed { .. } => ClaimKind::Ed25519Seed,
-        LegacyClaim::Bip32Secp256k1 { path, .. } => ClaimKind::Bip32Secp256k1 { path: path.clone() },
-    };
-    let (claim, mut scalar) = evaluate(&kind, witness).ok_or(OwnershipError::WitnessMismatch)?;
-    let nullifier = migration_nullifier(relation.curve(), &scalar, &statement.migration_domain);
-    wipe(&mut scalar);
-    if claim != statement.claim || nullifier != statement.nullifier {
-        return Err(OwnershipError::WitnessMismatch);
-    }
-    Ok(relation)
 }
 
 /// The relation of `statement` with the assignment for `witness`, after checking natively
 /// that the witness produces the statement. The assignment is secret. This is what a
 /// prover that does not go through [`prove_ownership`] (the collaborative one) starts from;
-/// its transcript statement must be the one [`prove_ownership`] uses.
+/// its transcript statement is [`ownership_transcript`].
 pub fn synthesize_ownership(
     statement: &OwnershipStatement,
     witness: &OwnershipWitness,
 ) -> Result<(Shape, Vec<F>), OwnershipError> {
-    let relation = checked_relation(statement, witness)?;
+    if !statement.is_well_formed() {
+        return Err(OwnershipError::MalformedStatement);
+    }
+    let derived = OwnershipStatement::derive(
+        statement.lock,
+        statement.source.clone(),
+        witness,
+        statement.pq_commitment,
+        statement.migration_domain,
+        statement.epoch,
+    );
+    if derived.as_ref() != Some(statement) {
+        return Err(OwnershipError::WitnessMismatch);
+    }
     let (shape, assignment, _) = build(
-        &relation,
-        &statement.public_bits(&relation),
-        witness.secret(),
+        statement.lock,
+        &statement.source,
+        &statement.public_bits(),
+        &RelationWitness {
+            secret: &witness.secret,
+            path: &witness.path,
+            merkle_root: witness.merkle_root.unwrap_or([0; 32]),
+        },
     );
     Ok((shape, assignment))
 }
 
+fn with_regime(mut bytes: Vec<u8>, regime: WhirSecurityRegime) -> Vec<u8> {
+    bytes.push(regime as u8);
+    bytes
+}
+
 /// The statement bytes [`prove_ownership`] and [`verify_ownership`] hand to zk-Hem.
 pub fn ownership_transcript(statement: &OwnershipStatement, regime: WhirSecurityRegime) -> Vec<u8> {
-    statement.transcript(regime)
+    with_regime(statement.to_bytes(), regime)
+}
+
+// ============================================================================
+// Batches
+// ============================================================================
+
+/// One credential of a batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchEntry {
+    /// The path from the batch's shared node to this credential's key.
+    pub tail: Vec<u32>,
+    pub credential: Credential,
+    pub pq_commitment: [u8; 32],
+    pub nullifier: [u8; 32],
+}
+
+/// Many secp256k1 credentials below one BIP-32 node, proved together: the root step and
+/// the shared `prefix` are proved once, and children of one node share its HMAC key state
+/// and its public key. All paths are public.
+///
+/// Entry `i` is the same claim as the single statement [`Self::statement`]`(i)`, with the
+/// same credential identifier and nullifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchStatement {
+    pub lock: Lock,
+    pub root: Bip32Root,
+    pub prefix: Vec<u32>,
+    pub entries: Vec<BatchEntry>,
+    pub migration_domain: [u8; 32],
+    pub epoch: u64,
+}
+
+impl BatchStatement {
+    /// The batch a holder derives from its root secret for the given tails and target
+    /// commitments. `None` under the conditions of [`OwnershipStatement::derive`], or when
+    /// the batch is empty or too large.
+    pub fn derive(
+        lock: Lock,
+        root: Bip32Root,
+        prefix: &[u32],
+        targets: &[(Vec<u32>, [u8; 32])],
+        witness: &OwnershipWitness,
+        migration_domain: [u8; 32],
+        epoch: u64,
+    ) -> Option<Self> {
+        let kind = Self::source(root, Vec::new()).nullifier_kind();
+        let shared = bip32_descend(bip32_root_node(root, &witness.secret)?, prefix)?;
+        let mut secret = bip32_nullifier_secret(root, &witness.secret);
+        let entries = targets
+            .iter()
+            .map(|(tail, pq_commitment)| {
+                let leaf = bip32_descend(shared.clone(), tail)?;
+                let credential = secp256k1_credential(lock, &leaf.private_key, None)?;
+                Some(BatchEntry {
+                    tail: tail.clone(),
+                    credential,
+                    pq_commitment: *pq_commitment,
+                    nullifier: migration_nullifier(kind, &secret, &migration_domain, &credential),
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        wipe(&mut secret);
+        let batch = Self {
+            lock,
+            root,
+            prefix: prefix.to_vec(),
+            entries: entries?,
+            migration_domain,
+            epoch,
+        };
+        batch.is_well_formed().then_some(batch)
+    }
+
+    fn source(root: Bip32Root, path: Vec<u32>) -> KeySource {
+        KeySource::Bip32 {
+            root,
+            path: PathSpec::Public(path),
+        }
+    }
+
+    /// Whether the lock is a secp256k1 lock without a witness of its own, the batch holds
+    /// 1 to [`MAX_BATCH_ENTRIES`] entries and no path exceeds [`MAX_PATH_DEPTH`].
+    pub fn is_well_formed(&self) -> bool {
+        !matches!(self.lock, Lock::Ed25519 | Lock::TaprootScriptTree)
+            && (1..=MAX_BATCH_ENTRIES).contains(&self.entries.len())
+            && self.entries.iter().all(|e| {
+                self.prefix.len() + e.tail.len() <= MAX_PATH_DEPTH
+                    && self.lock.credential(e.credential.value()) == Some(e.credential)
+            })
+    }
+
+    /// The single statement that makes the same claim as entry `index`.
+    pub fn statement(&self, index: usize) -> Option<OwnershipStatement> {
+        let entry = self.entries.get(index)?;
+        let mut path = self.prefix.clone();
+        path.extend_from_slice(&entry.tail);
+        Some(OwnershipStatement {
+            lock: self.lock,
+            source: Self::source(self.root, path),
+            credential: entry.credential,
+            pq_commitment: entry.pq_commitment,
+            migration_domain: self.migration_domain,
+            epoch: self.epoch,
+            nullifier: entry.nullifier,
+        })
+    }
+
+    fn encode_path(out: &mut Vec<u8>, path: &[u32]) {
+        out.push(path.len() as u8);
+        for index in path {
+            out.extend_from_slice(&index.to_be_bytes());
+        }
+    }
+
+    /// Canonical encoding; also the bytes the proof transcript absorbs.
+    ///
+    /// `tag(25) || lock || root || epoch(8, BE) || domain(32) || prefix || count(2, BE) ||
+    /// count * (tail || credential value || pq(32) || nullifier(32))`, a path being
+    /// `depth || depth * index(4, BE)`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = BATCH_TAG.to_vec();
+        out.push(self.lock as u8);
+        out.push(self.root as u8);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.migration_domain);
+        Self::encode_path(&mut out, &self.prefix);
+        out.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        for entry in &self.entries {
+            Self::encode_path(&mut out, &entry.tail);
+            out.extend_from_slice(entry.credential.value());
+            out.extend_from_slice(&entry.pq_commitment);
+            out.extend_from_slice(&entry.nullifier);
+        }
+        out
+    }
+
+    /// Strict inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut rest = bytes.strip_prefix(BATCH_TAG.as_slice())?;
+        let mut take = |n: usize| -> Option<Vec<u8>> {
+            let (head, tail) = rest.split_at_checked(n)?;
+            rest = tail;
+            Some(head.to_vec())
+        };
+        let path = |take: &mut dyn FnMut(usize) -> Option<Vec<u8>>| -> Option<Vec<u32>> {
+            let depth = usize::from(take(1)?[0]);
+            Some(
+                take(4 * depth)?
+                    .chunks_exact(4)
+                    .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        };
+        let lock = Lock::from_tag(take(1)?[0])?;
+        let root = match take(1)?[0] {
+            0 => Bip32Root::Seed,
+            1 => Bip32Root::ExtendedKey,
+            _ => return None,
+        };
+        let epoch = u64::from_be_bytes(take(8)?.try_into().ok()?);
+        let migration_domain: [u8; 32] = take(32)?.try_into().ok()?;
+        let prefix = path(&mut take)?;
+        let count = usize::from(u16::from_be_bytes(take(2)?.try_into().ok()?));
+        let mut entries = Vec::with_capacity(count.min(MAX_BATCH_ENTRIES));
+        for _ in 0..count {
+            let tail = path(&mut take)?;
+            entries.push(BatchEntry {
+                tail,
+                credential: lock.credential(&take(lock.credential_bytes())?)?,
+                pq_commitment: take(32)?.try_into().ok()?,
+                nullifier: take(32)?.try_into().ok()?,
+            });
+        }
+        let batch = Self {
+            lock,
+            root,
+            prefix,
+            entries,
+            migration_domain,
+            epoch,
+        };
+        (rest.is_empty() && batch.is_well_formed()).then_some(batch)
+    }
+
+    fn relation(&self) -> Relation {
+        Relation::Batch {
+            lock: self.lock,
+            root: self.root,
+            prefix: self.prefix.clone(),
+            tails: self.entries.iter().map(|e| e.tail.clone()).collect(),
+        }
+    }
+
+    fn public_bits(&self) -> Vec<bool> {
+        let kind = Self::source(self.root, Vec::new()).nullifier_kind();
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            credential_public_bits(
+                &mut out,
+                kind,
+                &entry.credential,
+                &self.migration_domain,
+                &entry.nullifier,
+            );
+        }
+        out
+    }
+
+    /// The relation's public inputs: those of each entry in order. `None` for a malformed
+    /// batch.
+    pub fn public_inputs(&self) -> Option<Vec<F>> {
+        self.is_well_formed()
+            .then(|| self.public_bits().into_iter().map(|b| fu(u64::from(b))).collect())
+    }
+
+    /// The bindings a verified batch asks the registry to record, one per entry.
+    #[cfg(feature = "std")]
+    pub fn bindings(&self) -> Vec<super::registry::MigrationBinding> {
+        (0..self.entries.len())
+            .filter_map(|i| self.statement(i))
+            .map(|statement| statement.binding())
+            .collect()
+    }
+}
+
+/// The relation of a batch with its assignment, and the row count before padding.
+fn build_batch(
+    lock: Lock,
+    root: Bip32Root,
+    prefix: &[u32],
+    tails: &[Vec<u32>],
+    public_bits: &[bool],
+    secret: &[u8],
+) -> (Shape, Vec<F>, usize) {
+    let per_entry = 8 * lock.credential_bytes() + 512;
+    assert_eq!(public_bits.len(), tails.len() * per_entry);
+    let mut cs = ConstraintSystem::new();
+    let public = alloc_public(&mut cs, public_bits);
+    let (node, nullifier_secret) = bip32_root(&mut cs, root, secret);
+    let order = Modulus::secp256k1_order();
+    let steps = |path: &[u32]| -> Vec<Step> { path.iter().map(|&i| Step::Public(i)).collect() };
+    let shared = bip32_descend_gadget(&mut cs, &order, node, &steps(prefix));
+    let mut parent = SecpParent::new(&mut cs, shared.clone());
+    for (tail, public) in tails.iter().zip(public.chunks(per_entry)) {
+        let leaf = match tail.split_first() {
+            None => shared.clone(),
+            Some((&first, rest)) => {
+                let child = parent.child(&mut cs, &order, &Step::Public(first));
+                bip32_descend_gadget(&mut cs, &order, child, &steps(rest))
+            }
+        };
+        let credential = secp_lock(&mut cs, lock, &leaf.key, &[0; 32]);
+        bind_credential(&mut cs, public, &credential, &nullifier_secret);
+    }
+    let rows = cs.num_rows();
+    let (shape, assignment) = cs.finish();
+    (shape, assignment, rows)
+}
+
+/// The public relation of a batch. `None` for a malformed batch.
+pub fn batch_shape(batch: &BatchStatement) -> Option<Arc<Shape>> {
+    batch.is_well_formed().then(|| shape_of(&batch.relation()))
+}
+
+/// The relation of `batch` with the assignment for `witness`; see
+/// [`synthesize_ownership`].
+pub fn synthesize_batch(
+    batch: &BatchStatement,
+    witness: &OwnershipWitness,
+) -> Result<(Shape, Vec<F>), OwnershipError> {
+    if !batch.is_well_formed() {
+        return Err(OwnershipError::MalformedStatement);
+    }
+    let targets: Vec<(Vec<u32>, [u8; 32])> = batch
+        .entries
+        .iter()
+        .map(|e| (e.tail.clone(), e.pq_commitment))
+        .collect();
+    let derived = BatchStatement::derive(
+        batch.lock,
+        batch.root,
+        &batch.prefix,
+        &targets,
+        witness,
+        batch.migration_domain,
+        batch.epoch,
+    );
+    if derived.as_ref() != Some(batch) {
+        return Err(OwnershipError::WitnessMismatch);
+    }
+    let tails: Vec<Vec<u32>> = targets.into_iter().map(|(tail, _)| tail).collect();
+    let (shape, assignment, _) = build_batch(
+        batch.lock,
+        batch.root,
+        &batch.prefix,
+        &tails,
+        &batch.public_bits(),
+        &witness.secret,
+    );
+    Ok((shape, assignment))
+}
+
+/// The statement bytes [`prove_batch`] and [`verify_batch`] hand to zk-Hem.
+pub fn batch_transcript(batch: &BatchStatement, regime: WhirSecurityRegime) -> Vec<u8> {
+    with_regime(batch.to_bytes(), regime)
 }
 
 // ============================================================================
 // Proofs
 // ============================================================================
 
-/// An ownership proof for one claim kind under one regime.
+/// An ownership proof, for one statement or one batch, under one regime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnershipProof {
-    claim_tag: u8,
     pub regime: WhirSecurityRegime,
     pub proof: ZkHemProof,
 }
 
 impl OwnershipProof {
-    /// `magic(8) || claim kind || regime || zk-Hem proof`.
+    /// `magic(8) || regime || zk-Hem proof`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = PROOF_MAGIC.to_vec();
-        out.push(self.claim_tag);
         out.push(self.regime as u8);
         out.extend_from_slice(&self.proof.to_bytes());
         out
     }
 
-    /// Strict decoding against the statement the proof is for: the claim kind must be the
-    /// statement's, the regime a known one, and the zk-Hem part canonical for the
-    /// statement's relation with no byte left over.
-    pub fn from_bytes(bytes: &[u8], statement: &OwnershipStatement) -> Option<Self> {
+    fn decode(bytes: &[u8], shape: Option<Arc<Shape>>) -> Option<Self> {
         let rest = bytes.strip_prefix(PROOF_MAGIC.as_slice())?;
-        let (&claim_tag, rest) = rest.split_first()?;
         let (&regime, rest) = rest.split_first()?;
-        if claim_tag != statement.claim.tag() {
-            return None;
-        }
         let regime = WhirSecurityRegime::from_u8(regime)?;
-        let shape = ownership_shape(statement)?;
         Some(Self {
-            claim_tag,
             regime,
-            proof: ZkHemProof::from_bytes(rest, &shape, regime)?,
+            proof: ZkHemProof::from_bytes(rest, &*shape?, regime)?,
         })
     }
+
+    /// Strict decoding against the statement the proof is for: a known regime and a
+    /// zk-Hem part that is canonical for the statement's relation, with no byte left over.
+    pub fn from_bytes(bytes: &[u8], statement: &OwnershipStatement) -> Option<Self> {
+        Self::decode(bytes, ownership_shape(statement))
+    }
+
+    /// [`Self::from_bytes`] for a batch proof.
+    pub fn from_bytes_batch(bytes: &[u8], batch: &BatchStatement) -> Option<Self> {
+        Self::decode(bytes, batch_shape(batch))
+    }
+}
+
+fn prove(
+    synthesized: Result<(Shape, Vec<F>), OwnershipError>,
+    transcript: &[u8],
+    regime: WhirSecurityRegime,
+    seed: &[u8; 32],
+) -> Result<OwnershipProof, OwnershipError> {
+    let (shape, assignment) = synthesized?;
+    let proof = protocol::prove(&shape, assignment, transcript, regime, seed)
+        .map_err(OwnershipError::Proof)?;
+    Ok(OwnershipProof { regime, proof })
 }
 
 /// Prove a statement. `seed` must be uniform and secret; it drives every mask and blinder
@@ -889,20 +2087,12 @@ pub fn prove_ownership(
     regime: WhirSecurityRegime,
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
-    let (shape, assignment) = synthesize_ownership(statement, witness)?;
-    let proof = protocol::prove(
-        &shape,
-        assignment,
-        &statement.transcript(regime),
+    prove(
+        synthesize_ownership(statement, witness),
+        &ownership_transcript(statement, regime),
         regime,
         seed,
     )
-    .map_err(OwnershipError::Proof)?;
-    Ok(OwnershipProof {
-        claim_tag: statement.claim.tag(),
-        regime,
-        proof,
-    })
 }
 
 /// Verify a proof against a statement under the regime the verifier requires. On `true`,
@@ -912,21 +2102,50 @@ pub fn verify_ownership(
     regime: WhirSecurityRegime,
     proof: &OwnershipProof,
 ) -> bool {
-    if proof.regime != regime || proof.claim_tag != statement.claim.tag() {
-        return false;
-    }
     let (Some(shape), Some(public_inputs)) =
         (ownership_shape(statement), statement.public_inputs())
     else {
         return false;
     };
-    protocol::verify(
-        &shape,
-        &public_inputs,
-        &statement.transcript(regime),
+    proof.regime == regime
+        && protocol::verify(
+            &shape,
+            &public_inputs,
+            &ownership_transcript(statement, regime),
+            regime,
+            &proof.proof,
+        )
+}
+
+/// Prove a batch; see [`prove_ownership`].
+pub fn prove_batch(
+    batch: &BatchStatement,
+    witness: &OwnershipWitness,
+    regime: WhirSecurityRegime,
+    seed: &[u8; 32],
+) -> Result<OwnershipProof, OwnershipError> {
+    prove(
+        synthesize_batch(batch, witness),
+        &batch_transcript(batch, regime),
         regime,
-        &proof.proof,
+        seed,
     )
+}
+
+/// Verify a batch proof. On `true`, [`BatchStatement::bindings`] is what the registry
+/// should record.
+pub fn verify_batch(batch: &BatchStatement, regime: WhirSecurityRegime, proof: &OwnershipProof) -> bool {
+    let (Some(shape), Some(public_inputs)) = (batch_shape(batch), batch.public_inputs()) else {
+        return false;
+    };
+    proof.regime == regime
+        && protocol::verify(
+            &shape,
+            &public_inputs,
+            &batch_transcript(batch, regime),
+            regime,
+            &proof.proof,
+        )
 }
 
 #[cfg(test)]
@@ -940,6 +2159,7 @@ mod tests {
     const PQ: [u8; 32] = [0x51; 32];
     const DOMAIN: [u8; 32] = [0xd0; 32];
     const EPOCH: u64 = 7;
+    const H: u32 = HARDENED;
 
     fn hex(s: &str) -> Vec<u8> {
         let digits: Vec<u8> = s
@@ -982,53 +2202,129 @@ mod tests {
         0x21, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
         0xff, 0x01,
     ];
+    const ROOT: [u8; 32] = [0x3c; 32];
 
-    fn seed64() -> Vec<u8> {
-        (0..64u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect()
+    fn seed(len: usize) -> Vec<u8> {
+        (0..len as u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect()
     }
 
-    fn case(index: usize) -> (ClaimKind, OwnershipWitness) {
-        match index {
-            0 => (
-                ClaimKind::BitcoinHash160,
-                OwnershipWitness::Secp256k1Key(KEY),
+    /// The BIP32-Ed25519 root key of the reference implementation's test (`D1` of
+    /// `rust-ed25519-bip32`, `src/tests.rs`).
+    fn cardano_root() -> Ed25519ExtendedKey {
+        Ed25519ExtendedKey(arr(
+            "f8a29231ee38d6c5bf715d5bac21c750577aa3798b22d79d65bf97d6fadea15a
+             dcd1ee1abdf78bd4be64731a12deb94d3671784112eb6f364b871851fd1c9a24
+             7384db9ad6003bbd08b3b1ddc0d07a597293ff85e961bf252b331262eddfad0d",
+        ))
+    }
+
+    fn bip32(root: Bip32Root, path: PathSpec) -> KeySource {
+        KeySource::Bip32 { root, path }
+    }
+
+    fn public(path: &[u32]) -> PathSpec {
+        PathSpec::Public(path.to_vec())
+    }
+
+    /// One case per lock and per source, with small paths.
+    fn cases() -> Vec<(&'static str, Lock, KeySource, OwnershipWitness)> {
+        let key = || OwnershipWitness::secp256k1_key(&KEY);
+        let xprv = OwnershipWitness::extended_key(&bip32_derive(&seed(32), &[H + 1]).unwrap());
+        vec![
+            ("p2pkh/key", Lock::P2pkh, KeySource::Secp256k1Key, key()),
+            ("p2pkh-uncompressed/key", Lock::P2pkhUncompressed, KeySource::Secp256k1Key, key()),
+            ("p2sh-p2wpkh/key", Lock::P2shP2wpkh, KeySource::Secp256k1Key, key()),
+            ("ethereum/key", Lock::Ethereum, KeySource::Secp256k1Key, key()),
+            ("taproot/key", Lock::TaprootKeyPath, KeySource::Secp256k1Key, key()),
+            (
+                "taproot-tree/key",
+                Lock::TaprootScriptTree,
+                KeySource::Secp256k1Key,
+                key().with_merkle_root(ROOT),
             ),
-            1 => (
-                ClaimKind::EthereumAddress,
-                OwnershipWitness::Secp256k1Key(KEY),
+            (
+                "ed25519/seed",
+                Lock::Ed25519,
+                KeySource::Ed25519Seed,
+                OwnershipWitness::ed25519_seed(&KEY),
             ),
-            2 => (ClaimKind::Ed25519Seed, OwnershipWitness::Ed25519Seed(KEY)),
-            _ => (
-                ClaimKind::Bip32Secp256k1 {
-                    path: vec![BIP32_HARDENED + 44],
-                },
-                OwnershipWitness::Bip32Seed(seed64()),
+            (
+                "ed25519/slip10",
+                Lock::Ed25519,
+                KeySource::Slip10 { path: public(&[H, H + 1]) },
+                OwnershipWitness::seed(&seed(16)),
             ),
+            (
+                "ed25519/slip10-hidden",
+                Lock::Ed25519,
+                KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 2 } },
+                OwnershipWitness::seed(&seed(33)).with_path(&[H + 5]),
+            ),
+            (
+                "ed25519/bip32-ed25519",
+                Lock::Ed25519,
+                KeySource::Bip32Ed25519 { path: vec![H, 1] },
+                OwnershipWitness::ed25519_extended_key(&cardano_root()),
+            ),
+            (
+                "p2pkh/bip32-seed",
+                Lock::P2pkh,
+                bip32(Bip32Root::Seed, public(&[H + 44])),
+                OwnershipWitness::seed(&seed(64)),
+            ),
+            (
+                "ethereum/bip32-seed",
+                Lock::Ethereum,
+                bip32(Bip32Root::Seed, public(&[3])),
+                OwnershipWitness::seed(&seed(20)),
+            ),
+            (
+                "taproot/bip32-xprv",
+                Lock::TaprootKeyPath,
+                bip32(Bip32Root::ExtendedKey, public(&[H + 86, 0])),
+                xprv,
+            ),
+            (
+                "p2pkh/bip32-hidden",
+                Lock::P2pkh,
+                bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 2 }),
+                OwnershipWitness::seed(&seed(64)).with_path(&[H + 44, 7]),
+            ),
+        ]
+    }
+
+    fn derive(lock: Lock, source: KeySource, witness: &OwnershipWitness) -> OwnershipStatement {
+        OwnershipStatement::derive(lock, source, witness, PQ, DOMAIN, EPOCH).expect("valid witness")
+    }
+
+    fn relation_witness(w: &OwnershipWitness) -> RelationWitness<'_> {
+        RelationWitness {
+            secret: &w.secret,
+            path: &w.path,
+            merkle_root: w.merkle_root.unwrap_or([0; 32]),
         }
     }
 
-    fn statement(index: usize) -> (OwnershipStatement, OwnershipWitness) {
-        let (kind, witness) = case(index);
-        let st = OwnershipStatement::derive(&kind, &witness, PQ, DOMAIN, EPOCH).expect("valid");
-        (st, witness)
-    }
-
-    /// One honest proof per claim kind, shared by the tests below.
-    fn proven(index: usize) -> &'static (OwnershipStatement, OwnershipProof) {
-        static PROOFS: [OnceLock<(OwnershipStatement, OwnershipProof)>; 4] =
-            [const { OnceLock::new() }; 4];
-        PROOFS[index].get_or_init(|| {
-            let (st, witness) = statement(index);
-            let proof = prove_ownership(&st, &witness, REGIME, &[index as u8 + 1; 32]).unwrap();
-            (st, proof)
-        })
+    fn batch_case() -> (BatchStatement, OwnershipWitness) {
+        let witness = OwnershipWitness::seed(&seed(64));
+        let targets = vec![(vec![0], [0x61; 32]), (vec![1], [0x62; 32])];
+        let batch = BatchStatement::derive(
+            Lock::P2pkh,
+            Bip32Root::Seed,
+            &[H + 44],
+            &targets,
+            &witness,
+            DOMAIN,
+            EPOCH,
+        )
+        .unwrap();
+        (batch, witness)
     }
 
     #[test]
     fn bip32_matches_test_vector_1() {
         // BIP-32, "Test vector 1": (path, ext pub, ext prv).
         let seed = hex("000102030405060708090a0b0c0d0e0f");
-        let h = BIP32_HARDENED;
         let chain: [(&[u32], &str, &str); 6] = [
             (
                 &[],
@@ -1036,27 +2332,27 @@ mod tests {
                 "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
             ),
             (
-                &[h],
+                &[H],
                 "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw",
                 "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7",
             ),
             (
-                &[h, 1],
+                &[H, 1],
                 "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ",
                 "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs",
             ),
             (
-                &[h, 1, h + 2],
+                &[H, 1, H + 2],
                 "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5",
                 "xprv9z4pot5VBttmtdRTWfWQmoH1taj2axGVzFqSb8C9xaxKymcFzXBDptWmT7FwuEzG3ryjH4ktypQSAewRiNMjANTtpgP4mLTj34bhnZX7UiM",
             ),
             (
-                &[h, 1, h + 2, 2],
+                &[H, 1, H + 2, 2],
                 "xpub6FHa3pjLCk84BayeJxFW2SP4XRrFd1JYnxeLeU8EqN3vDfZmbqBqaGJAyiLjTAwm6ZLRQUMv1ZACTj37sR62cfN7fe5JnJ7dh8zL4fiyLHV",
                 "xprvA2JDeKCSNNZky6uBCviVfJSKyQ1mDYahRjijr5idH2WwLsEd4Hsb2Tyh8RfQMuPh7f7RtyzTtdrbdqqsunu5Mm3wDvUAKRHSC34sJ7in334",
             ),
             (
-                &[h, 1, h + 2, 2, 1_000_000_000],
+                &[H, 1, H + 2, 2, 1_000_000_000],
                 "xpub6H1LXWLaKsWFhvm6RVpEL9P4KfRZSW7abD2ttkWP3SSQvnyA8FSVqNTEcYFgJS2UaFcxupHiYkro49S8yGasTvXEYBVPamhGW6cFJodrTHy",
                 "xprvA41z7zogVVwxVSgdKUHDy1SKmdb533PjDz7J6N6mV6uS3ze1ai8FHa8kmHScGpWmj4WggLyQjgPie1rFSruoUihUZREPSL39UNdE3BBDu76",
             ),
@@ -1068,14 +2364,89 @@ mod tests {
             assert_eq!(usize::from(xpub[4]), path.len());
             let node = bip32_derive(&seed, path).expect("valid derivation");
             assert_eq!(node.chain_code[..], xpub[13..45], "chain code at {path:?}");
-            assert_eq!(node.public_key()[..], xpub[45..], "public key at {path:?}");
+            assert_eq!(
+                secp256k1_public_key(&node.private_key).unwrap()[..],
+                xpub[45..],
+                "public key at {path:?}"
+            );
             assert_eq!(xprv[45], 0);
             assert_eq!(node.private_key[..], xprv[46..], "private key at {path:?}");
         }
     }
 
     #[test]
-    fn ed25519_and_secp256k1_references_match_published_vectors() {
+    fn slip10_matches_ed25519_test_vector_1() {
+        // SLIP-0010, "Test vector 1 for ed25519": (path, chain code, private, public).
+        let seed = hex("000102030405060708090a0b0c0d0e0f");
+        let chain: [(&[u32], &str, &str, &str); 6] = [
+            (
+                &[],
+                "90046a93de5380a72b5e45010748567d5ea02bbf6522f979e05c0d8d8ca9fffb",
+                "2b4be7f19ee27bbf30c667b642d5f4aa69fd169872f8fc3059c08ebae2eb19e7",
+                "a4b2856bfec510abab89753fac1ac0e1112364e7d250545963f135f2a33188ed",
+            ),
+            (
+                &[H],
+                "8b59aa11380b624e81507a27fedda59fea6d0b779a778918a2fd3590e16e9c69",
+                "68e0fe46dfb67e368c75379acec591dad19df3cde26e63b93a8e704f1dade7a3",
+                "8c8a13df77a28f3445213a0f432fde644acaa215fc72dcdf300d5efaa85d350c",
+            ),
+            (
+                &[H, H + 1],
+                "a320425f77d1b5c2505a6b1b27382b37368ee640e3557c315416801243552f14",
+                "b1d0bad404bf35da785a64ca1ac54b2617211d2777696fbffaf208f746ae84f2",
+                "1932a5270f335bed617d5b935c80aedb1a35bd9fc1e31acafd5372c30f5c1187",
+            ),
+            (
+                &[H, H + 1, H + 2],
+                "2e69929e00b5ab250f49c3fb1c12f252de4fed2c1db88387094a0f8c4c9ccd6c",
+                "92a5b23c0b8a99e37d07df3fb9966917f5d06e02ddbd909c7e184371463e9fc9",
+                "ae98736566d30ed0e9d2f4486a64bc95740d89c7db33f52121f8ea8f76ff0fc1",
+            ),
+            (
+                &[H, H + 1, H + 2, H + 2],
+                "8f6d87f93d750e0efccda017d662a1b31a266e4a6f5993b15f5c1f07f74dd5cc",
+                "30d1dc7e5fc04c31219ab25a27ae00b50f6fd66622f6e9c913253d6511d1e662",
+                "8abae2d66361c879b900d204ad2cc4984fa2aa344dd7ddc46007329ac76c429c",
+            ),
+            (
+                &[H, H + 1, H + 2, H + 2, H + 1_000_000_000],
+                "68789923a0cac2cd5a29172a475fe9e0fb14cd6adb5ad98a3fa70333e7afa230",
+                "8f94d394a8e8fd6b1bc2f3f49f5c47e385281d5c17e65324b0f62483e37e8793",
+                "3c24da049451555d51a7014a37337aa4e12d41e485abccfa46b47dfb2af54b7a",
+            ),
+        ];
+        for (path, chain_code, private, public_key) in chain {
+            let node = slip10_ed25519_derive(&seed, path).unwrap();
+            assert_eq!(node.chain_code, arr::<32>(chain_code), "{path:?}");
+            assert_eq!(node.private_key, arr::<32>(private), "{path:?}");
+            assert_eq!(ed25519_public_key(&node.private_key), arr::<32>(public_key));
+        }
+        assert!(slip10_ed25519_derive(&seed, &[H, 1]).is_none());
+    }
+
+    #[test]
+    fn bip32_ed25519_matches_the_reference_implementation() {
+        // `D1` and `D1_H0` of `rust-ed25519-bip32` (`src/tests.rs`, `xprv_derive`):
+        // the child at index 0x80000000.
+        let child = cardano_root().child(H);
+        assert_eq!(
+            child.0,
+            arr::<96>(
+                "60d399da83ef80d8d4f8d223239efdc2b8fef387e1b5219137ffb4e8fbdea15a
+                 dc9366b7d003af37c11396de9a83734e30e05e851efa32745c9cd7b42712c890
+                 608763770eddf77248ab652984b21b849760d1da74a6f5bd633ce41adceef07a"
+            )
+        );
+        // A soft step uses the public key and other tags, so it differs from the
+        // hardened step of the same low index.
+        let soft = cardano_root().child(0);
+        assert_ne!(soft.0, child.0);
+        assert_eq!(cardano_root().descend(&[H, 0]).0, child.child(0).0);
+    }
+
+    #[test]
+    fn locks_match_published_vectors() {
         // RFC 8032 section 7.1, tests 1 and 2.
         for (seed, public) in [
             (
@@ -1089,240 +2460,428 @@ mod tests {
         ] {
             assert_eq!(ed25519_public_key(&arr(seed)), arr::<32>(public));
         }
-        // Secret key 1: the generator.
+        // Secret key 1: the generator and its well-known addresses.
         let mut one = [0u8; 32];
         one[31] = 1;
+        let credential = |lock| secp256k1_credential(lock, &one, None).unwrap();
         assert_eq!(
             secp256k1_public_key(&one).unwrap(),
             arr::<33>("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
         );
         assert_eq!(
-            bitcoin_hash160(&one).unwrap(),
-            arr::<20>("751e76e8199196d454941c45d1b3a323f1433bd6")
+            credential(Lock::P2pkh),
+            Credential::BitcoinKeyHash(arr("751e76e8199196d454941c45d1b3a323f1433bd6"))
         );
         assert_eq!(
-            ethereum_address(&one).unwrap(),
-            arr::<20>("7e5f4552091a69125d5dfcb7b8c2659029395bdf")
+            credential(Lock::P2pkhUncompressed),
+            Credential::BitcoinKeyHash(arr("91b24bf9f5288532960ac687abb035127b1d28a5"))
         );
-        // Zero and the group order are not keys.
+        assert_eq!(
+            credential(Lock::P2shP2wpkh),
+            Credential::BitcoinScriptHash(arr("bcfeb728b584253d5f3f70bcb780e9ef218a68f4"))
+        );
+        assert_eq!(
+            credential(Lock::Ethereum),
+            Credential::EthereumAddress(arr("7e5f4552091a69125d5dfcb7b8c2659029395bdf"))
+        );
+        // Zero and the group order are not keys; a script tree needs its root.
         let order = arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
-        assert_eq!(secp256k1_public_key(&[0; 32]), None);
-        assert_eq!(bitcoin_hash160(&order), None);
-        assert_eq!(ethereum_address(&order), None);
+        assert_eq!(secp256k1_credential(Lock::P2pkh, &[0; 32], None), None);
+        assert_eq!(secp256k1_credential(Lock::Ethereum, &order, None), None);
+        assert_eq!(secp256k1_credential(Lock::TaprootScriptTree, &one, None), None);
     }
 
     #[test]
-    fn nullifier_separates_domains_and_curves_and_follows_the_key() {
-        let n = migration_nullifier(NullifierCurve::Secp256k1, &KEY, &DOMAIN);
-        let mut other_domain = DOMAIN;
-        other_domain[31] ^= 1;
-        assert_ne!(
-            n,
-            migration_nullifier(NullifierCurve::Secp256k1, &KEY, &other_domain)
-        );
-        assert_ne!(n, migration_nullifier(NullifierCurve::Ed25519, &KEY, &DOMAIN));
-        let mut other_key = KEY;
-        other_key[0] ^= 1;
-        assert_ne!(
-            n,
-            migration_nullifier(NullifierCurve::Secp256k1, &other_key, &DOMAIN)
-        );
+    fn taproot_matches_bip341_wallet_vectors() {
+        // BIP-341 `wallet-test-vectors.json`, `keyPathSpending`, inputs 0, 1 and 3:
+        // (internal private key, merkle root, tweak, tweaked private key, output key).
+        let vectors: [(&str, Option<&str>, &str, &str, &str); 3] = [
+            (
+                "6b973d88838f27366ed61c9ad6367663045cb456e28335c109e30717ae0c6baa",
+                None,
+                "b86e7be8f39bab32a6f2c0443abbc210f0edac0e2c53d501b36b64437d9c6c70",
+                "2405b971772ad26915c8dcdf10f238753a9b837e5f8e6a86fd7c0cce5b7296d9",
+                "53a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343",
+            ),
+            (
+                "1e4da49f6aaf4e5cd175fe08a32bb5cb4863d963921255f33d3bc31e1343907f",
+                Some("5b75adecf53548f3ec6ad7d78383bf84cc57b55a3127c72b9a2481752dd88b21"),
+                "cbd8679ba636c1110ea247542cfbd964131a6be84f873f7f3b62a777528ed001",
+                "ea260c3b10e60f6de018455cd0278f2f5b7e454be1999572789e6a9565d26080",
+                "147c9c57132f6e7ecddba9800bb0c4449251c92a1e60371ee77557b6620f3ea3",
+            ),
+            (
+                "d3c7af07da2d54f7a7735d3d0fc4f0a73164db638b2f2f7c43f711f6d4aa7e64",
+                Some("c525714a7f49c28aedbbba78c005931a81c234b2f6c99a73e4d06082adc8bf2b"),
+                "6af9e28dbf9d6aaf027696e2598a5b3d056f5fd2355a7fd5a37a0e5008132d30",
+                "97323385e57015b75b0339a549c56a948eb961555973f0951f555ae6039ef00d",
+                "e4d810fd50586274face62b8a807eb9719cef49c04177cc6b76a9a4251d5450e",
+            ),
+        ];
+        let mut odd_internal_keys = 0;
+        for (key, root, tweak, tweaked, output) in vectors {
+            let key: [u8; 32] = arr(key);
+            let root: Option<[u8; 32]> = root.map(arr);
+            let internal = secp256k1_public_key(&key).unwrap();
+            odd_internal_keys += usize::from(internal[0] == 3);
+            let x: [u8; 32] = internal[1..].try_into().unwrap();
+            assert_eq!(taproot_tweak(&x, root.as_ref()), arr::<32>(tweak));
+            assert_eq!(taproot_output_key(&key, root.as_ref()).unwrap(), arr::<32>(output));
+            assert_eq!(secp256k1_public_key(&arr(tweaked)).unwrap()[1..], hex(output)[..]);
+            let lock = if root.is_some() { Lock::TaprootScriptTree } else { Lock::TaprootKeyPath };
+            assert_eq!(
+                secp256k1_credential(lock, &key, root.as_ref()),
+                Some(Credential::BitcoinTaproot(arr(output)))
+            );
+        }
+        // The vectors exercise the negation of an odd internal key.
+        assert!(odd_internal_keys >= 1);
+    }
+
+    #[test]
+    fn bip39_seed_matches_the_reference_vectors() {
+        // `python-mnemonic` `vectors.json` (passphrase "TREZOR"): mnemonic, seed, master xprv.
+        let vectors = [
+            (
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04",
+                "xprv9s21ZrQH143K3h3fDYiay8mocZ3afhfULfb5GX8kCBdno77K4HiA15Tg23wpbeF1pLfs1c5SPmYHrEpTuuRhxMwvKDwqdKiGJS9XFKzUsAF",
+            ),
+            (
+                "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+                "ac27495480225222079d7be181583751e86f571027b0497b5b5d11218e0a8a13332572917f0f8e5a589620c6f15b11c61dee327651a14c34e18231052e48c069",
+                "xprv9s21ZrQH143K2V4oox4M8Zmhi2Fjx5XK4Lf7GKRvPSgydU3mjZuKGCTg7UPiBUD7ydVPvSLtg9hjp7MQTYsW67rZHAXeccqYqrsx8LcXnyd",
+            ),
+            (
+                "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold",
+                "01f5bced59dec48e362f2c45b5de68b9fd6c92c6634f44d6d40aab69056506f0e35524a518034ddc1192e1dacd32c1ed3eaa3c3b131c88ed8e7e54c49a5d0998",
+                "xprv9s21ZrQH143K39rnQJknpH1WEPFJrzmAqqasiDcVrNuk926oizzJDDQkdiTvNPr2FYDYzWgiMiC63YmfPAa2oPyNB23r2g7d1yiK6WpqaQS",
+            ),
+        ];
+        for (mnemonic, seed, xprv) in vectors {
+            let got = bip39_seed(mnemonic, "TREZOR");
+            assert_eq!(got[..], hex(seed)[..]);
+            let (xprv, master) = (base58check(xprv), bip32_master(&got).unwrap());
+            assert_eq!(master.chain_code[..], xprv[13..45]);
+            assert_eq!(master.private_key[..], xprv[46..]);
+        }
+        assert_ne!(bip39_seed(vectors[0].0, ""), bip39_seed(vectors[0].0, "TREZOR"));
+    }
+
+    #[test]
+    fn nullifier_is_per_secret_credential_and_domain() {
+        let credential = Credential::BitcoinKeyHash([7; 20]);
+        let n = migration_nullifier(1, &KEY, &DOMAIN, &credential);
         // It is plain SHA-256 of the documented preimage.
-        let mut preimage = b"QSAG.MIGRATE.HEM.NULLIFIER/v1\0\0\x01".to_vec();
+        let mut preimage = b"QSAG.MIGRATE.HEM.NULLIFIER/v2\x01\0\0".to_vec();
         preimage.extend_from_slice(&DOMAIN);
+        preimage.extend_from_slice(&credential.identifier());
+        preimage.extend_from_slice(&[0; 32]);
         preimage.extend_from_slice(&KEY);
         assert_eq!(n, sha2_native::sha256(&preimage));
 
-        // The same key through three statements has one nullifier per domain.
-        let (bitcoin, _) = statement(0);
-        let (ethereum, _) = statement(1);
-        assert_eq!(bitcoin.nullifier, n);
-        assert_eq!(ethereum.nullifier, n);
-        let path = vec![BIP32_HARDENED + 44, 5];
-        let node = bip32_derive(&seed64(), &path).unwrap();
-        let derive = |kind: &ClaimKind, w: &OwnershipWitness, domain: [u8; 32]| {
-            OwnershipStatement::derive(kind, w, PQ, domain, EPOCH).unwrap()
-        };
+        let mut other_domain = DOMAIN;
+        other_domain[31] ^= 1;
+        let mut other_key = KEY;
+        other_key[0] ^= 1;
+        assert_ne!(n, migration_nullifier(1, &KEY, &other_domain, &credential));
+        assert_ne!(n, migration_nullifier(2, &KEY, &DOMAIN, &credential));
+        assert_ne!(n, migration_nullifier(1, &other_key, &DOMAIN, &credential));
+        assert_ne!(n, migration_nullifier(1, &KEY, &DOMAIN, &Credential::EthereumAddress([7; 20])));
+        assert_ne!(n, migration_nullifier(1, &KEY, &DOMAIN, &Credential::BitcoinKeyHash([8; 20])));
+
+        // An Ed25519 key proved from its seed or through SLIP-0010 has one nullifier.
+        let master = seed(16);
+        let path = [H, H + 1];
+        let leaf = slip10_ed25519_derive(&master, &path).unwrap();
+        let via_slip10 = derive(
+            Lock::Ed25519,
+            KeySource::Slip10 { path: public(&path) },
+            &OwnershipWitness::seed(&master),
+        );
+        let via_hidden_path = derive(
+            Lock::Ed25519,
+            KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 3 } },
+            &OwnershipWitness::seed(&master).with_path(&path),
+        );
         let via_seed = derive(
-            &ClaimKind::Bip32Secp256k1 { path },
-            &OwnershipWitness::Bip32Seed(seed64()),
-            DOMAIN,
+            Lock::Ed25519,
+            KeySource::Ed25519Seed,
+            &OwnershipWitness::ed25519_seed(&leaf.private_key),
         );
-        let leaf = OwnershipWitness::Secp256k1Key(node.private_key);
-        let via_key = derive(&ClaimKind::BitcoinHash160, &leaf, DOMAIN);
-        assert_eq!(via_seed.nullifier, via_key.nullifier);
-        assert_ne!(via_seed.nullifier, n);
-        assert_ne!(
-            derive(&ClaimKind::BitcoinHash160, &leaf, other_domain).nullifier,
-            via_key.nullifier
+        assert_eq!(via_slip10.credential, via_seed.credential);
+        assert_eq!(via_slip10.nullifier, via_seed.nullifier);
+        assert_eq!(via_slip10.nullifier, via_hidden_path.nullifier);
+
+        // A revealed secp256k1 key: the seed statement's nullifier is not the function of
+        // the signing key that the hidden-key statement uses, and not one of the leaf's
+        // chain code either.
+        let master = seed(64);
+        let path = [H + 44, 5];
+        let leaf = bip32_derive(&master, &path).unwrap();
+        let seeded = derive(
+            Lock::P2pkh,
+            bip32(Bip32Root::Seed, public(&path)),
+            &OwnershipWitness::seed(&master),
         );
-        // Both also name the same legacy credential.
+        let hidden = derive(
+            Lock::P2pkh,
+            KeySource::Secp256k1Key,
+            &OwnershipWitness::secp256k1_key(&leaf.private_key),
+        );
+        assert_eq!(seeded.credential, hidden.credential);
+        assert_ne!(seeded.nullifier, hidden.nullifier);
+        for kind in [1, 2, 7] {
+            for secret in [&leaf.private_key, &leaf.chain_code] {
+                assert_ne!(
+                    seeded.nullifier,
+                    migration_nullifier(kind, secret, &DOMAIN, &seeded.credential)
+                );
+            }
+        }
         assert_eq!(
-            via_seed.claim.legacy_commitment(),
-            via_key.claim.legacy_commitment()
-        );
-        // The Ed25519 nullifier is over the clamped scalar, not the seed.
-        let (ed, _) = statement(2);
-        assert_eq!(
-            ed.nullifier,
+            seeded.nullifier,
             migration_nullifier(
-                NullifierCurve::Ed25519,
-                &ed25519_clamped_scalar(&KEY),
-                &DOMAIN
+                2,
+                &master_inner_digest(BIP32_MASTER_KEY, &master),
+                &DOMAIN,
+                &seeded.credential
             )
         );
-        assert_ne!(
-            ed.nullifier,
-            migration_nullifier(NullifierCurve::Ed25519, &KEY, &DOMAIN)
+        // Two credentials of that seed are unlinkable by nullifier and by identifier.
+        let ethereum = derive(
+            Lock::Ethereum,
+            bip32(Bip32Root::Seed, public(&path)),
+            &OwnershipWitness::seed(&master),
         );
+        assert_ne!(ethereum.nullifier, seeded.nullifier);
+        assert_ne!(ethereum.credential.identifier(), seeded.credential.identifier());
     }
 
     #[test]
     fn derive_rejects_unusable_witnesses() {
-        let derive = |kind: &ClaimKind, w: &OwnershipWitness| {
-            OwnershipStatement::derive(kind, w, PQ, DOMAIN, EPOCH)
+        let try_derive = |lock, source, w: &OwnershipWitness| {
+            OwnershipStatement::derive(lock, source, w, PQ, DOMAIN, EPOCH)
         };
         let order = arr::<32>("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
-        let bip32 = |path: Vec<u32>| ClaimKind::Bip32Secp256k1 { path };
-        assert!(derive(&ClaimKind::BitcoinHash160, &OwnershipWitness::Secp256k1Key([0; 32])).is_none());
-        assert!(derive(&ClaimKind::EthereumAddress, &OwnershipWitness::Secp256k1Key(order)).is_none());
-        assert!(derive(&ClaimKind::Ed25519Seed, &OwnershipWitness::Secp256k1Key(KEY)).is_none());
-        assert!(derive(&ClaimKind::BitcoinHash160, &OwnershipWitness::Ed25519Seed(KEY)).is_none());
-        assert!(derive(&bip32(vec![]), &OwnershipWitness::Bip32Seed(vec![1; 15])).is_none());
-        assert!(derive(&bip32(vec![]), &OwnershipWitness::Bip32Seed(vec![1; 65])).is_none());
-        assert!(derive(&bip32(vec![0; 11]), &OwnershipWitness::Bip32Seed(vec![1; 32])).is_none());
-        assert!(derive(&bip32(vec![0; 10]), &OwnershipWitness::Bip32Seed(vec![1; 16])).is_some());
+        let key = OwnershipWitness::secp256k1_key(&KEY);
+        let seed_root = |path| bip32(Bip32Root::Seed, path);
+        assert!(try_derive(Lock::P2pkh, KeySource::Secp256k1Key, &OwnershipWitness::secp256k1_key(&[0; 32])).is_none());
+        assert!(try_derive(Lock::Ethereum, KeySource::Secp256k1Key, &OwnershipWitness::secp256k1_key(&order)).is_none());
+        // Lock and source of different curves.
+        assert!(try_derive(Lock::Ed25519, KeySource::Secp256k1Key, &key).is_none());
+        assert!(try_derive(Lock::P2pkh, KeySource::Ed25519Seed, &key).is_none());
+        // A script tree without its root.
+        assert!(try_derive(Lock::TaprootScriptTree, KeySource::Secp256k1Key, &key).is_none());
+        // Seed lengths, path lengths, a hidden path longer than its bound.
+        assert!(try_derive(Lock::P2pkh, seed_root(public(&[])), &OwnershipWitness::seed(&[1; 15])).is_none());
+        assert!(try_derive(Lock::P2pkh, seed_root(public(&[])), &OwnershipWitness::seed(&[1; 65])).is_none());
+        assert!(try_derive(Lock::P2pkh, seed_root(public(&[0; 11])), &OwnershipWitness::seed(&[1; 32])).is_none());
+        assert!(try_derive(Lock::P2pkh, seed_root(public(&[0; 10])), &OwnershipWitness::seed(&[1; 16])).is_some());
+        let hidden = |max_depth| seed_root(PathSpec::Hidden { max_depth });
+        let walk = OwnershipWitness::seed(&[1; 32]).with_path(&[1, 2, 3]);
+        assert!(try_derive(Lock::P2pkh, hidden(2), &walk).is_none());
+        assert!(try_derive(Lock::P2pkh, hidden(3), &walk).is_some());
+        assert!(try_derive(Lock::P2pkh, hidden(0), &walk).is_none());
+        assert!(try_derive(Lock::P2pkh, hidden(11), &walk).is_none());
+        // SLIP-0010 has hardened steps only.
+        let slip = |path| KeySource::Slip10 { path };
+        assert!(try_derive(Lock::Ed25519, slip(public(&[H, 1])), &OwnershipWitness::seed(&[1; 32])).is_none());
+        assert!(try_derive(Lock::Ed25519, slip(PathSpec::Hidden { max_depth: 3 }), &walk).is_none());
+        // An extended key is 64 bytes with a valid scalar.
+        let xprv = |path| bip32(Bip32Root::ExtendedKey, path);
+        assert!(try_derive(Lock::P2pkh, xprv(public(&[1])), &OwnershipWitness::seed(&[1; 32])).is_none());
+        assert!(try_derive(Lock::P2pkh, xprv(public(&[1])), &OwnershipWitness::seed(&[0; 64])).is_none());
     }
 
     #[test]
     fn statement_encoding_is_canonical_and_strict() {
-        for index in 0..4 {
-            let (st, _) = statement(index);
+        for (name, lock, source, witness) in cases() {
+            let st = derive(lock, source, &witness);
             let bytes = st.to_bytes();
-            assert_eq!(OwnershipStatement::from_bytes(&bytes), Some(st.clone()));
-            assert_eq!(bytes[29], st.claim.tag());
-            assert_eq!(bytes[30], u8::from(index >= 2));
+            assert_eq!(OwnershipStatement::from_bytes(&bytes), Some(st.clone()), "{name}");
+            assert_eq!(bytes[29], lock as u8);
+            assert_eq!(bytes[30], u8::from(st.source != KeySource::Secp256k1Key));
 
             let mut longer = bytes.clone();
             longer.push(0);
-            assert_eq!(OwnershipStatement::from_bytes(&longer), None);
-            assert_eq!(OwnershipStatement::from_bytes(&bytes[..bytes.len() - 1]), None);
-            // Tag, kind and exposure are checked; every later byte is a statement field.
-            for at in 0..31 {
+            assert_eq!(OwnershipStatement::from_bytes(&longer), None, "{name}");
+            assert_eq!(OwnershipStatement::from_bytes(&bytes[..bytes.len() - 1]), None, "{name}");
+            // The tag and the exposure byte are checked; every other byte is a field.
+            for at in (0..29).chain([30]) {
                 let mut bad = bytes.clone();
                 bad[at] ^= 1;
-                assert_eq!(OwnershipStatement::from_bytes(&bad), None, "byte {at}");
+                assert_eq!(OwnershipStatement::from_bytes(&bad), None, "{name} byte {at}");
             }
-            for at in 31..bytes.len() {
+            for at in (29..bytes.len()).filter(|&at| at != 30) {
                 let mut other = bytes.clone();
                 other[at] ^= 0x40;
-                assert_ne!(OwnershipStatement::from_bytes(&other), Some(st.clone()), "byte {at}");
+                assert_ne!(OwnershipStatement::from_bytes(&other), Some(st.clone()), "{name} byte {at}");
             }
         }
-        // BIP-32 parameters outside the supported ranges do not decode.
-        let (st, _) = statement(3);
-        let with = |f: &dyn Fn(&mut LegacyClaim)| {
+        // Parameters outside the supported ranges are malformed and do not decode.
+        let (_, lock, _, witness) = cases().remove(0);
+        let st = derive(lock, KeySource::Secp256k1Key, &witness);
+        let with = |f: &dyn Fn(&mut OwnershipStatement)| {
             let mut bad = st.clone();
-            f(&mut bad.claim);
+            f(&mut bad);
             (bad.is_well_formed(), OwnershipStatement::from_bytes(&bad.to_bytes()).is_some())
         };
-        let seed_len = |v: u8| {
-            move |c: &mut LegacyClaim| {
-                if let LegacyClaim::Bip32Secp256k1 { seed_len, .. } = c {
-                    *seed_len = v;
-                }
-            }
-        };
-        assert_eq!(with(&seed_len(15)), (false, false));
-        assert_eq!(with(&seed_len(65)), (false, false));
-        assert_eq!(with(&seed_len(16)), (true, true));
-        assert_eq!(
-            with(&|c| {
-                if let LegacyClaim::Bip32Secp256k1 { path, .. } = c {
-                    *path = vec![1; MAX_BIP32_DEPTH + 1];
-                }
-            }),
-            (false, false)
-        );
-        assert_eq!(
-            with(&|c| {
-                if let LegacyClaim::Bip32Secp256k1 { public_key, .. } = c {
-                    public_key[0] = 4;
-                }
-            }),
-            (false, false)
-        );
+        let source = |source: KeySource| move |s: &mut OwnershipStatement| s.source = source.clone();
+        assert_eq!(with(&|_| {}), (true, true));
+        assert_eq!(with(&source(bip32(Bip32Root::Seed, public(&[0; 11])))), (false, false));
+        assert_eq!(with(&source(bip32(Bip32Root::Seed, public(&[0; 10])))), (true, true));
+        assert_eq!(with(&source(bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 0 }))), (false, false));
+        assert_eq!(with(&source(bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 11 }))), (false, false));
+        assert_eq!(with(&source(KeySource::Ed25519Seed)), (false, false));
+        assert_eq!(with(&source(KeySource::Slip10 { path: public(&[1]) })), (false, false));
+        // The wire carries the credential's bytes and the lock gives them their type, so a
+        // mistyped credential is malformed in memory and cannot be expressed on the wire.
+        assert_eq!(with(&|s| s.lock = Lock::Ethereum), (false, true));
+        let mut mistyped = st.clone();
+        mistyped.lock = Lock::Ethereum;
+        let decoded = OwnershipStatement::from_bytes(&mistyped.to_bytes()).unwrap();
+        assert!(matches!(decoded.credential, Credential::EthereumAddress(_)));
+        assert_ne!(decoded, mistyped);
+        assert_eq!(with(&|s| s.lock = Lock::P2pkhUncompressed), (true, true));
     }
 
-    /// The relation itself, without a proof: satisfied by the honest assignment, and
+    /// The relations themselves, without proofs: satisfied by the honest assignment, and
     /// unsatisfied when any public region or the witness is wrong.
     #[test]
     fn relations_accept_the_honest_assignment_only() {
-        for index in 0..4 {
-            let (st, witness) = statement(index);
-            let relation = st.claim.relation().unwrap();
-            let public = st.public_bits(&relation);
-            let (shape, z, rows) = build(&relation, &public, witness.secret());
-            assert!(shape.is_satisfied(&z), "case {index}");
+        for (name, lock, source, witness) in cases() {
+            let st = derive(lock, source.clone(), &witness);
+            let public = st.public_bits();
+            let (shape, z, rows) = build(lock, &source, &public, &relation_witness(&witness));
+            assert!(shape.is_satisfied(&z), "{name}");
             assert_eq!(shape.num_sbox, 0, "the collaborative prover needs mul rows only");
             assert_eq!(shape.num_public, public.len());
-            assert!(rows > 90_000 && rows + 12 <= shape.num_rows());
+            assert!(rows > 80_000 && rows + 12 <= shape.num_rows(), "{name}: {rows}");
             assert_eq!(st.public_inputs().unwrap(), z[1..=public.len()]);
+            // The cached shape is built from a placeholder witness and zero public inputs.
+            assert_eq!(shape.digest(), ownership_shape(&st).unwrap().digest(), "{name}");
 
-            // The shape does not depend on the witness or on public values.
-            assert_eq!(shape.digest(), ownership_shape(&st).unwrap().digest());
-            let other_secret = match index {
-                0 | 1 => vec![0x77; 32],
-                2 => vec![0xff; 32],
-                _ => vec![0xff; 64],
-            };
-            let (other, _, _) = build(&relation, &vec![true; public.len()], &other_secret);
-            assert_eq!(other.digest(), shape.digest());
-
-            // One wrong bit in the claim, in the domain's chaining value, in the nullifier.
-            let claim_bits = 8 * relation.claim_bytes();
-            for at in [3, claim_bits - 1, claim_bits + 5, claim_bits + 255, claim_bits + 256, public.len() - 1] {
+            // One wrong bit in the credential, in the chaining value, in the nullifier.
+            let value_bits = 8 * lock.credential_bytes();
+            for at in [3, value_bits - 1, value_bits + 5, value_bits + 255, value_bits + 256, public.len() - 1] {
                 let mut wrong = public.clone();
                 wrong[at] ^= true;
-                let (shape, z, _) = build(&relation, &wrong, witness.secret());
-                assert!(!shape.is_satisfied(&z), "case {index}, public bit {at}");
+                let (shape, z, _) = build(lock, &source, &wrong, &relation_witness(&witness));
+                assert!(!shape.is_satisfied(&z), "{name}, public bit {at}");
             }
             // Another secret under the honest public values.
-            let mut secret = witness.secret().to_vec();
-            secret[7] ^= 0x20;
-            let (shape, z, _) = build(&relation, &public, &secret);
-            assert!(!shape.is_satisfied(&z), "case {index}, wrong secret");
-        }
-
-        // A BIP-32 statement is tied to its path and to hardened versus normal steps.
-        let (st, witness) = statement(3);
-        let public = st.public_bits(&st.claim.relation().unwrap());
-        for path in [vec![BIP32_HARDENED + 45], vec![44], vec![]] {
-            let relation = Relation::Bip32Secp256k1 { seed_len: 64, path };
-            let (shape, z, _) = build(&relation, &public, witness.secret());
-            assert!(!shape.is_satisfied(&z));
+            let mut other = witness.clone();
+            other.secret[7] ^= 0x20;
+            let (shape, z, _) = build(lock, &source, &public, &relation_witness(&other));
+            assert!(!shape.is_satisfied(&z), "{name}, wrong secret");
+            if !witness.path.is_empty() {
+                let mut other = witness.clone();
+                other.path[0] ^= 1;
+                let (shape, z, _) = build(lock, &source, &public, &relation_witness(&other));
+                assert!(!shape.is_satisfied(&z), "{name}, wrong hidden path");
+            }
+            if lock == Lock::TaprootScriptTree {
+                let mut other = witness.clone();
+                other.merkle_root = Some([0x3d; 32]);
+                let (shape, z, _) = build(lock, &source, &public, &relation_witness(&other));
+                assert!(!shape.is_satisfied(&z), "{name}, wrong merkle root");
+            }
         }
     }
 
     #[test]
-    fn bip32_relation_follows_normal_and_hardened_steps() {
-        // One normal and one hardened step below a 16-byte seed.
-        let seed = hex("000102030405060708090a0b0c0d0e0f");
-        let path = vec![1, BIP32_HARDENED + 2];
-        let witness = OwnershipWitness::Bip32Seed(seed);
-        let kind = ClaimKind::Bip32Secp256k1 { path };
-        let st = OwnershipStatement::derive(&kind, &witness, PQ, DOMAIN, EPOCH).unwrap();
-        let relation = st.claim.relation().unwrap();
-        let public = st.public_bits(&relation);
-        let (shape, z, _) = build(&relation, &public, witness.secret());
-        assert!(shape.is_satisfied(&z));
-        // Swapping which step is hardened is a different relation that this key fails.
-        let swapped = Relation::Bip32Secp256k1 {
-            seed_len: 16,
-            path: vec![BIP32_HARDENED + 1, 2],
+    fn public_paths_and_roots_select_the_relation() {
+        let master = seed(64);
+        let witness = OwnershipWitness::seed(&master);
+        let honest = bip32(Bip32Root::Seed, public(&[H + 44, 1]));
+        let st = derive(Lock::P2pkh, honest, &witness);
+        let public_bits = st.public_bits();
+        // Another index, swapped hardening, a shorter and a longer path: this key fails.
+        for path in [vec![H + 45, 1], vec![44, H + 1], vec![H + 44], vec![H + 44, 1, 0]] {
+            let source = bip32(Bip32Root::Seed, PathSpec::Public(path));
+            let (shape, z, _) = build(Lock::P2pkh, &source, &public_bits, &relation_witness(&witness));
+            assert!(!shape.is_satisfied(&z));
+        }
+        // The same leaf from an extended key one step up: a different relation with
+        // another nullifier secret, satisfied for its own statement only.
+        let parent = OwnershipWitness::extended_key(&bip32_derive(&master, &[H + 44]).unwrap());
+        let from_parent = bip32(Bip32Root::ExtendedKey, public(&[1]));
+        let st_parent = derive(Lock::P2pkh, from_parent.clone(), &parent);
+        assert_eq!(st_parent.credential, st.credential);
+        assert_ne!(st_parent.nullifier, st.nullifier);
+        let run = |bits: &[bool]| {
+            let (shape, z, _) = build(Lock::P2pkh, &from_parent, bits, &relation_witness(&parent));
+            shape.is_satisfied(&z)
         };
-        let (shape, z, _) = build(&swapped, &public, witness.secret());
-        assert!(!shape.is_satisfied(&z));
+        assert!(run(&st_parent.public_bits()));
+        assert!(!run(&public_bits));
+    }
+
+    #[test]
+    fn hidden_paths_and_seed_lengths_share_one_relation() {
+        let source = bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 2 });
+        let mut digests = Vec::new();
+        let mut credentials = Vec::new();
+        for (len, path) in [(16usize, vec![]), (17, vec![9]), (40, vec![H + 3]), (64, vec![H, 0]), (63, vec![1, H + 2])] {
+            let master = seed(len);
+            let witness = OwnershipWitness::seed(&master).with_path(&path);
+            let st = derive(Lock::P2pkh, source.clone(), &witness);
+            // Native parity: the same leaf as the public-path statement.
+            let leaf = bip32_derive(&master, &path).unwrap();
+            assert_eq!(
+                st.credential,
+                secp256k1_credential(Lock::P2pkh, &leaf.private_key, None).unwrap()
+            );
+            let (shape, z, _) = build(Lock::P2pkh, &source, &st.public_bits(), &relation_witness(&witness));
+            assert!(shape.is_satisfied(&z), "seed {len}, path {path:?}");
+            digests.push(shape.digest());
+            credentials.push(st.credential);
+            // The statement does not carry the path or the seed length.
+            assert_eq!(st.source, source);
+
+            // A seed with a nonzero byte past its length is not a witness.
+            if len < 64 {
+                let mut longer = master.clone();
+                longer.push(1);
+                let mut forged = witness.clone();
+                forged.secret = longer;
+                // Keep the selector at `len` by handing the relation the padded bytes.
+                let mut cs = ConstraintSystem::new();
+                let _ = seed_master(&mut cs, BIP32_MASTER_KEY, &master);
+                let (shape, mut z) = cs.finish();
+                assert!(shape.is_satisfied(&z));
+                // Variable `1 + 8 * len` is the lowest bit of the first byte past the seed.
+                z[1 + 8 * len] = F::ONE;
+                assert!(!shape.is_satisfied(&z), "seed {len}: trailing byte accepted");
+            }
+        }
+        assert!(digests.windows(2).all(|w| w[0] == w[1]));
+        assert!(credentials.windows(2).all(|w| w[0] != w[1]));
+
+        // The master step with a hidden length equals HMAC-SHA512 for every length.
+        for len in [16usize, 31, 32, 55, 56, 64] {
+            let master = seed(len);
+            let mut cs = ConstraintSystem::new();
+            let (i, inner) = seed_master(&mut cs, SLIP10_ED25519_KEY, &master);
+            assert_eq!(
+                super::super::hash::bits_to_bytes(&cs, &i),
+                sha2_native::hmac_sha512(SLIP10_ED25519_KEY, &master).to_vec(),
+                "length {len}"
+            );
+            assert_eq!(
+                super::super::hash::bits_to_bytes(&cs, &inner)[..32],
+                master_inner_digest(SLIP10_ED25519_KEY, &master)
+            );
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+            // Two selectors set, or none, is not a length: variables 513.. are the one-hot.
+            for change in [513 + len - 16, 513 + (len - 16 + 1) % 49] {
+                let mut bad = z.clone();
+                bad[change] = F::ONE - bad[change];
+                assert!(!shape.is_satisfied(&bad), "length {len}, selector {change}");
+            }
+        }
     }
 
     #[test]
@@ -1377,25 +2936,22 @@ mod tests {
 
     #[test]
     fn prover_refuses_a_witness_that_does_not_match() {
-        let (st, witness) = statement(0);
+        let (_, lock, source, witness) = cases().remove(0);
+        let st = derive(lock, source, &witness);
         let mut wrong_key = KEY;
         wrong_key[3] ^= 1;
         let seed = [9; 32];
         assert_eq!(
-            prove_ownership(&st, &OwnershipWitness::Secp256k1Key(wrong_key), REGIME, &seed),
+            prove_ownership(&st, &OwnershipWitness::secp256k1_key(&wrong_key), REGIME, &seed),
             Err(OwnershipError::WitnessMismatch)
         );
-        assert_eq!(
-            prove_ownership(&st, &OwnershipWitness::Ed25519Seed(KEY), REGIME, &seed),
-            Err(OwnershipError::WitnessMismatch)
-        );
-        // The right key cannot claim another nullifier, address or domain.
+        // The right key cannot claim another nullifier, credential or domain.
         for field in 0..3 {
             let mut other = st.clone();
             match field {
                 0 => other.nullifier[0] ^= 1,
                 1 => other.migration_domain[0] ^= 1,
-                _ => other.claim = LegacyClaim::BitcoinHash160([7; 20]),
+                _ => other.credential = Credential::BitcoinKeyHash([7; 20]),
             }
             assert_eq!(
                 prove_ownership(&other, &witness, REGIME, &seed),
@@ -1403,73 +2959,164 @@ mod tests {
                 "field {field}"
             );
         }
-        let (mut st, witness) = statement(3);
-        if let LegacyClaim::Bip32Secp256k1 { seed_len, .. } = &mut st.claim {
-            *seed_len = 65;
-        }
+        let mut malformed = st.clone();
+        malformed.lock = Lock::Ed25519;
         assert_eq!(
-            prove_ownership(&st, &witness, REGIME, &seed),
+            prove_ownership(&malformed, &witness, REGIME, &seed),
             Err(OwnershipError::MalformedStatement)
+        );
+        let (batch, batch_witness) = batch_case();
+        let mut other = batch.clone();
+        other.entries[1].nullifier[0] ^= 1;
+        assert_eq!(
+            prove_batch(&other, &batch_witness, REGIME, &seed),
+            Err(OwnershipError::WitnessMismatch)
+        );
+        assert_eq!(
+            prove_batch(&batch, &OwnershipWitness::seed(&[5; 64]), REGIME, &seed),
+            Err(OwnershipError::WitnessMismatch)
         );
     }
 
-    /// Everything a verifier must reject, against one honest proof.
-    fn check_proof(index: usize) {
-        let (st, proof) = proven(index);
-        assert!(verify_ownership(st, REGIME, proof), "honest proof, case {index}");
+    /// One honest proof per case, shared by the tests below.
+    fn proven(index: usize) -> &'static (OwnershipStatement, OwnershipProof) {
+        static PROOFS: [OnceLock<(OwnershipStatement, OwnershipProof)>; 14] =
+            [const { OnceLock::new() }; 14];
+        PROOFS[index].get_or_init(|| {
+            let (_, lock, source, witness) = cases().remove(index);
+            let st = derive(lock, source, &witness);
+            let proof = prove_ownership(&st, &witness, REGIME, &[index as u8 + 1; 32]).unwrap();
+            (st, proof)
+        })
+    }
 
-        // Each public field is bound.
-        let mut variants: Vec<(&str, OwnershipStatement)> = Vec::new();
+    fn proven_batch() -> &'static (BatchStatement, OwnershipProof) {
+        static PROOF: OnceLock<(BatchStatement, OwnershipProof)> = OnceLock::new();
+        PROOF.get_or_init(|| {
+            let (batch, witness) = batch_case();
+            let proof = prove_batch(&batch, &witness, REGIME, &[77; 32]).unwrap();
+            (batch, proof)
+        })
+    }
+
+    /// Statements that differ from `st` in exactly one public field.
+    fn variants(st: &OwnershipStatement) -> Vec<(&'static str, OwnershipStatement)> {
+        let mut out: Vec<(&'static str, OwnershipStatement)> = Vec::new();
         let mut push = |name: &'static str, f: &dyn Fn(&mut OwnershipStatement)| {
             let mut other = st.clone();
             f(&mut other);
             assert_ne!(&other, st, "{name} must change the statement");
-            variants.push((name, other));
+            out.push((name, other));
         };
         push("pq commitment", &|s| s.pq_commitment[31] ^= 1);
         push("migration domain", &|s| s.migration_domain[0] ^= 0x80);
         push("epoch", &|s| s.epoch += 1);
         push("nullifier", &|s| s.nullifier[16] ^= 4);
-        push("legacy value", &|s| match &mut s.claim {
-            LegacyClaim::BitcoinHash160(v) | LegacyClaim::EthereumAddress(v) => v[19] ^= 1,
-            LegacyClaim::Ed25519Seed { public_key } => public_key[0] ^= 1,
-            LegacyClaim::Bip32Secp256k1 { public_key, .. } => public_key[32] ^= 1,
+        push("credential value", &|s| {
+            let mut value = s.credential.value().to_vec();
+            value[0] ^= 1;
+            s.credential = s.lock.credential(&value).unwrap();
         });
-        if matches!(st.claim, LegacyClaim::Bip32Secp256k1 { .. }) {
-            push("path index", &|s| {
-                if let LegacyClaim::Bip32Secp256k1 { path, .. } = &mut s.claim {
-                    path[0] += 1;
-                }
-            });
-            push("path hardening", &|s| {
-                if let LegacyClaim::Bip32Secp256k1 { path, .. } = &mut s.claim {
-                    path[0] -= BIP32_HARDENED;
-                }
-            });
-            push("path length", &|s| {
-                if let LegacyClaim::Bip32Secp256k1 { path, .. } = &mut s.claim {
-                    path.push(0);
-                }
-            });
-            push("seed length", &|s| {
-                if let LegacyClaim::Bip32Secp256k1 { seed_len, .. } = &mut s.claim {
-                    *seed_len -= 1;
-                }
-            });
-            push("public key parity", &|s| {
-                if let LegacyClaim::Bip32Secp256k1 { public_key, .. } = &mut s.claim {
-                    public_key[0] ^= 1;
-                }
-            });
+        // Another lock that yields the same credential type.
+        match st.lock {
+            Lock::P2pkh => push("lock", &|s| s.lock = Lock::P2pkhUncompressed),
+            Lock::P2pkhUncompressed => push("lock", &|s| s.lock = Lock::P2pkh),
+            Lock::TaprootKeyPath => push("lock", &|s| s.lock = Lock::TaprootScriptTree),
+            Lock::TaprootScriptTree => push("lock", &|s| s.lock = Lock::TaprootKeyPath),
+            _ => {}
         }
-        for (name, other) in &variants {
-            assert!(!verify_ownership(other, REGIME, proof), "{name}, case {index}");
-            // Not merely the tag check: also with the proof relabelled for that statement.
-            let mut relabelled = proof.clone();
-            relabelled.claim_tag = other.claim.tag();
-            assert!(!verify_ownership(other, REGIME, &relabelled), "{name}, case {index}");
+        let respec = |spec: &mut PathSpec, change: u8| match spec {
+            PathSpec::Public(path) => match change {
+                0 => path[0] ^= 1,
+                1 => path.push(H),
+                _ => {
+                    path.pop();
+                }
+            },
+            PathSpec::Hidden { max_depth } => *max_depth += 1,
+        };
+        match &st.source {
+            KeySource::Secp256k1Key => push("source", &|s| {
+                s.source = bip32(Bip32Root::ExtendedKey, public(&[]));
+            }),
+            KeySource::Ed25519Seed => push("source", &|s| {
+                s.source = KeySource::Slip10 { path: public(&[]) };
+            }),
+            KeySource::Bip32 { .. } => {
+                for (name, change) in [("path index", 0), ("longer path", 1), ("shorter path", 2)] {
+                    push(name, &|s| {
+                        if let KeySource::Bip32 { path, .. } = &mut s.source {
+                            respec(path, change);
+                        }
+                    });
+                }
+                push("root", &|s| {
+                    if let KeySource::Bip32 { root, .. } = &mut s.source {
+                        *root = match *root {
+                            Bip32Root::Seed => Bip32Root::ExtendedKey,
+                            Bip32Root::ExtendedKey => Bip32Root::Seed,
+                        };
+                    }
+                });
+                push("path privacy", &|s| {
+                    if let KeySource::Bip32 { path, .. } = &mut s.source {
+                        *path = match path {
+                            PathSpec::Public(p) => PathSpec::Hidden { max_depth: p.len() as u8 },
+                            PathSpec::Hidden { .. } => public(&[H + 44, 7]),
+                        };
+                    }
+                });
+            }
+            KeySource::Slip10 { .. } => {
+                for (name, change) in [("path index", 0), ("longer path", 1)] {
+                    push(name, &|s| {
+                        if let KeySource::Slip10 { path } = &mut s.source {
+                            respec(path, change);
+                        }
+                    });
+                }
+            }
+            KeySource::Bip32Ed25519 { .. } => {
+                push("path index", &|s| {
+                    if let KeySource::Bip32Ed25519 { path } = &mut s.source {
+                        path[1] ^= 1;
+                    }
+                });
+                push("path hardening", &|s| {
+                    if let KeySource::Bip32Ed25519 { path } = &mut s.source {
+                        path[0] ^= H;
+                    }
+                });
+            }
         }
+        out
+    }
 
+    /// Wire format: canonical, strict, and every sampled byte matters.
+    fn check_wire(bytes: &[u8], accepted: &dyn Fn(&[u8]) -> bool, name: &str) {
+        assert!(accepted(bytes), "{name}");
+        let mut longer = bytes.to_vec();
+        longer.push(0);
+        assert!(!accepted(&longer), "{name}: trailing byte");
+        assert!(!accepted(&bytes[..bytes.len() - 1]), "{name}: truncated");
+        let mut tried = 0;
+        for at in (0..9).chain((9..bytes.len()).step_by(bytes.len() / 61)) {
+            let mut bad = bytes.to_vec();
+            bad[at] ^= 1;
+            assert!(!accepted(&bad), "{name}: byte {at} of {}", bytes.len());
+            tried += 1;
+        }
+        assert!(tried >= 60);
+    }
+
+    /// Everything a verifier must reject, against one honest proof.
+    fn check_proof(index: usize) {
+        let name = cases()[index].0;
+        let (st, proof) = proven(index);
+        assert!(verify_ownership(st, REGIME, proof), "honest proof, {name}");
+        for (field, other) in variants(st) {
+            assert!(!verify_ownership(&other, REGIME, proof), "{field}, {name}");
+        }
         // The regime is the verifier's choice and is bound.
         let other_regime = WhirSecurityRegime::Cdhz25JohnsonQrom128;
         assert!(!verify_ownership(st, other_regime, proof));
@@ -1477,103 +3124,198 @@ mod tests {
         relabelled.regime = other_regime;
         assert!(!verify_ownership(st, other_regime, &relabelled));
 
-        // Wire format: canonical, strict, and every sampled byte matters.
         let bytes = proof.to_bytes();
-        let decoded = OwnershipProof::from_bytes(&bytes, st).expect("canonical");
-        assert_eq!(&decoded, proof);
-        assert!(verify_ownership(st, REGIME, &decoded));
+        assert_eq!(OwnershipProof::from_bytes(&bytes, st).as_ref(), Some(proof));
+        check_wire(
+            &bytes,
+            &|b| OwnershipProof::from_bytes(b, st).is_some_and(|p| verify_ownership(st, REGIME, &p)),
+            name,
+        );
+    }
+
+    macro_rules! proof_tests {
+        ($($test:ident = $index:expr;)*) => {$(
+            #[test]
+            fn $test() {
+                check_proof($index);
+            }
+        )*};
+    }
+
+    proof_tests! {
+        proof_p2pkh_from_key = 0;
+        proof_uncompressed_p2pkh_from_key = 1;
+        proof_p2sh_p2wpkh_from_key = 2;
+        proof_ethereum_from_key = 3;
+        proof_taproot_key_path_from_key = 4;
+        proof_taproot_script_tree_from_key = 5;
+        proof_ed25519_from_seed = 6;
+        proof_ed25519_from_slip10 = 7;
+        proof_ed25519_from_slip10_hidden_path = 8;
+        proof_ed25519_from_bip32_ed25519 = 9;
+        proof_p2pkh_from_bip32_seed = 10;
+        proof_ethereum_from_bip32_seed = 11;
+        proof_taproot_from_bip32_extended_key = 12;
+        proof_p2pkh_from_bip32_hidden_path = 13;
+    }
+
+    #[test]
+    fn no_proof_verifies_as_another_statement_kind() {
+        let count = cases().len();
+        assert_eq!(count, 14);
+        let (batch, batch_proof) = proven_batch();
+        for i in 0..count {
+            let (st, _) = proven(i);
+            for j in 0..count {
+                let (_, proof) = proven(j);
+                assert_eq!(verify_ownership(st, REGIME, proof), i == j, "proof {j} as statement {i}");
+                if i != j {
+                    // Also with the other proof's own statement values under this kind.
+                    let (other, _) = proven(j);
+                    let mut crossed = other.clone();
+                    crossed.lock = st.lock;
+                    crossed.source = st.source.clone();
+                    if let Some(credential) = st.lock.credential(other.credential.value()) {
+                        crossed.credential = credential;
+                        assert!(!verify_ownership(&crossed, REGIME, proof), "{j} relabelled as {i}");
+                    }
+                }
+            }
+            assert!(!verify_ownership(st, REGIME, batch_proof), "batch proof as {i}");
+            assert!(!verify_batch(batch, REGIME, &proven(i).1), "proof {i} as batch");
+        }
+        // A batch proof is not a proof of one of its entries either.
+        let entry = batch.statement(0).unwrap();
+        assert!(!verify_ownership(&entry, REGIME, batch_proof));
+    }
+
+    #[test]
+    fn batch_entries_are_the_single_statements() {
+        let (batch, witness) = batch_case();
+        assert_eq!(batch.entries.len(), 2);
+        for (i, index) in [0u32, 1].into_iter().enumerate() {
+            let single = derive(
+                Lock::P2pkh,
+                bip32(Bip32Root::Seed, public(&[H + 44, index])),
+                &witness,
+            );
+            let mut entry = batch.statement(i).unwrap();
+            assert_eq!(entry.pq_commitment, [0x61 + i as u8; 32]);
+            entry.pq_commitment = PQ;
+            assert_eq!(entry, single);
+        }
+        assert_ne!(batch.entries[0].credential, batch.entries[1].credential);
+        assert_ne!(batch.entries[0].nullifier, batch.entries[1].nullifier);
+
+        // The relation: honest assignment only; entries cannot be swapped.
+        let tails: Vec<Vec<u32>> = batch.entries.iter().map(|e| e.tail.clone()).collect();
+        let public_bits = batch.public_bits();
+        let run = |bits: &[bool], secret: &[u8]| {
+            let (shape, z, rows) = build_batch(Lock::P2pkh, Bip32Root::Seed, &batch.prefix, &tails, bits, secret);
+            (shape.is_satisfied(&z), shape, rows)
+        };
+        let (ok, shape, rows) = run(&public_bits, &witness.secret);
+        assert!(ok);
+        assert_eq!(shape.num_sbox, 0);
+        assert_eq!(shape.digest(), batch_shape(&batch).unwrap().digest());
+        let half = public_bits.len() / 2;
+        let swapped = [&public_bits[half..], &public_bits[..half]].concat();
+        assert!(!run(&swapped, &witness.secret).0);
+        for at in [0, half - 1, half, public_bits.len() - 1] {
+            let mut wrong = public_bits.clone();
+            wrong[at] ^= true;
+            assert!(!run(&wrong, &witness.secret).0, "public bit {at}");
+        }
+        assert!(!run(&public_bits, &seed(63)).0);
+        // Sharing: two entries cost less than two single statements.
+        let single = bip32(Bip32Root::Seed, public(&[H + 44, 0]));
+        let st = derive(Lock::P2pkh, single.clone(), &witness);
+        let (_, _, single_rows) = build(Lock::P2pkh, &single, &st.public_bits(), &relation_witness(&witness));
+        assert!(rows + 300_000 < 2 * single_rows, "{rows} vs 2 x {single_rows}");
+
+        // Encoding.
+        let bytes = batch.to_bytes();
+        assert_eq!(BatchStatement::from_bytes(&bytes), Some(batch.clone()));
         let mut longer = bytes.clone();
         longer.push(0);
-        assert!(OwnershipProof::from_bytes(&longer, st).is_none());
-        assert!(OwnershipProof::from_bytes(&bytes[..bytes.len() - 1], st).is_none());
-        let accepted = |bytes: &[u8]| {
-            OwnershipProof::from_bytes(bytes, st).is_some_and(|p| verify_ownership(st, REGIME, &p))
-        };
-        let mut tried = 0;
-        for at in (0..10).chain((10..bytes.len()).step_by(bytes.len() / 61)) {
-            let mut bad = bytes.clone();
-            bad[at] ^= 1;
-            assert!(!accepted(&bad), "byte {at} of {}, case {index}", bytes.len());
-            tried += 1;
+        assert_eq!(BatchStatement::from_bytes(&longer), None);
+        assert_eq!(BatchStatement::from_bytes(&bytes[..bytes.len() - 1]), None);
+        for at in 0..bytes.len() {
+            let mut other = bytes.clone();
+            other[at] ^= 0x10;
+            assert_ne!(BatchStatement::from_bytes(&other), Some(batch.clone()), "byte {at}");
         }
-        assert!(tried >= 60);
+        let mut empty = batch.clone();
+        empty.entries.clear();
+        assert!(!empty.is_well_formed() && BatchStatement::from_bytes(&empty.to_bytes()).is_none());
+        let mut deep = batch.clone();
+        deep.entries[0].tail = vec![0; MAX_PATH_DEPTH];
+        assert!(!deep.is_well_formed());
+        let mut tree = batch.clone();
+        tree.lock = Lock::TaprootScriptTree;
+        assert!(!tree.is_well_formed());
     }
 
     #[test]
-    fn bitcoin_hash160_proof_verifies_and_binds_its_statement() {
-        check_proof(0);
-    }
-
-    #[test]
-    fn ethereum_address_proof_verifies_and_binds_its_statement() {
-        check_proof(1);
-    }
-
-    #[test]
-    fn ed25519_seed_proof_verifies_and_binds_its_statement() {
-        check_proof(2);
-    }
-
-    #[test]
-    fn bip32_proof_verifies_and_binds_its_statement() {
-        check_proof(3);
-    }
-
-    #[test]
-    fn a_proof_for_one_statement_kind_does_not_verify_as_another() {
-        // Bitcoin and Ethereum statements over the same 20 bytes, key and nullifier.
-        let (bitcoin, bitcoin_proof) = proven(0);
-        let (ethereum, ethereum_proof) = proven(1);
-        assert_eq!(bitcoin.nullifier, ethereum.nullifier);
-        let as_ethereum = OwnershipStatement {
-            claim: LegacyClaim::EthereumAddress(bitcoin.claim.value().try_into().unwrap()),
-            ..bitcoin.clone()
+    fn proof_batch_verifies_and_binds_every_entry() {
+        let (batch, proof) = proven_batch();
+        assert!(verify_batch(batch, REGIME, proof));
+        let mut others: Vec<(&str, BatchStatement)> = Vec::new();
+        let mut push = |name: &'static str, f: &dyn Fn(&mut BatchStatement)| {
+            let mut other = batch.clone();
+            f(&mut other);
+            assert_ne!(&other, batch);
+            others.push((name, other));
         };
-        let as_bitcoin = OwnershipStatement {
-            claim: LegacyClaim::BitcoinHash160(ethereum.claim.value().try_into().unwrap()),
-            ..ethereum.clone()
-        };
-        for (other, proof) in [(&as_ethereum, bitcoin_proof), (&as_bitcoin, ethereum_proof)] {
-            assert!(!verify_ownership(other, REGIME, proof));
-            assert!(OwnershipProof::from_bytes(&proof.to_bytes(), other).is_none());
-            let mut relabelled = proof.clone();
-            relabelled.claim_tag = other.claim.tag();
-            assert!(!verify_ownership(other, REGIME, &relabelled));
+        push("pq commitment", &|b| b.entries[1].pq_commitment[0] ^= 1);
+        push("nullifier", &|b| b.entries[0].nullifier[31] ^= 1);
+        push("credential", &|b| {
+            b.entries[1].credential = Credential::BitcoinKeyHash([3; 20]);
+        });
+        push("tail", &|b| b.entries[0].tail[0] = 2);
+        push("order", &|b| b.entries.swap(0, 1));
+        push("fewer entries", &|b| {
+            b.entries.pop();
+        });
+        push("prefix", &|b| b.prefix[0] += 1);
+        push("root", &|b| b.root = Bip32Root::ExtendedKey);
+        push("lock", &|b| b.lock = Lock::P2pkhUncompressed);
+        push("domain", &|b| b.migration_domain[5] ^= 1);
+        push("epoch", &|b| b.epoch ^= 1);
+        for (name, other) in &others {
+            assert!(!verify_batch(other, REGIME, proof), "{name}");
         }
-        // Every proof against every other honest statement.
-        for i in 0..4 {
-            for j in 0..4 {
-                let (st, _) = proven(i);
-                let (_, proof) = proven(j);
-                let mut relabelled = proof.clone();
-                relabelled.claim_tag = st.claim.tag();
-                assert_eq!(verify_ownership(st, REGIME, &relabelled), i == j, "{j} as {i}");
-            }
-        }
+        let bytes = proof.to_bytes();
+        check_wire(
+            &bytes,
+            &|b| OwnershipProof::from_bytes_batch(b, batch).is_some_and(|p| verify_batch(batch, REGIME, &p)),
+            "batch",
+        );
     }
 
     #[cfg(feature = "std")]
     #[test]
-    fn binding_is_what_the_registry_consumes() {
-        use super::super::registry::{KeyExposure, legacy_identifier};
-        for index in 0..4 {
-            let (st, _) = statement(index);
+    fn bindings_are_what_the_registry_consumes() {
+        use super::super::registry::KeyExposure;
+        for (name, lock, source, witness) in cases() {
+            let hidden = source == KeySource::Secp256k1Key;
+            let st = derive(lock, source, &witness);
             let binding = st.binding();
-            assert_eq!(binding.nullifier, st.nullifier);
+            assert_eq!(binding.nullifier, st.nullifier, "{name}");
             assert_eq!(binding.migration_domain, DOMAIN);
             assert_eq!(binding.pq_commitment, PQ);
             assert_eq!(binding.epoch, EPOCH);
-            let exposure = if index >= 2 { KeyExposure::Revealed } else { KeyExposure::Hidden };
-            assert_eq!(binding.exposure, exposure);
-            assert_eq!(binding.legacy_id, legacy_identifier(&st.claim.legacy_commitment()));
+            assert_eq!(binding.legacy_id, st.credential.identifier());
+            let exposure = if hidden { KeyExposure::Hidden } else { KeyExposure::Revealed };
+            assert_eq!(binding.exposure, exposure, "{name}");
         }
-        let (bitcoin, _) = statement(0);
-        let (ethereum, _) = statement(1);
-        assert_ne!(bitcoin.binding().legacy_id, ethereum.binding().legacy_id);
-        assert_eq!(
-            bitcoin.claim.legacy_commitment(),
-            LegacyCommitmentKind::BitcoinHash160(bitcoin_hash160(&KEY).unwrap())
-        );
+        let (batch, _) = batch_case();
+        let bindings = batch.bindings();
+        assert_eq!(bindings.len(), 2);
+        for (i, binding) in bindings.iter().enumerate() {
+            assert_eq!(*binding, batch.statement(i).unwrap().binding());
+            assert_eq!(binding.pq_commitment, batch.entries[i].pq_commitment);
+        }
     }
 
     fn peak_rss_mib() -> Option<u64> {
@@ -1583,97 +3325,243 @@ mod tests {
         Some(kib / 1024)
     }
 
-    /// `cargo test --release -p dregg-sig-migrate --features std --lib hem::relations::tests::measure
-    /// -- --ignored --nocapture --test-threads 1`
+    fn report(
+        name: &str,
+        shape: &Shape,
+        rows: usize,
+        synth_s: f64,
+        prove: &dyn Fn() -> OwnershipProof,
+        verify: &dyn Fn(&[u8]) -> bool,
+    ) {
+        let layout = protocol::Layout::new(shape, REGIME).unwrap();
+        let stages: Vec<String> = layout
+            .schedule
+            .stages
+            .iter()
+            .map(|s| std::format!("{}q@x{}/2^{}", s.num_queries, s.blowup, s.step_vars))
+            .collect();
+        let head = std::format!(
+            "HEM_OWNERSHIP statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} vars={} \
+             public_inputs={} cells=2^{} synth_s={synth_s:.2}",
+            REGIME as u8,
+            shape.log_rows,
+            shape.num_vars,
+            shape.num_public,
+            layout.log_cells,
+        );
+        if std::env::var("HEM_MEASURE_ROWS_ONLY").is_ok() {
+            println!("{head}");
+            return;
+        }
+        let t = std::time::Instant::now();
+        let proof = prove();
+        let prove_s = t.elapsed().as_secs_f64();
+        let bytes = proof.to_bytes();
+        // The first verification also builds and caches the shape.
+        let t = std::time::Instant::now();
+        assert!(verify(&bytes));
+        let verify_cold_s = t.elapsed().as_secs_f64();
+        let mut warm: Vec<f64> = (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                assert!(verify(&bytes));
+                t.elapsed().as_secs_f64()
+            })
+            .collect();
+        warm.sort_by(f64::total_cmp);
+        println!(
+            "{head} prove_s={prove_s:.2} verify_cold_s={verify_cold_s:.2} verify_warm_ms={:.1} \
+             proof_bytes={} proof_kib={:.1} stages=[{}] early_stop_vars={} peak_rss_mib={}",
+            warm[1] * 1e3,
+            bytes.len(),
+            bytes.len() as f64 / 1024.0,
+            stages.join(" "),
+            layout.schedule.early_stop_vars,
+            peak_rss_mib().map_or_else(|| String::from("n/a"), |m| std::format!("{m}")),
+        );
+    }
+
+    /// `cargo test --release -p dregg-sig-migrate --features std --lib -- --ignored --nocapture
+    /// --test-threads 1 hem::relations::tests::measure_ownership_proofs`. `HEM_MEASURE_ONLY`
+    /// filters by name; `HEM_MEASURE_ROWS_ONLY` skips proving; `HEM_MEASURE_BATCH` lists
+    /// batch sizes (default `1,10`).
     #[test]
     #[ignore = "measurement"]
     fn measure_ownership_proofs() {
-        let h = BIP32_HARDENED;
-        let cases: Vec<(&str, ClaimKind, OwnershipWitness)> = vec![
-            ("bitcoin-hash160", ClaimKind::BitcoinHash160, OwnershipWitness::Secp256k1Key(KEY)),
-            ("ed25519-seed", ClaimKind::Ed25519Seed, OwnershipWitness::Ed25519Seed(KEY)),
-            ("ethereum-address", ClaimKind::EthereumAddress, OwnershipWitness::Secp256k1Key(KEY)),
+        let key = || OwnershipWitness::secp256k1_key(&KEY);
+        let master = || OwnershipWitness::seed(&seed(64));
+        let seeded = |path: &[u32]| bip32(Bip32Root::Seed, public(path));
+        let standard = [H + 44, H, H, 0, 0];
+        let account = OwnershipWitness::extended_key(&bip32_master(&seed(64)).unwrap());
+        let cardano = [H + 1852, H + 1815, H, 0, 0];
+        let singles: Vec<(&str, Lock, KeySource, OwnershipWitness)> = vec![
+            ("p2pkh, key", Lock::P2pkh, KeySource::Secp256k1Key, key()),
+            ("p2pkh uncompressed, key", Lock::P2pkhUncompressed, KeySource::Secp256k1Key, key()),
+            ("p2sh-p2wpkh, key", Lock::P2shP2wpkh, KeySource::Secp256k1Key, key()),
+            ("ethereum, key", Lock::Ethereum, KeySource::Secp256k1Key, key()),
+            ("taproot key path, key", Lock::TaprootKeyPath, KeySource::Secp256k1Key, key()),
             (
-                "bip32 m/44' (seed 64)",
-                ClaimKind::Bip32Secp256k1 { path: vec![h + 44] },
-                OwnershipWitness::Bip32Seed(seed64()),
+                "taproot script tree, key",
+                Lock::TaprootScriptTree,
+                KeySource::Secp256k1Key,
+                key().with_merkle_root(ROOT),
             ),
             (
-                "bip32 m/44'/0'/0'/0/0 (seed 64)",
-                ClaimKind::Bip32Secp256k1 { path: vec![h + 44, h, h, 0, 0] },
-                OwnershipWitness::Bip32Seed(seed64()),
+                "ed25519, rfc8032 seed",
+                Lock::Ed25519,
+                KeySource::Ed25519Seed,
+                OwnershipWitness::ed25519_seed(&KEY),
+            ),
+            (
+                "ed25519, slip10 m/44'/501'/0'/0'",
+                Lock::Ed25519,
+                KeySource::Slip10 { path: public(&[H + 44, H + 501, H, H]) },
+                master(),
+            ),
+            (
+                "ed25519, slip10 hidden path (max 4)",
+                Lock::Ed25519,
+                KeySource::Slip10 { path: PathSpec::Hidden { max_depth: 4 } },
+                master().with_path(&[H + 44, H + 501, H, H]),
+            ),
+            (
+                "ed25519, bip32-ed25519 m/1852'/1815'/0'/0/0",
+                Lock::Ed25519,
+                KeySource::Bip32Ed25519 { path: cardano.to_vec() },
+                OwnershipWitness::ed25519_extended_key(&cardano_root()),
+            ),
+            ("p2pkh, bip32 seed m/44'", Lock::P2pkh, seeded(&[H + 44]), master()),
+            ("p2pkh, bip32 seed m/44'/0'/0'/0/0", Lock::P2pkh, seeded(&standard), master()),
+            (
+                "p2pkh, bip32 master xprv m/44'/0'/0'/0/0",
+                Lock::P2pkh,
+                bip32(Bip32Root::ExtendedKey, public(&standard)),
+                account.clone(),
+            ),
+            (
+                "p2pkh, bip32 seed hidden path (max 5)",
+                Lock::P2pkh,
+                bip32(Bip32Root::Seed, PathSpec::Hidden { max_depth: 5 }),
+                master().with_path(&standard),
+            ),
+            (
+                "p2sh-p2wpkh, bip32 seed m/49'/0'/0'/0/0",
+                Lock::P2shP2wpkh,
+                seeded(&[H + 49, H, H, 0, 0]),
+                master(),
+            ),
+            (
+                "ethereum, bip32 seed m/44'/60'/0'/0/0",
+                Lock::Ethereum,
+                seeded(&[H + 44, H + 60, H, 0, 0]),
+                master(),
+            ),
+            (
+                "taproot key path, bip32 seed m/86'/0'/0'/0/0",
+                Lock::TaprootKeyPath,
+                seeded(&[H + 86, H, H, 0, 0]),
+                master(),
             ),
         ];
         let only = std::env::var("HEM_MEASURE_ONLY").ok();
-        let regimes: Vec<WhirSecurityRegime> = match std::env::var("HEM_MEASURE_REGIMES") {
-            Ok(list) => list
-                .split(',')
-                .map(|t| WhirSecurityRegime::from_u8(t.trim().parse().unwrap()).unwrap())
-                .collect(),
-            Err(_) => vec![REGIME],
-        };
+        let wanted = |name: &str| only.as_ref().is_none_or(|o| name.contains(o.as_str()));
         println!(
             "cpus={}",
             std::thread::available_parallelism().map_or(0, |n| n.get())
         );
-        for (name, kind, witness) in &cases {
-            if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
+        for (name, lock, source, witness) in singles {
+            if !wanted(name) {
                 continue;
             }
-            let st = OwnershipStatement::derive(kind, witness, PQ, DOMAIN, EPOCH).unwrap();
-            let relation = st.claim.relation().unwrap();
+            let st = derive(lock, source.clone(), &witness);
             let t = std::time::Instant::now();
-            let (shape, _, rows) = build(&relation, &st.public_bits(&relation), witness.secret());
+            let (shape, _, rows) = build(lock, &source, &st.public_bits(), &relation_witness(&witness));
             let synth_s = t.elapsed().as_secs_f64();
-            for &regime in &regimes {
-                let layout = protocol::Layout::new(&shape, regime).unwrap();
-                let t = std::time::Instant::now();
-                let proof = prove_ownership(&st, witness, regime, &[3; 32]).unwrap();
-                let prove_s = t.elapsed().as_secs_f64();
-                let bytes = proof.to_bytes();
-                // The first verification also builds and caches the shape.
-                let t = std::time::Instant::now();
-                assert!(verify_ownership(&st, regime, &proof));
-                let verify_cold_s = t.elapsed().as_secs_f64();
-                let mut warm: Vec<f64> = (0..3)
-                    .map(|_| {
-                        let t = std::time::Instant::now();
-                        let decoded = OwnershipProof::from_bytes(&bytes, &st).unwrap();
-                        assert!(verify_ownership(&st, regime, &decoded));
-                        t.elapsed().as_secs_f64()
-                    })
-                    .collect();
-                warm.sort_by(f64::total_cmp);
-                let sumcheck_bytes = 32
-                    * (shape.log_rows * (protocol::ROW_DEGREE + 1)
-                        + layout.var_bits * (protocol::COL_DEGREE + 1)
-                        + 9);
-                let stages: Vec<String> = layout
-                    .schedule
-                    .stages
-                    .iter()
-                    .map(|s| std::format!("{}q@x{}/2^{}", s.num_queries, s.blowup, s.step_vars))
-                    .collect();
-                println!(
-                    "HEM_OWNERSHIP statement=\"{name}\" regime={} rows={rows} padded_rows=2^{} \
-                     vars={} public_inputs={} cells=2^{} synth_s={synth_s:.2} prove_s={prove_s:.2} \
-                     verify_cold_s={verify_cold_s:.2} verify_warm_ms={:.1} proof_bytes={} \
-                     proof_kib={:.1} sumcheck_bytes={sumcheck_bytes} blind_cells={} stages=[{}] \
-                     early_stop_vars={} peak_rss_mib={}",
-                    regime as u8,
-                    shape.log_rows,
-                    shape.num_vars,
-                    shape.num_public,
-                    layout.log_cells,
-                    warm[1] * 1e3,
-                    bytes.len(),
-                    bytes.len() as f64 / 1024.0,
-                    layout.blind_cells,
-                    stages.join(" "),
-                    layout.schedule.early_stop_vars,
-                    peak_rss_mib().map_or_else(|| String::from("n/a"), |m| std::format!("{m}")),
-                );
-            }
+            report(
+                name,
+                &shape,
+                rows,
+                synth_s,
+                &|| prove_ownership(&st, &witness, REGIME, &[3; 32]).unwrap(),
+                &|bytes| {
+                    OwnershipProof::from_bytes(bytes, &st).is_some_and(|p| verify_ownership(&st, REGIME, &p))
+                },
+            );
         }
+        let sizes: Vec<u32> = std::env::var("HEM_MEASURE_BATCH")
+            .unwrap_or_else(|_| String::from("1,10"))
+            .split(',')
+            .map(|t| t.trim().parse().unwrap())
+            .collect();
+        for n in sizes {
+            let name = std::format!("batch of {n}: p2pkh, bip32 seed m/44'/0'/0'/0/i");
+            if !wanted(&name) {
+                continue;
+            }
+            let targets: Vec<(Vec<u32>, [u8; 32])> = (0..n).map(|i| (vec![i], [i as u8; 32])).collect();
+            let witness = master();
+            let prefix = [H + 44, H, H, 0];
+            let batch = BatchStatement::derive(Lock::P2pkh, Bip32Root::Seed, &prefix, &targets, &witness, DOMAIN, EPOCH)
+                .unwrap();
+            let tails: Vec<Vec<u32>> = targets.iter().map(|(t, _)| t.clone()).collect();
+            let t = std::time::Instant::now();
+            let (shape, _, rows) =
+                build_batch(Lock::P2pkh, Bip32Root::Seed, &prefix, &tails, &batch.public_bits(), &witness.secret);
+            let synth_s = t.elapsed().as_secs_f64();
+            report(
+                &name,
+                &shape,
+                rows,
+                synth_s,
+                &|| prove_batch(&batch, &witness, REGIME, &[4; 32]).unwrap(),
+                &|bytes| {
+                    OwnershipProof::from_bytes_batch(bytes, &batch).is_some_and(|p| verify_batch(&batch, REGIME, &p))
+                },
+            );
+        }
+    }
+
+    /// Rows of an EIP-2333 `derive_child_SK` step, from the measured cost of its parts.
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_eip2333_child_step() {
+        use super::super::hash::{sha256, sha256_compress, sha256_iv};
+        let rows = |f: &dyn Fn(&mut ConstraintSystem)| {
+            let mut cs = ConstraintSystem::new();
+            f(&mut cs);
+            cs.num_rows()
+        };
+        let input = |cs: &mut ConstraintSystem, len: usize| alloc_bits(cs, &seed(len));
+        // One HKDF-Expand block `T(i) = HMAC(PRK, T(i-1) || i)` under a prepared key.
+        let key_rows = rows(&|cs| {
+            let prk = input(cs, 32);
+            let before = cs.num_rows();
+            let _ = HmacKey::sha256(cs, &prk);
+            assert!(cs.num_rows() > before);
+        }) - 256;
+        let expand_block = rows(&|cs| {
+            let (prk, t) = (input(cs, 32), input(cs, 33));
+            let key = HmacKey::sha256(cs, &prk);
+            let _ = key.mac(cs, &t);
+        }) - key_rows - 8 * 65;
+        let chunk_hash = rows(&|cs| {
+            let chunk = input(cs, 32);
+            let _ = sha256(cs, &chunk);
+        }) - 256;
+        let compression = rows(&|cs| {
+            let block: Vec<Word> = (0..16).map(|i| Word::alloc(cs, i, 32)).collect();
+            let _ = sha256_compress(cs, &sha256_iv(), block.as_slice().try_into().unwrap());
+        }) - 512;
+        // parent_SK_to_lamport_PK: two HKDF chains of 255 blocks, 510 chunk hashes, one hash
+        // of 16,320 bytes (256 blocks); then HKDF_mod_r (about eight compressions).
+        let lamport = 2 * (key_rows + 255 * expand_block) + 510 * chunk_hash + 256 * compression;
+        let child = lamport + 8 * compression;
+        println!(
+            "EIP2333 hkdf_expand_block={expand_block} chunk_hash={chunk_hash} compression={compression} \
+             derive_child_SK={child} rows; EIP-2334 withdrawal path m/12381/3600/i/0 = 4 steps = {} rows \
+             (2^{:.1}), before the master step and the G1 multiplication",
+            4 * child,
+            ((4 * child) as f64).log2()
+        );
     }
 }
