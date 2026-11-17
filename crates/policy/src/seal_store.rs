@@ -138,8 +138,11 @@ impl FsSealConsumptionStore {
             .consumed
             .try_reserve_exact(count)
             .map_err(std::io::Error::other)?;
-        for encoded in bytes[Self::HEADER_BYTES..].chunks_exact(32) {
-            let id: [u8; 32] = encoded.try_into().map_err(|_| invalid())?;
+        let (ids, rest) = bytes[Self::HEADER_BYTES..].as_chunks::<32>();
+        if !rest.is_empty() {
+            return Err(invalid());
+        }
+        for &id in ids {
             if memory.consumed.last().is_some_and(|prev| prev >= &id) {
                 return Err(invalid());
             }

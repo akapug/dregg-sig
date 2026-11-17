@@ -196,6 +196,8 @@ pub(crate) fn without_circuit_build<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+// Written out so the test build can refuse construction; outside tests it equals the derive.
+#[cfg_attr(not(test), allow(clippy::derivable_impls))]
 impl Default for Builder {
     fn default() -> Self {
         #[cfg(test)]
