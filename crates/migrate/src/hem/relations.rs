@@ -1743,7 +1743,18 @@ fn build_shape(relation: &Relation) -> Shape {
     shape
 }
 
-/// Shapes are a pure function of the relation; with `std` the most recent ones are kept.
+/// Matrix entries the shape cache may hold in total: about 1.5 GB. A shape larger than
+/// this (a batch of more than about 30 entries) is built for its caller and not kept.
+#[cfg(feature = "std")]
+const SHAPE_CACHE_ENTRIES: usize = 1 << 27;
+
+#[cfg(feature = "std")]
+fn shape_entries(shape: &Shape) -> usize {
+    shape.a.nnz() + shape.b.nnz() + shape.c.nnz()
+}
+
+/// Shapes are a pure function of the relation; with `std` the most recent ones are kept,
+/// up to 32 of them and [`SHAPE_CACHE_ENTRIES`] matrix entries.
 #[cfg(feature = "std")]
 fn shape_of(relation: &Relation) -> Arc<Shape> {
     use std::sync::{Mutex, PoisonError};
@@ -1759,11 +1770,17 @@ fn shape_of(relation: &Relation) -> Arc<Shape> {
         return hit;
     }
     let shape = Arc::new(build_shape(relation));
+    let size = shape_entries(&shape);
+    if size > SHAPE_CACHE_ENTRIES {
+        return shape;
+    }
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(hit) = find(&cache) {
         return hit;
     }
-    if cache.len() == KEEP {
+    while cache.len() == KEEP
+        || cache.iter().map(|(_, s)| shape_entries(s)).sum::<usize>() + size > SHAPE_CACHE_ENTRIES
+    {
         cache.remove(0);
     }
     cache.push((relation.clone(), shape.clone()));
@@ -3654,6 +3671,22 @@ mod tests {
         // A batch proof is not a proof of one of its entries either.
         let entry = batch.statement(0).unwrap();
         assert!(!verify_ownership(&entry, REGIME, batch_proof));
+    }
+
+    #[test]
+    fn shape_cache_returns_the_same_shape_and_stays_within_its_budget() {
+        let relation = Relation::Single(Lock::P2pkh, KeySource::Secp256k1Key);
+        let first = shape_of(&relation);
+        // Cached: the same allocation, not an equal rebuild.
+        assert!(Arc::ptr_eq(&first, &shape_of(&relation)));
+        let size = shape_entries(&first);
+        assert!(
+            size > 1 << 20 && size < SHAPE_CACHE_ENTRIES / 16,
+            "{size} entries"
+        );
+        // The budget admits the single statements and a batch of 10, not a batch of 100
+        // (350,554,982 entries measured).
+        assert!(47_846_552 < SHAPE_CACHE_ENTRIES && SHAPE_CACHE_ENTRIES < 350_554_982);
     }
 
     #[test]
