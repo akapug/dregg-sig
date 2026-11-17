@@ -49,19 +49,19 @@ use alloc::vec::Vec;
 
 use super::recursive_whir::{
     Backend as RecBackend, Base as RecBase, Correlated3WhirProof, Digest as RecDigest,
-    Ext as RecExt, FixedPathWhirParams, FoldedEdgeSpec, FoldedLevelWhirProof,
-    Native as RecNative, PublicRecursionCommitment, Transcript as RecTranscript,
-    commit_for_recursion, commit_levels_for_recursion, f as rec_f, open_correlated3_for_recursion,
+    Ext as RecExt, FixedPathWhirParams, FoldedEdgeSpec, FoldedLevelWhirProof, Native as RecNative,
+    PublicRecursionCommitment, Transcript as RecTranscript, commit_for_recursion,
+    commit_levels_for_recursion, f as rec_f, open_correlated3_for_recursion,
     prove_folded_level_for_recursion, verify_correlated3_gadget, verify_folded_level,
 };
 use super::relation::{HologramMeta, Poseidon2InteriorTemplate, Shape};
 use super::{CornerPadBasis, LibraMask, NonzeroChallenge, PrimitiveChallenge, SeedStream, interp};
 use crate::field::{Goldilocks, GoldilocksExt4, build_eq_table_ext4};
 use crate::pcs::{
-    CanopyCommitment, HemWhirOpeningProof, MAX_PCS_NUM_VARS, WeightedPoint, WhirSchedule,
-    WhirSecurityRegime, add_point_kernel, hypercube_to_monomial_coeffs,
-    whir_commit_batch_secret_with_schedule, whir_open_blend, whir_open_blend_from_state,
-    whir_verify_blend,
+    CanopyCommitment, HemWhirOpeningProof, HemWhirSplitOpeningProof, MAX_PCS_NUM_VARS,
+    WeightedPoint, WhirSchedule, WhirSecurityRegime, add_point_kernel,
+    hypercube_to_monomial_coeffs, whir_commit_batch_secret_with_schedule, whir_open_blend,
+    whir_open_blend_from_state, whir_verify_blend, whir_verify_blend_split,
 };
 use crate::sponge::{FiatShamirTranscript, InstanceBound, cshake256_32};
 
@@ -72,9 +72,12 @@ type F = Goldilocks;
 pub const ROW_DEGREE: usize = 9;
 /// Individual degree of the column sumcheck: `M * Z`.
 pub const COL_DEGREE: usize = 2;
-const ROW_MASK_BITS: usize = 4;
-const COL_MASK_BITS: usize = 2;
-const COMPANIONS: usize = 4;
+/// `log2` of the cells holding one limb of one row-mask round.
+pub const ROW_MASK_BITS: usize = 4;
+/// `log2` of the cells holding one limb of one column-mask round.
+pub const COL_MASK_BITS: usize = 2;
+/// Companion tables committed beside the assignment table.
+pub const COMPANIONS: usize = 4;
 const _: () = assert!(ROW_DEGREE < 1 << ROW_MASK_BITS && COL_DEGREE < 1 << COL_MASK_BITS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,13 +128,17 @@ impl Layout {
         })
     }
 
+    /// First cell of the block holding limb `limb` of row-mask round `round`: the hypercube
+    /// values of the multilinear polynomial whose monomial coefficients are that limb of
+    /// the round's univariate coefficients.
     #[inline]
-    fn row_mask_block(&self, round: usize, limb: usize) -> usize {
+    pub fn row_mask_block(&self, round: usize, limb: usize) -> usize {
         (1usize << self.var_bits) + ((round * 4 + limb) << ROW_MASK_BITS)
     }
 
+    /// [`Self::row_mask_block`] for the column mask.
     #[inline]
-    fn col_mask_block(&self, log_rows: usize, round: usize, limb: usize) -> usize {
+    pub fn col_mask_block(&self, log_rows: usize, round: usize, limb: usize) -> usize {
         self.row_mask_block(log_rows, 0) + ((round * 4 + limb) << COL_MASK_BITS)
     }
 }
@@ -157,6 +164,16 @@ pub struct ZkHemProof {
 }
 
 impl ZkHemProof {
+    fn front(&self) -> FrontMessages<'_> {
+        FrontMessages {
+            row_mask_sum: self.row_mask_sum,
+            row_rounds: &self.row_rounds,
+            row_values: self.row_values,
+            col_mask_sum: self.col_mask_sum,
+            col_rounds: &self.col_rounds,
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.commitment.to_bytes());
@@ -276,7 +293,7 @@ fn corner_factor(rx: &[E], base: usize) -> E {
 }
 
 /// Whether the masking rows make `(Az, Bz, Cz)(rx)` uniform.
-fn mask_rows_full_rank(shape: &Shape, rx: &[E]) -> bool {
+pub fn mask_rows_full_rank(shape: &Shape, rx: &[E]) -> bool {
     CornerPadBasis::new(rx[0], rx[1]).is_some()
         && (0..3).all(|g| !corner_factor(rx, shape.mask_row_base(g)).is_zero())
 }
@@ -454,6 +471,25 @@ fn add_sparse_point_kernel(kernel: &mut [E], weight: E, point: &[E]) {
     for (idx, v) in entries {
         kernel[idx] += v;
     }
+}
+
+/// The functional `sum_t weight_t * W(point_t)` on the `cells` monomial coefficients of a
+/// table, followed by the two zero overflow slots `whir_open_blend` expects.
+pub fn claim_kernel(terms: &[WeightedPoint], cells: usize) -> Vec<E> {
+    let mut kernel = vec![E::ZERO; cells + 2];
+    for term in terms {
+        if term.point.iter().filter(|c| !c.is_zero()).count() <= 16 {
+            add_sparse_point_kernel(&mut kernel, term.weight, &term.point);
+        } else {
+            let live = term
+                .point
+                .iter()
+                .rposition(|c| !c.is_zero())
+                .map_or(0, |p| p + 1);
+            add_point_kernel(&mut kernel, term.weight, &term.point[..live]);
+        }
+    }
+    kernel
 }
 
 fn batched_value(lambda: E, values: &[E]) -> E {
@@ -1262,19 +1298,7 @@ fn prove_with_claimed_publics(
         rho2,
         matrix_at_point,
     });
-    let mut kernel = vec![E::ZERO; cells + 2];
-    for term in &terms {
-        if term.point.iter().filter(|c| !c.is_zero()).count() <= 16 {
-            add_sparse_point_kernel(&mut kernel, term.weight, &term.point);
-        } else {
-            let live = term
-                .point
-                .iter()
-                .rposition(|c| !c.is_zero())
-                .map_or(0, |p| p + 1);
-            add_point_kernel(&mut kernel, term.weight, &term.point[..live]);
-        }
-    }
+    let kernel = claim_kernel(&terms, cells);
     drop(terms);
 
     // 5. Companion claims, then the blend challenge.
@@ -1318,8 +1342,281 @@ fn prove_with_claimed_publics(
 }
 
 // ============================================================================
+// Split commitments: one Stage-0 tree per committer over additive shares
+// ============================================================================
+
+/// Wire magic of a [`ZkHemSplitProof`].
+pub const SPLIT_PROOF_WIRE_MAGIC: &[u8; 8] = b"QSAGZKS1";
+/// Most committers a split proof may have.
+pub const MAX_SPLIT_COMMITTERS: usize = 255;
+
+/// A zk-Hem proof whose commitment is a list of roots. Committer `i` holds an additive
+/// share of the five committed tables and commits to its shares alone; the committed
+/// tables are the sums. Every message other than the Stage-0 openings is that of
+/// [`ZkHemProof`] for the summed tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZkHemSplitProof {
+    pub roots: Vec<CanopyCommitment>,
+    pub row_mask_sum: E,
+    pub row_rounds: Vec<Vec<E>>,
+    pub row_values: [E; 3],
+    pub col_mask_sum: E,
+    pub col_rounds: Vec<Vec<E>>,
+    pub companion_claims: [E; COMPANIONS],
+    pub opening: HemWhirSplitOpeningProof,
+}
+
+impl ZkHemSplitProof {
+    pub fn front(&self) -> FrontMessages<'_> {
+        FrontMessages {
+            row_mask_sum: self.row_mask_sum,
+            row_rounds: &self.row_rounds,
+            row_values: self.row_values,
+            col_mask_sum: self.col_mask_sum,
+            col_rounds: &self.col_rounds,
+        }
+    }
+
+    /// `SPLIT_PROOF_WIRE_MAGIC`, the root count, the roots, then the fields in order.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = SPLIT_PROOF_WIRE_MAGIC.to_vec();
+        out.push(self.roots.len() as u8);
+        for root in &self.roots {
+            out.extend_from_slice(&root.to_bytes());
+        }
+        let push = |out: &mut Vec<u8>, v: &E| out.extend_from_slice(&v.to_le_bytes());
+        push(&mut out, &self.row_mask_sum);
+        self.row_rounds
+            .iter()
+            .flatten()
+            .for_each(|v| push(&mut out, v));
+        self.row_values.iter().for_each(|v| push(&mut out, v));
+        push(&mut out, &self.col_mask_sum);
+        self.col_rounds
+            .iter()
+            .flatten()
+            .for_each(|v| push(&mut out, v));
+        self.companion_claims.iter().for_each(|v| push(&mut out, v));
+        self.opening.push_bytes(&mut out);
+        out
+    }
+
+    /// Canonical decoding for the given relation and regime; rejects trailing bytes.
+    pub fn from_bytes(bytes: &[u8], shape: &Shape, regime: WhirSecurityRegime) -> Option<Self> {
+        let layout = Layout::new(shape, regime)?;
+        if bytes.get(..8)? != SPLIT_PROOF_WIRE_MAGIC {
+            return None;
+        }
+        let count = *bytes.get(8)? as usize;
+        if count == 0 {
+            return None;
+        }
+        let mut pos = 9;
+        let mut roots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (root, used) = CanopyCommitment::from_bytes_canonical(bytes.get(pos..)?)?;
+            pos += used;
+            roots.push(root);
+        }
+        let take = |pos: &mut usize| -> Option<E> {
+            let chunk: [u8; 32] = bytes.get(*pos..*pos + 32)?.try_into().ok()?;
+            *pos += 32;
+            E::from_le_bytes_canonical(chunk)
+        };
+        let rounds = |pos: &mut usize, n: usize, d: usize| -> Option<Vec<Vec<E>>> {
+            (0..n)
+                .map(|_| (0..=d).map(|_| take(pos)).collect())
+                .collect()
+        };
+        let row_mask_sum = take(&mut pos)?;
+        let row_rounds = rounds(&mut pos, shape.log_rows, ROW_DEGREE)?;
+        let row_values = [take(&mut pos)?, take(&mut pos)?, take(&mut pos)?];
+        let col_mask_sum = take(&mut pos)?;
+        let col_rounds = rounds(&mut pos, layout.var_bits, COL_DEGREE)?;
+        let companion_claims = [
+            take(&mut pos)?,
+            take(&mut pos)?,
+            take(&mut pos)?,
+            take(&mut pos)?,
+        ];
+        let (opening, used) = HemWhirSplitOpeningProof::from_bytes_canonical(bytes.get(pos..)?)?;
+        (pos + used == bytes.len()).then_some(Self {
+            roots,
+            row_mask_sum,
+            row_rounds,
+            row_values,
+            col_mask_sum,
+            col_rounds,
+            companion_claims,
+            opening,
+        })
+    }
+}
+
+/// The transcript of a split proof once the roots are fixed. Its relation tag differs
+/// from the single-commitment one, so no message of one kind of proof is a message of
+/// the other.
+pub fn split_transcript(
+    shape: &Shape,
+    layout: &Layout,
+    statement: &[u8],
+    public_inputs: &[F],
+    roots: &[CanopyCommitment],
+) -> FiatShamirTranscript<InstanceBound> {
+    let public_bytes: Vec<u8> = public_inputs.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut params = shape.digest().to_vec();
+    for n in [layout.log_cells, layout.var_bits, layout.blind_cells] {
+        params.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    let mut root_bytes = vec![roots.len() as u8];
+    for root in roots {
+        root_bytes.extend_from_slice(&root.to_bytes());
+    }
+    FiatShamirTranscript::new()
+        .bind_relation(b"QSAG.ZKHEM.SPLIT/v1", &params, &layout.schedule)
+        .bind_instance(&[statement, &public_bytes, &root_bytes])
+}
+
+/// [`verify`] for a split proof: the same steps 1 to 5, with every Stage-0 fiber checked
+/// against each committer's root and the opened share symbols summed.
+pub fn verify_split(
+    shape: &Shape,
+    public_inputs: &[F],
+    statement: &[u8],
+    regime: WhirSecurityRegime,
+    proof: &ZkHemSplitProof,
+) -> bool {
+    let Some(layout) = Layout::new(shape, regime) else {
+        return false;
+    };
+    if proof.roots.is_empty() || proof.roots.len() > MAX_SPLIT_COMMITTERS {
+        return false;
+    }
+    let mut tr = split_transcript(shape, &layout, statement, public_inputs, &proof.roots);
+    let Some(front) = replay_front(shape, &layout, public_inputs, &mut tr, &proof.front()) else {
+        return false;
+    };
+    let (scalars, claim) = blend_claim(&mut tr, front.value, &proof.companion_claims);
+    whir_verify_blend_split(
+        &proof.roots,
+        layout.log_cells,
+        &scalars,
+        &front.terms,
+        claim,
+        &proof.opening,
+        &mut tr,
+        &layout.schedule,
+    )
+}
+
+// ============================================================================
 // Verifier
 // ============================================================================
+
+/// The prover messages of steps 1 to 3.
+#[derive(Clone, Copy, Debug)]
+pub struct FrontMessages<'a> {
+    pub row_mask_sum: E,
+    pub row_rounds: &'a [Vec<E>],
+    pub row_values: [E; 3],
+    pub col_mask_sum: E,
+    pub col_rounds: &'a [Vec<E>],
+}
+
+/// What steps 1 to 4 leave to the commitment: `sum_t weight_t Z(point_t) = value`.
+#[derive(Clone, Debug)]
+pub struct FrontClaim {
+    pub terms: Vec<WeightedPoint>,
+    pub value: E,
+}
+
+/// The verifier's steps 1 to 4 on a transcript that has bound the commitment: replays both
+/// sumchecks and returns the linear claim on the committed table. `None` if a sumcheck
+/// message is malformed or inconsistent. A prover that has sent `msgs` calls this on a
+/// fresh transcript to obtain the claim and the transcript state for step 5.
+pub fn replay_front(
+    shape: &Shape,
+    layout: &Layout,
+    public_inputs: &[F],
+    tr: &mut FiatShamirTranscript<InstanceBound>,
+    msgs: &FrontMessages<'_>,
+) -> Option<FrontClaim> {
+    if msgs.row_rounds.len() != shape.log_rows
+        || msgs.col_rounds.len() != layout.var_bits
+        || public_inputs.len() != shape.num_public
+    {
+        return None;
+    }
+    let tau = squeeze_point(tr, b"ZKHEM_TAU", shape.log_rows);
+    tr.absorb_ext4(b"ZKHEM_ROW_MASK_SUM", msgs.row_mask_sum);
+    let rho1 = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO1").get();
+    let (row_final, rx) = verify_sumcheck(
+        tr,
+        b"ZKHEM_ROW_ROUND",
+        msgs.row_rounds,
+        ROW_DEGREE,
+        rho1 * msgs.row_mask_sum,
+    )?;
+    let [va, vb, vc] = msgs.row_values;
+    tr.absorb_ext4_slice(b"ZKHEM_ROW_VALUES", &msgs.row_values);
+    let gate = eq_eval(&tau, &rx) * row_gate(prefix_indicator(&rx, shape.num_sbox), va, vb, vc);
+    // The value the committed row mask must take at `rx`.
+    let row_mask_at_point = (row_final - gate) * rho1.inv();
+
+    let combine = squeeze_point(tr, b"ZKHEM_COMBINE", 3);
+    tr.absorb_ext4(b"ZKHEM_COL_MASK_SUM", msgs.col_mask_sum);
+    let rho2 = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO2").get();
+    let col_claim = combine[0] * va + combine[1] * vb + combine[2] * vc;
+    let (col_final, ry) = verify_sumcheck(
+        tr,
+        b"ZKHEM_COL_ROUND",
+        msgs.col_rounds,
+        COL_DEGREE,
+        col_claim + rho2 * msgs.col_mask_sum,
+    )?;
+
+    let lambda = tr.squeeze_ext4(b"ZKHEM_LAMBDA");
+    let terms = claim_terms(&ClaimInputs {
+        layout,
+        log_rows: shape.log_rows,
+        num_public: shape.num_public,
+        rx: &rx,
+        ry: &ry,
+        lambda,
+        rho2,
+        matrix_at_point: matrix_at(shape, &rx, &ry, &combine),
+    });
+    let mut values = vec![
+        msgs.row_mask_sum,
+        msgs.col_mask_sum,
+        row_mask_at_point,
+        col_final,
+        E::ONE,
+    ];
+    values.extend(public_inputs.iter().map(|&v| E::from_base(v)));
+    let value = batched_value(lambda, &values);
+
+    Some(FrontClaim { terms, value })
+}
+
+/// Step 5 after the companion claims: binds them, draws `beta`, and returns the blend
+/// scalars `(1, beta, .., beta^4)` and the claimed value of the blended word.
+pub fn blend_claim(
+    tr: &mut FiatShamirTranscript<InstanceBound>,
+    value: E,
+    companion_claims: &[E; COMPANIONS],
+) -> (Vec<E>, E) {
+    tr.absorb_ext4_slice(b"ZKHEM_COMPANION_CLAIMS", companion_claims);
+    let beta = PrimitiveChallenge::squeeze(tr, b"ZKHEM_BETA").get();
+    let mut scalars = vec![E::ONE];
+    let mut claim = value;
+    for &sigma in companion_claims {
+        let s = scalars[scalars.len() - 1] * beta;
+        claim += s * sigma;
+        scalars.push(s);
+    }
+    (scalars, claim)
+}
 
 /// Replays one masked sumcheck; returns the final claim and the challenge point.
 fn verify_sumcheck(
@@ -1391,69 +1688,11 @@ pub fn verify(
         return false;
     }
     let mut tr = start_transcript(shape, &layout, statement, public_inputs, &proof.commitment);
-
-    let tau = squeeze_point(&mut tr, b"ZKHEM_TAU", shape.log_rows);
-    tr.absorb_ext4(b"ZKHEM_ROW_MASK_SUM", proof.row_mask_sum);
-    let rho1 = NonzeroChallenge::squeeze(&mut tr, b"ZKHEM_RHO1").get();
-    let Some((row_final, rx)) = verify_sumcheck(
-        &mut tr,
-        b"ZKHEM_ROW_ROUND",
-        &proof.row_rounds,
-        ROW_DEGREE,
-        rho1 * proof.row_mask_sum,
-    ) else {
+    let Some(front) = replay_front(shape, &layout, public_inputs, &mut tr, &proof.front()) else {
         return false;
     };
-    let [va, vb, vc] = proof.row_values;
-    tr.absorb_ext4_slice(b"ZKHEM_ROW_VALUES", &proof.row_values);
-    let gate = eq_eval(&tau, &rx) * row_gate(prefix_indicator(&rx, shape.num_sbox), va, vb, vc);
-    // The value the committed row mask must take at `rx`.
-    let row_mask_at_point = (row_final - gate) * rho1.inv();
-
-    let combine = squeeze_point(&mut tr, b"ZKHEM_COMBINE", 3);
-    tr.absorb_ext4(b"ZKHEM_COL_MASK_SUM", proof.col_mask_sum);
-    let rho2 = NonzeroChallenge::squeeze(&mut tr, b"ZKHEM_RHO2").get();
-    let col_claim = combine[0] * va + combine[1] * vb + combine[2] * vc;
-    let Some((col_final, ry)) = verify_sumcheck(
-        &mut tr,
-        b"ZKHEM_COL_ROUND",
-        &proof.col_rounds,
-        COL_DEGREE,
-        col_claim + rho2 * proof.col_mask_sum,
-    ) else {
-        return false;
-    };
-
-    let lambda = tr.squeeze_ext4(b"ZKHEM_LAMBDA");
-    let terms = claim_terms(&ClaimInputs {
-        layout: &layout,
-        log_rows: shape.log_rows,
-        num_public: shape.num_public,
-        rx: &rx,
-        ry: &ry,
-        lambda,
-        rho2,
-        matrix_at_point: matrix_at(shape, &rx, &ry, &combine),
-    });
-    let mut values = vec![
-        proof.row_mask_sum,
-        proof.col_mask_sum,
-        row_mask_at_point,
-        col_final,
-        E::ONE,
-    ];
-    values.extend(public_inputs.iter().map(|&v| E::from_base(v)));
-    let value = batched_value(lambda, &values);
-
-    tr.absorb_ext4_slice(b"ZKHEM_COMPANION_CLAIMS", &proof.companion_claims);
-    let beta = PrimitiveChallenge::squeeze(&mut tr, b"ZKHEM_BETA").get();
-    let mut scalars = vec![E::ONE];
-    let mut claim = value;
-    for &sigma in &proof.companion_claims {
-        let s = scalars[scalars.len() - 1] * beta;
-        claim += s * sigma;
-        scalars.push(s);
-    }
+    let (scalars, claim) = blend_claim(&mut tr, front.value, &proof.companion_claims);
+    let terms = front.terms;
     whir_verify_blend(
         &proof.commitment,
         layout.log_cells,

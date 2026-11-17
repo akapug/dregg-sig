@@ -6055,11 +6055,11 @@ pub fn whir_stage0_share_verifies(
 /// that is not the blend of the committed shares yields a proof that does not verify; it is
 /// not detected here.
 ///
+/// `Err(j)` if opening `j` does not authenticate against root `j` (the first such `j`): no
+/// proof exists then. The transcript has advanced and must be discarded.
+///
 /// # Panics
-/// On malformed arguments, if `open_stage0` does not return one opening per root, or if an
-/// opening does not authenticate against its root (the message names the share). A caller that
-/// takes openings from parties it does not trust checks each with
-/// [`whir_stage0_share_verifies`] inside `open_stage0`.
+/// On malformed arguments, or if `open_stage0` does not return one opening per root.
 #[allow(clippy::too_many_arguments)]
 pub fn whir_open_blend_split(
     roots: &[CanopyCommitment],
@@ -6071,7 +6071,7 @@ pub fn whir_open_blend_split(
     claim: GoldilocksExt4,
     transcript: &mut FiatShamirTranscript<InstanceBound>,
     open_stage0: &mut dyn FnMut(&[usize]) -> Vec<Stage0ShareOpening>,
-) -> HemWhirSplitOpeningProof {
+) -> Result<HemWhirSplitOpeningProof, usize> {
     assert!((1..=MAX_STAGE0_SHARES).contains(&roots.len()));
     assert!((2..=MAX_BATCH_POLYS).contains(&scalars.len()));
     assert!(pcs_num_vars_supported(num_vars) && schedule.validate_structural(num_vars));
@@ -6098,6 +6098,7 @@ pub fn whir_open_blend_split(
     let hash = CanopyHash::for_stage(schedule.regime, 0);
     let per_query = scalars.len() << schedule.stages[0].step_vars;
     let mut shares = Vec::new();
+    let mut bad_share = None;
     let stages = whir_open_stages(
         schedule,
         num_vars,
@@ -6116,11 +6117,13 @@ pub fn whir_open_blend_split(
                 .map(|(root, opening)| Stage0ShareRef::new(root, opening))
                 .collect();
             let q_indices: alloc::sync::Arc<[usize]> = queries.indices.as_slice().into();
-            for (index, share) in refs.iter().enumerate() {
-                assert!(
-                    stage0_share_authenticates(hash, share, &q_indices, scalars.len(), per_query),
-                    "Stage-0 opening {index} does not authenticate against its root"
-                );
+            bad_share = refs.iter().position(|share| {
+                !stage0_share_authenticates(hash, share, &q_indices, scalars.len(), per_query)
+            });
+            if bad_share.is_some() {
+                // Finish on zero symbols; the result is discarded.
+                let zeros = vec![Goldilocks::ZERO; queries.indices.len() * per_query];
+                return blend_stage0_fibers(&zeros, &weights, queries);
             }
             let fibers = blend_stage0_fibers(&sum_stage0_share_vals(&refs), &weights, queries);
             drop(refs);
@@ -6128,7 +6131,10 @@ pub fn whir_open_blend_split(
             fibers
         },
     );
-    HemWhirSplitOpeningProof {
+    if let Some(index) = bad_share {
+        return Err(index);
+    }
+    Ok(HemWhirSplitOpeningProof {
         stage0_ood_evals: stages.stage0_ood_evals,
         fold_sumcheck_polys: stages.fold_sumcheck_polys,
         fold_pow_nonces: stages.fold_pow_nonces,
@@ -6136,7 +6142,7 @@ pub fn whir_open_blend_split(
         final_coeffs: stages.final_coeffs,
         pow_nonce: stages.pow_nonce,
         shares,
-    }
+    })
 }
 
 /// Verify a [`whir_open_blend_split`] proof for the functional
@@ -8289,7 +8295,8 @@ mod pcs_unit_tests {
                         .map(|state| whir_stage0_open_share(state, fibers))
                         .collect()
                 },
-            );
+            )
+            .expect("every share opens its root");
             assert_eq!(calls, 1);
             proof
         }
@@ -8404,7 +8411,8 @@ mod pcs_unit_tests {
                 fx.claim,
                 &mut split_tr,
                 &mut |fibers| vec![whir_stage0_open_share(state, fibers)],
-            );
+            )
+            .expect("every share opens its root");
             assert!(fx.accepts(&split));
             assert_eq!(split.stage0_ood_evals, single.stage0_ood_evals);
             assert_eq!(split.fold_sumcheck_polys, single.fold_sumcheck_polys);
@@ -8556,7 +8564,8 @@ mod pcs_unit_tests {
                     .map(|state| whir_stage0_open_share(state, fibers))
                     .collect()
             },
-        );
+        )
+        .expect("every share opens its root");
         let verifies = |root: usize, opening: &Stage0ShareOpening, fibers: &[usize]| {
             whir_stage0_share_verifies(&fx.roots[root], fx.nv, 5, &fx.schedule, fibers, opening)
         };
@@ -8586,10 +8595,9 @@ mod pcs_unit_tests {
     }
 
     #[test]
-    #[should_panic(expected = "Stage-0 opening 1 does not authenticate")]
     fn split_prover_refuses_a_share_that_does_not_open_its_root() {
         let fx = SplitFixture::new(WhirSecurityRegime::default(), 10, 2, 5);
-        whir_open_blend_split(
+        let refused = whir_open_blend_split(
             &fx.roots,
             fx.nv,
             &fx.schedule,
@@ -8608,6 +8616,7 @@ mod pcs_unit_tests {
                 shares
             },
         );
+        assert_eq!(refused.err(), Some(1));
     }
 
     #[test]
