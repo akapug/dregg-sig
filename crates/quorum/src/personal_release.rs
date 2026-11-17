@@ -13,7 +13,7 @@
 //!   derives pairwise Encrypt-then-MAC [`MacSealedWireChannel`] keys from its enrolled
 //!   [`PersonalBeltLatch`], exchanges latch acknowledgements, collapses its own MSP rows
 //!   locally, reshares its 4 `Goldilocks` lanes over encrypted point-to-point links,
-//!   establishes pairwise PQ Ring-LWE + interactive KOS15 OT channels ([`PartyOtEndpoint`]),
+//!   establishes pairwise PQ Ring-LWE + consistency-checked OT-extension channels ([`PartyOtEndpoint`]),
 //!   authenticates inputs and 118 `Π_pow7` S-box tuples under a dealerless `GoldilocksExt2`
 //!   SPDZ MAC key, evaluates `poseidon2_compress12_ff`, and verifies a two-stage
 //!   multiplicatively blinded `MacCheck` strictly before opening the PRF-check digest.
@@ -32,8 +32,8 @@ use dregg_sig_core::{
     preprocessing::{
         BaseOtCrsCommitMsg, BaseOtCrsOpenMsg, BaseOtCrsReceiverRound0, BaseOtCrsSenderRound0,
         BaseOtCrsShareMsg, BaseOtExtReceiverRound2, BaseOtExtSenderRound1, BaseOtRound1Msg,
-        BaseOtRound2Msg, BaseOtRound3Msg, BaseOtRound4Msg, KosOtChallengeMsg, KosOtProofMsg,
-        KosOtUColsMsg, OtExtReceiverChannel, OtExtSenderChannel, OtMesh, OtPadPair,
+        BaseOtRound2Msg, BaseOtRound3Msg, BaseOtRound4Msg, OtExtChallengeMsg, OtExtProofMsg,
+        OtExtUColsMsg, OtExtReceiverChannel, OtExtSenderChannel, OtMesh, OtPadPair,
         PartyPrivateRng, PreprocessError,
     },
     sponge::{
@@ -268,7 +268,7 @@ impl Drop for WireExt2BlindTriple {
     }
 }
 
-/// One custodian's end of a pairwise PQ Ring-LWE + interactive KOS15 OT mesh over
+/// One custodian's end of a pairwise PQ Ring-LWE + consistency-checked OT-extension mesh over
 /// [`WireTransport`], with pooled single-use `GoldilocksExt2` multiplicative blinding triples.
 ///
 /// Holds **only** local `me -> peer` [`OtExtSenderChannel`]s and `peer -> me`
@@ -294,7 +294,7 @@ impl Drop for PartyOtEndpoint {
 }
 
 impl PartyOtEndpoint {
-    /// Establish active-secure PQ Ring-LWE + 4-ciphertext parity-combined KOS15 OT channels
+    /// Establish active-secure PQ Ring-LWE + 4-ciphertext parity-combined OT-extension channels
     /// with every peer in `roster` over `wire` using deadlock-free lexicographic pair scheduling.
     pub fn establish_over_wire<T: WireTransport>(
         session_id: [u8; 32],
@@ -478,7 +478,7 @@ impl PartyOtEndpoint {
             let u_bytes = u_msg.to_bytes();
             wire.send_frame(sender, ROUND_PREL_KOS_U, &u_bytes)?;
             let chal_raw = recv_wire(wire, &self.roster, sender, ROUND_PREL_KOS_CHAL)?;
-            let chal = KosOtChallengeMsg::from_bytes(&chal_raw).ok_or(
+            let chal = OtExtChallengeMsg::from_bytes(&chal_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[sender],
                     round: ROUND_PREL_KOS_CHAL,
@@ -508,7 +508,7 @@ impl PartyOtEndpoint {
                 )),
             )?;
             let u_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_KOS_U)?;
-            let u_msg = KosOtUColsMsg::from_bytes(&u_raw).ok_or(
+            let u_msg = OtExtUColsMsg::from_bytes(&u_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[receiver],
                     round: ROUND_PREL_KOS_U,
@@ -520,7 +520,7 @@ impl PartyOtEndpoint {
             })?;
             wire.send_frame(receiver, ROUND_PREL_KOS_CHAL, &chal.to_bytes())?;
             let proof_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_KOS_PROOF)?;
-            let proof = KosOtProofMsg::from_bytes(&proof_raw).ok_or(
+            let proof = OtExtProofMsg::from_bytes(&proof_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[receiver],
                     round: ROUND_PREL_KOS_PROOF,
@@ -2276,7 +2276,7 @@ impl<W: DurableWal> PersonalReleaseParty<W> {
     /// 2. Exchanges receiver-bound [`PersonalLatchAck`]s, verifies the B³ quorum certificate, and
     ///    collapses only this custodian's MSP rows locally;
     /// 3. Reshares the 4 `Goldilocks` lanes into uniform additive shares over the encrypted links,
-    ///    establishes pairwise PQ Ring-LWE + KOS15 OT channels, runs dealerless `Π_MAC` + `Π_pow7`,
+    ///    establishes pairwise PQ Ring-LWE + OT-extension channels, runs dealerless `Π_MAC` + `Π_pow7`,
     ///    evaluates `poseidon2_compress12_ff`, and verifies a two-stage multiplicatively blinded
     ///    `GoldilocksExt2` `MacCheck` **strictly before** opening the PRF-check digest.
     pub fn ceremony_over_wire<T: WireTransport, J: PoisonJournal>(

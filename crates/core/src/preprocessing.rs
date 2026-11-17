@@ -7,10 +7,11 @@
 //!    per-party round state machines, and a post-Base-OT $384 \to 128$ 2-universal `[I_128 | R]`
 //!    Leftover-Hash combiner eliminating Chou–Orlandi (`ePrint 2015/267`) selective-failure leakage
 //!    to $< 2^{-128}$.
-//! 2. **Interactive `KosOtExtension`**: 3-message interactive challenge-response `cSHAKE256` KOS OT
-//!    extension (`KosOtUColsMsg` $\to$ `KosOtChallengeMsg` $\to$ `KosOtProofMsg`) with transcript-bound
-//!    correlation-robust hashing and immediate channel poison-and-wipe on failure, eliminating the
-//!    Roy (`CRYPTO 2022` / `ePrint 2022/192`) Fiat–Shamir grinding & column-probe attacks.
+//! 2. **Interactive correlated OT extension** (`OtExtUColsMsg` $\to$ `OtExtChallengeMsg` $\to$
+//!    `OtExtProofMsg`): 128 IKNP columns, the SoftSpokenOT consistency check with a linear
+//!    universal hash, transcript-bound correlation-robust hashing with a distinct tweak per
+//!    extended OT, and channel poison-and-wipe on the first failed check. See
+//!    [the section below](#correlated-ot-extension-and-its-consistency-check).
 //! 3. **Dealerless `Π_triple_f2` (`PreprocessedKeccakVault`)**: Authenticated pairwise OT
 //!    products, recursive inner-product sacrifice, post-sacrifice adaptive bucket combining
 //!    (including one discarded parity bucket), then degree-`<t` Shamir dealing and a two-lane
@@ -25,8 +26,124 @@
 //!    `run_silent_pcg_keccak_vaults`)**: Callers can generate authenticated Shamir-SPDZ Beaver
 //!    triples (`PreprocessedKeccakPartyVault`) and silent 384-bit OT correlations directly from
 //!    locally expanded [`crate::pcg_dense::DensePcgExpandedVault`]s (`Depth15` expand-accumulate
-//!    dual-LPN) alongside the interactive KOS/MASCOT [`run_dealerless_pi_triple_f2`] pool. The
+//!    dual-LPN) alongside the interactive OT-extension/MASCOT [`run_dealerless_pi_triple_f2`] pool. The
 //!    earlier sparse GGM/QC-LPN sketch below remains gated to unit-test regressions.
+//!
+//! # Correlated OT extension and its consistency check
+//!
+//! Papers, in `/Users/ember/paperbin/`: **Roy**, "SoftSpokenOT", ePrint 2022/192, revision of
+//! 2025-11-18 (`2022-roy-softspokenot-2022-192-rev20251118`; the 2022-02-17 revision is
+//! `2022-roy-softspokenot-2022-192` and states a value of `t` in Theorem 4.5 that the later
+//! revision corrects); **KOS**, ePrint 2015/546
+//! (`2015-keller-orsini-scholl-actively-secure-ot-extension-kos-2015-546`); **Diamond**, "On the
+//! Security of KOS", ePrint 2022/1371 (`2022-diamond-on-the-security-of-kos-2022-1371`).
+//! "Theorem" means a statement proven in a paper; "claim" an argument of this module.
+//!
+//! ## Why the KOS check is gone
+//!
+//! This extension used to run the correlation check of KOS Fig. 7: one random combination over
+//! `GF(2^128)` of all rows, which compresses the 128 columns into one field element. Roy,
+//! Section 4.1.3 and Appendix D, shows that the lemma under KOS Theorem 1 is false and gives
+//! attacks that beat the theorem's bound. Diamond proves KOS secure only asymptotically, with
+//! concrete security from a security parameter of about 5,000 columns (Example 3.17), and
+//! recommends a check known to be concretely secure. No proof covers KOS at 128 columns, so
+//! that check was deleted, not kept behind a flag.
+//!
+//! ## Construction
+//!
+//! Roles: the OT receiver holds choice bits `x` and, per base OT `c < 128`, both seeds; the OT
+//! sender holds `delta` in `GF(2)^128` and the seed selected by `delta_c`. In Roy's notation the
+//! OT receiver is the VOLE sender `P_S`, the OT sender is `P_R`, `p = q = 2`, `k = 1`, and the
+//! code is the repetition code of length `n_C = d_C = 128` (the IKNP/KOS setting).
+//!
+//! 1. The receiver appends [`OT_EXT_SACRIFICIAL_OTS`]` = 256` random choice bits, expands
+//!    columns `t0_c`, `t1_c` and sends `u_c = t0_c + t1_c + x` ([`OtExtUColsMsg`]). This is Roy
+//!    Fig. 7 with `k = 1` followed by the correction of Fig. 8.
+//! 2. The sender, having received all of `u`, samples 32 fresh bytes ([`OtExtChallengeMsg`]):
+//!    two points `s_0, s_1` of `GF(2^128)` (`Tower128`). They key the `GF(2)`-linear hash
+//!    `H(v) = (P_v(s_0) + tail_0(v), P_v(s_1) + tail_1(v))` of a bit column `v`, where
+//!    `P_v(s) = sum_k block_k(v) s^(k+1)` runs over the 128-bit blocks of the payload bits and
+//!    `tail` is the 256 sacrificial bits. As a matrix `H = [X | I_256]`.
+//! 3. The receiver answers with `H(x)` and `H(t0_c)` for every column ([`OtExtProofMsg`], Roy
+//!    Fig. 9: `R U` and `R V`).
+//! 4. The sender has `q_c = t0_c + delta_c (x)` if the receiver was honest, and accepts iff
+//!    `H(q_c) = H(t0_c) + delta_c H(x)` for all 128 columns. Otherwise it wipes the channel and
+//!    refuses every later batch on it. The sacrificial rows are dropped.
+//! 5. Row `i` of the transposed columns is hashed into a pad with the tweak
+//!    `(session, bind, sender, receiver, batch counter, i)`, `bind` being a digest of the
+//!    three messages (Roy Fig. 11 with `t(i, x) = i`).
+//!
+//! The same check, with 256 columns, guards the per-pair pool extension of `Π_triple_f2`
+//! (`triple_f2.rs`, `extend_pair`), whose correlation is the holder's two-lane MAC key share.
+//!
+//! ## What is proven, with this code's numbers
+//!
+//! * `H` is `eps`-almost universal with `eps <= (n / 2^128)^2`, `n` the number of payload
+//!   blocks (claim, by counting roots: for `v != 0` with a nonzero payload, `P_v(s) + tail`
+//!   is a nonzero polynomial of degree at most `n` in each independent point; with a zero
+//!   payload `H(v) = tail != 0`). Every `H`, for every key, is `GF(2)^h`-hiding in the sense
+//!   of Roy Definition 4.1 with `h` the payload length, because of the identity block: a
+//!   corrupted sender cannot pick a key that makes `H(x)` reveal payload choice bits. A mesh
+//!   frame carries at most 16,380 payload words (`MAX_FRAME_BUDGET`), so `n <= 8,190` and
+//!   `eps < 2^-230`; a 256-OT bootstrap frame has `n = 2`.
+//! * **Theorem (Roy Theorem 4.5).** Fig. 8 with the check of Fig. 9 realises subspace VOLE
+//!   with pre-commitment and selective-abort leakage `Affine(GF(2)^128)` against malicious
+//!   parties, with distinguishing advantage at most `eps q/(q-1) + q^(-t-1)`, where
+//!   `t = (d_C - 1) / (1 + sqrt(1 - (d_C - 1)/n_C))`. Here that is `2 eps + 2^(-t-1)` with
+//!   `t = 127 / (1 + 2^-3.5) = 116.7`: at most `2^-229 + 2^-117.7`.
+//! * The `2^(-t-1)` term belongs to the pre-commitment property only (the paper says so under
+//!   the theorem; it enters in step 5 of the proof, steps 1 to 4 cost `eps q/(q-1)`).
+//!   Pre-commitment is used by Roy Theorem 5.1 to bound collisions between extended OTs that
+//!   share a tweak, a term `eps M l (t_max - 1)/2` that is zero for `t_max = 1`.
+//!   **Claim:** since every extended OT of a channel has its own tweak (the batch counter
+//!   never repeats on a channel, the index never within a batch, and a `delta` lives in one
+//!   channel), this code needs only steps 1 to 4, so a corrupted receiver's advantage against
+//!   the correlation is at most `2 eps < 2^-229` per batch. Read strictly as stated, the
+//!   theorems give `2^-229 + 2^-117.7`; either way the check is no longer the weakest term.
+//! * **Theorem (Roy Theorem 5.1 with Proposition 2.6).** Hashing the rows with a tweakable
+//!   correlation-robust hash gives malicious random OT with no leakage to its consumers; a
+//!   random oracle is such a hash against `Affine` leakage with advantage at most
+//!   `(tau_max q + q'/2) 2^-128` for `q` oracle queries and `q'` hashed rows, `tau_max = 1`
+//!   here. That bound already contains the selective abort, so guessed bits of `delta` are
+//!   not charged twice. **Claim:** the single-block Keccak pad hash of this module is modelled
+//!   as that random oracle.
+//! * **Claims of this module, not of the paper:** sending the hash key in the clear as two
+//!   field elements (the paper allows any `eps`-almost universal family of hiding matrices and
+//!   a key chosen by the VOLE receiver after the correction); the composition with the base
+//!   OTs of item 1 as the `GF(2)` VOLE of Roy Fig. 7; that the proof message, 129 hash values
+//!   sent in full, needs no further assumption (the paper's optional compression of `R V` by
+//!   a hash is not used). Nothing here is Fiat-Shamir: the key is the sender's fresh
+//!   randomness, sent after the columns, which is the order Fig. 9 requires. The interactive
+//!   order and the poisoning are also what the regression test for the grinding and
+//!   column-probe attacks on the first, non-interactive version of this extension pins.
+//! * For the 256-column pool extension the same theorem gives `2 eps` with
+//!   `eps <= (rows / 2^135)^2` (steps 1 to 4; its rows are used as a VOLE, and hashed only
+//!   under per-`(session, holder, owner, domain, row)` tweaks).
+//!
+//! ## Selective failure, and what consumers must tolerate
+//!
+//! A corrupted OT receiver can make its columns inconsistent in a set of columns and prepare
+//! its proof for one guess of the corresponding bits of `delta` (in general: for one affine
+//! subspace of `GF(2)^128`). The check passes exactly if the guess is right, probability
+//! `2^-c` for `c` independent constraints, and then the receiver knows them; a wrong guess
+//! ends the channel, so all guesses over the life of a channel are one attempt. The tests
+//! `ot_ext_one_inconsistent_column_passes_exactly_on_the_right_delta_guess` and
+//! `ot_ext_many_rows_in_eight_columns_pass_for_exactly_one_guess_in_256` pin this.
+//!
+//! * Consumers of pads ([`OtMesh::run_correlated_ot_words`], Gilboa and MASCOT products, the
+//!   COPE initialisation and triple multiplication of `dregg-sig-migrate`'s `hem::collab::prep`,
+//!   `dregg-sig-fts`, `dregg-sig-quorum`) never see `delta`; for them the leak is inside the
+//!   `(q + q'/2) 2^-128` term above and nothing else changes. No constant of a consumer
+//!   depends on the check.
+//! * The pool extension of `Π_triple_f2` leaks, to a corrupted bit owner that passes, affine
+//!   constraints on an honest holder's MAC key share: `c` constraints with probability
+//!   `2^-c`, after which a forgery still has to name the remaining `256 - c` bits. A failed
+//!   check fails the ceremony; a caller must draw fresh key shares for a rerun, or the
+//!   attempts add up. This is the leakage MASCOT's authentication tolerates and it is
+//!   unchanged from the deleted check, which leaked the same predicate when it worked as
+//!   intended.
+//! * An honest receiver's choice bits are never exposed to selective failure by the
+//!   extension: the sender sends nothing but the hash key, and every key is hiding.
 
 // Unit tests have a host runtime even when the production library is no_std.
 #[cfg(all(test, not(feature = "std")))]
@@ -55,8 +172,8 @@ use crate::wipe::{
 
 mod mac_blind;
 mod triple_f2;
-pub use mac_blind::{blind_open_additive_gf128_poly, blind_open_ext2};
 pub(crate) use mac_blind::blind_open_tower128;
+pub use mac_blind::{blind_open_additive_gf128_poly, blind_open_ext2};
 use mac_blind::{blind_open_degree_ext2, blind_open_degree_tower128};
 
 // ============================================================================
@@ -184,7 +301,7 @@ pub enum PreprocessError {
         receiver_id: usize,
         ot_idx: u32,
     },
-    KosOtCheckFailed {
+    OtExtCheckFailed {
         sender_id: usize,
         receiver_id: usize,
     },
@@ -260,12 +377,12 @@ impl fmt::Display for PreprocessError {
                 "Ring-LWE Base-OT Fujisaki-Okamoto re-encryption check failed (sender {}, receiver {}, idx {})",
                 sender_id, receiver_id, ot_idx
             ),
-            Self::KosOtCheckFailed {
+            Self::OtExtCheckFailed {
                 sender_id,
                 receiver_id,
             } => write!(
                 f,
-                "interactive KOS OT extension correlation check failed between sender {} and receiver {}",
+                "correlated OT extension consistency check failed between sender {} and receiver {}",
                 sender_id, receiver_id
             ),
             Self::ChannelPoisoned {
@@ -2499,7 +2616,7 @@ pub fn rlwe_ot_decrypt(
 }
 
 // ============================================================================
-// 2. Committed CRS + 4-Ciphertext `384 -> 128` Parity OT Combiner & Interactive 128-Col `KOS15`
+// 2. Committed CRS + 4-Ciphertext `384 -> 128` Parity OT Combiner & Interactive 128-Col Correlated
 // ============================================================================
 
 /// Expand the 2-universal systematic Leftover-Hash matrix $E = [I_{128} \mid R_{128 \times 256}] \in \mathbb{F}_2^{128 \times 384}$
@@ -3668,7 +3785,7 @@ impl BaseOtExtSenderRound3 {
             });
         }
         if msg4.parity_tables.len() != 128 {
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.ext_sender_id,
                 receiver_id: self.ext_receiver_id,
             });
@@ -3696,7 +3813,7 @@ impl BaseOtExtSenderRound3 {
             .collect();
         for (row, support) in supports.iter().enumerate() {
             if msg4.parity_tables[row].len() + 1 != support.len() {
-                return Err(PreprocessError::KosOtCheckFailed {
+                return Err(PreprocessError::OtExtCheckFailed {
                     sender_id: self.ext_sender_id,
                     receiver_id: self.ext_receiver_id,
                 });
@@ -3763,7 +3880,7 @@ impl BaseOtExtSenderRound3 {
 }
 
 /// Established 128-column parity-combined Ring-LWE OT-Extension Sender channel (`!Clone`, wiped on
-/// `Drop`, permanently poisoned and zeroed on first `KosOtCheckFailed`!).
+/// `Drop`, permanently poisoned and zeroed on first `OtExtCheckFailed`).
 pub struct OtExtSenderChannel {
     pub session_id: [u8; 32],
     pub sender_id: usize,
@@ -3783,48 +3900,6 @@ impl OtExtSenderChannel {
             wipe_bytes32(s);
         }
     }
-
-    /// Derive a domain-separated child sender channel over the same 128-bit `delta` correlation
-    /// so independent concurrent repetition streams never contend or re-run Ring-LWE Base OT.
-    pub fn fork_substream(
-        &self,
-        child_session_id: [u8; 32],
-        stream_idx: u64,
-    ) -> Result<Self, PreprocessError> {
-        if self.poisoned {
-            return Err(PreprocessError::ChannelPoisoned {
-                sender_id: self.sender_id,
-                receiver_id: self.receiver_id,
-            });
-        }
-        let s_be = (self.sender_id as u64).to_be_bytes();
-        let r_be = (self.receiver_id as u64).to_be_bytes();
-        let idx_be = stream_idx.to_be_bytes();
-        let combined_seeds: [[u8; 32]; 128] = core::array::from_fn(|col| {
-            let col_be = (col as u64).to_be_bytes();
-            cshake256_32_multi_frame(
-                b"QSAG.OT.EXT.FORK/v1",
-                &[
-                    &self.session_id,
-                    &child_session_id,
-                    &s_be,
-                    &r_be,
-                    &idx_be,
-                    &col_be,
-                    &self.combined_seeds[col],
-                ],
-            )
-        });
-        Ok(Self {
-            session_id: child_session_id,
-            sender_id: self.sender_id,
-            receiver_id: self.receiver_id,
-            delta: self.delta,
-            combined_seeds,
-            batch_ctr: 0,
-            poisoned: false,
-        })
-    }
 }
 
 impl Drop for OtExtSenderChannel {
@@ -3840,50 +3915,6 @@ pub struct OtExtReceiverChannel {
     pub receiver_id: usize,
     combined_seed_pairs: [([u8; 32], [u8; 32]); 128],
     batch_ctr: u64,
-}
-
-impl OtExtReceiverChannel {
-    /// Derive the matching domain-separated child receiver channel for [`OtExtSenderChannel::fork_substream`].
-    pub fn fork_substream(&self, child_session_id: [u8; 32], stream_idx: u64) -> Self {
-        let s_be = (self.sender_id as u64).to_be_bytes();
-        let r_be = (self.receiver_id as u64).to_be_bytes();
-        let idx_be = stream_idx.to_be_bytes();
-        let combined_seed_pairs: [([u8; 32], [u8; 32]); 128] = core::array::from_fn(|col| {
-            let col_be = (col as u64).to_be_bytes();
-            let s0 = cshake256_32_multi_frame(
-                b"QSAG.OT.EXT.FORK/v1",
-                &[
-                    &self.session_id,
-                    &child_session_id,
-                    &s_be,
-                    &r_be,
-                    &idx_be,
-                    &col_be,
-                    &self.combined_seed_pairs[col].0,
-                ],
-            );
-            let s1 = cshake256_32_multi_frame(
-                b"QSAG.OT.EXT.FORK/v1",
-                &[
-                    &self.session_id,
-                    &child_session_id,
-                    &s_be,
-                    &r_be,
-                    &idx_be,
-                    &col_be,
-                    &self.combined_seed_pairs[col].1,
-                ],
-            );
-            (s0, s1)
-        });
-        Self {
-            session_id: child_session_id,
-            sender_id: self.sender_id,
-            receiver_id: self.receiver_id,
-            combined_seed_pairs,
-            batch_ctr: 0,
-        }
-    }
 }
 
 impl Drop for OtExtReceiverChannel {
@@ -3934,7 +3965,7 @@ pub fn try_establish_rlwe_ot_ext_channel(
 
 /// Ideal base-OT functionality for unit tests of the OT extension and its
 /// consumers. Production never compiles this constructor. Base proofs, FO,
-/// committed CRS and KOS attacks also have a real default end-to-end regression.
+/// committed CRS and extension-check attacks also have a real default end-to-end regression.
 #[cfg(test)]
 fn establish_ideal_ot_ext_channel_for_test(
     session_id: [u8; 32],
@@ -3984,25 +4015,36 @@ pub fn establish_rlwe_ot_ext_channel(
     try_establish_rlwe_ot_ext_channel(session_id, sender_id, receiver_id, sender_rng, receiver_rng)
 }
 
-/// Interactive KOS OT-Extension Message 1 (`OT Receiver -> OT Sender`: locks `128` parity-combined
-/// `u_cols` BEFORE Sender samples `chi_seed`!).
+/// Number of sacrificial extended OTs appended to every batch. They are the identity block of
+/// the consistency-check hash `[X | I_256]` and are discarded, which keeps the hashed choice
+/// bits and rows of the payload OTs hidden (Roy, Definition 4.1).
+pub const OT_EXT_SACRIFICIAL_OTS: usize = 256;
+const OT_EXT_SACRIFICIAL_WORDS: usize = OT_EXT_SACRIFICIAL_OTS / 64;
+/// Encoded length of [`OtExtProofMsg`]: the 256-bit hash of the choice bits and of each of the
+/// 128 columns.
+pub const OT_EXT_PROOF_BYTES: usize = 32 * 129;
+
+/// Correlated OT extension message 1 (`OT Receiver -> OT Sender`): the 128 IKNP correction
+/// columns, sent before the sender picks its hash key.
 #[derive(Clone, Debug)]
-pub struct KosOtUColsMsg {
-    /// `128` active-secure combined bit-columns of length `padded_words` (`payload_words + 4` sacrificial words = +256 OTs).
+pub struct OtExtUColsMsg {
+    /// `128` bit-columns of `payload_words + 4` words (the last 4 words are the sacrificial OTs).
     pub u_cols: Vec<Vec<u64>>,
 }
 
-/// Interactive KOS OT-Extension Message 2 (`OT Sender -> OT Receiver`: fresh 256-bit random challenge seed!).
+/// Correlated OT extension message 2 (`OT Sender -> OT Receiver`): the key of the linear
+/// universal hash, two evaluation points in `GF(2^128)`, sampled after message 1 arrived.
 #[derive(Clone, Copy, Debug)]
-pub struct KosOtChallengeMsg {
+pub struct OtExtChallengeMsg {
     pub chi_seed: [u8; 32],
 }
 
-/// Interactive KOS OT-Extension Message 3 (`OT Receiver -> OT Sender`: linear correlation proof `(x_kos, t_kos)`).
-#[derive(Clone, Copy, Debug)]
-pub struct KosOtProofMsg {
-    pub x_kos: Tower128,
-    pub t_kos: Tower128,
+/// Correlated OT extension message 3 (`OT Receiver -> OT Sender`): the hash of the receiver's
+/// choice bits and of each of its 128 row-matrix columns (Roy Fig. 9: `R U` and `R V`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OtExtProofMsg {
+    pub x_hash: [u128; 2],
+    pub t_hash: Box<[[u128; 2]; 128]>,
 }
 
 fn encode_rlwe_poly_vec(out: &mut Vec<u8>, poly: &RlwePoly) {
@@ -4269,7 +4311,7 @@ impl BaseOtRound4Msg {
     }
 }
 
-impl KosOtUColsMsg {
+impl OtExtUColsMsg {
     /// Canonical byte serialization (`padded_words_be32` + `128 * padded_words` LE `u64`s).
     pub fn to_bytes(&self) -> Vec<u8> {
         let padded_words = self.u_cols.first().map_or(0, Vec::len);
@@ -4311,7 +4353,7 @@ impl KosOtUColsMsg {
     }
 }
 
-impl KosOtChallengeMsg {
+impl OtExtChallengeMsg {
     pub fn to_bytes(&self) -> [u8; 32] {
         self.chi_seed
     }
@@ -4322,55 +4364,67 @@ impl KosOtChallengeMsg {
     }
 }
 
-impl KosOtProofMsg {
-    pub fn to_bytes(&self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        out[0..16].copy_from_slice(&self.x_kos.0.to_le_bytes());
-        out[16..32].copy_from_slice(&self.t_kos.0.to_le_bytes());
+impl OtExtProofMsg {
+    /// `x_hash` then the 128 `t_hash` entries, each two little-endian `u128`s.
+    pub fn to_bytes(&self) -> [u8; OT_EXT_PROOF_BYTES] {
+        let mut out = [0u8; OT_EXT_PROOF_BYTES];
+        let entries = core::iter::once(&self.x_hash).chain(self.t_hash.iter());
+        for (dst, entry) in out.as_chunks_mut::<32>().0.iter_mut().zip(entries) {
+            dst[..16].copy_from_slice(&entry[0].to_le_bytes());
+            dst[16..].copy_from_slice(&entry[1].to_le_bytes());
+        }
         out
     }
 
     pub fn from_bytes(raw: &[u8]) -> Option<Self> {
-        if raw.len() != 32 {
+        if raw.len() != OT_EXT_PROOF_BYTES {
             return None;
         }
-        let x = u128::from_le_bytes(raw[0..16].try_into().ok()?);
-        let t = u128::from_le_bytes(raw[16..32].try_into().ok()?);
+        let entry = |i: usize| -> [u128; 2] {
+            core::array::from_fn(|lane| {
+                let o = 32 * i + 16 * lane;
+                u128::from_le_bytes(core::array::from_fn(|b| raw[o + b]))
+            })
+        };
         Some(Self {
-            x_kos: Tower128(x),
-            t_kos: Tower128(t),
+            x_hash: entry(0),
+            t_hash: Box::new(core::array::from_fn(|c| entry(c + 1))),
         })
     }
 }
 
-/// Ephemeral Receiver state awaiting `KosOtChallengeMsg` (`!Clone`, wiped on `Drop`).
-pub struct KosOtReceiverPending {
+/// Receiver state between messages 1 and 3 (`!Clone`, wiped on `Drop`).
+pub struct OtExtReceiverPending {
     batch_ctr: u64,
     payload_words: usize,
     full_choices: Vec<u64>,
-    t_rows: Vec<u128>,
+    t0_cols: Vec<Vec<u64>>,
     u_cols_digest: [u8; 32],
 }
 
-impl Drop for KosOtReceiverPending {
+impl Drop for OtExtReceiverPending {
     fn drop(&mut self) {
         wipe_u64s(&mut self.full_choices);
-        wipe_u128s(&mut self.t_rows);
+        for col in &mut self.t0_cols {
+            wipe_u64s(col);
+        }
     }
 }
 
-/// Ephemeral Sender state awaiting `KosOtProofMsg` (`!Clone`, wiped on `Drop`).
-pub struct KosOtSenderPending {
+/// Sender state between messages 2 and 3 (`!Clone`, wiped on `Drop`).
+pub struct OtExtSenderPending {
     batch_ctr: u64,
-    payload_words: usize,
     q_rows: Vec<u128>,
+    /// Hash of each of the sender's 128 columns under its own key.
+    q_hash: [[u128; 2]; 128],
     u_cols_digest: [u8; 32],
     chi_seed: [u8; 32],
 }
 
-impl Drop for KosOtSenderPending {
+impl Drop for OtExtSenderPending {
     fn drop(&mut self) {
         wipe_u128s(&mut self.q_rows);
+        wipe_u128s(self.q_hash.as_flattened_mut());
     }
 }
 
@@ -4430,14 +4484,14 @@ fn transpose_cols128_to_rows(cols: &[Vec<u64>], num_words: usize) -> Vec<u128> {
     rows
 }
 
-fn hash_kos_u_cols(
+fn hash_ot_ext_u_cols(
     session_id: &[u8; 32],
     sender_id: usize,
     receiver_id: usize,
     batch_ctr: u64,
     u_cols: &[Vec<u64>],
 ) -> [u8; 32] {
-    let mut xof = Cshake256Xof::new(b"QSAG.OT.KOS.UCOLS/v2");
+    let mut xof = Cshake256Xof::new(b"QSAG.OT.EXT.UCOLS/v3");
     xof.absorb(session_id);
     xof.absorb(&(sender_id as u64).to_be_bytes());
     xof.absorb(&(receiver_id as u64).to_be_bytes());
@@ -4454,17 +4508,75 @@ fn hash_kos_u_cols(
     out
 }
 
-fn compute_kos_transcript_bind(
+fn compute_ot_ext_transcript_bind(
     u_cols_digest: &[u8; 32],
     chi_seed: &[u8; 32],
-    proof: &KosOtProofMsg,
+    proof: &OtExtProofMsg,
 ) -> [u8; 32] {
-    let x_bytes = proof.x_kos.0.to_le_bytes();
-    let t_bytes = proof.t_kos.0.to_le_bytes();
     cshake256_32_multi_frame(
-        b"QSAG.OT.KOS.BIND/v2",
-        &[u_cols_digest, chi_seed, &x_bytes, &t_bytes],
+        b"QSAG.OT.EXT.BIND/v3",
+        &[u_cols_digest, chi_seed, &proof.to_bytes()],
     )
+}
+
+/// Key of the consistency-check hash of one extension batch: the powers `s_j^1 ..= s_j^n` of
+/// the two evaluation points carried by [`OtExtChallengeMsg`], `n` the number of 128-bit
+/// payload blocks.
+///
+/// The hash of a bit column `x` (`payload_words` words, then the 4 sacrificial words) is
+/// `(P_x(s_0) + tail_0, P_x(s_1) + tail_1)` with `P_x(s) = sum_k block_k s^(k+1)` over
+/// `Tower128`; `block_k` is the `k`-th pair of payload words and `tail` the two pairs of
+/// sacrificial words. It is the `GF(2)`-linear map `[X | I_256]`.
+pub(crate) struct OtExtCheckKey {
+    payload_words: usize,
+    powers: Vec<[u128; 2]>,
+}
+
+impl OtExtCheckKey {
+    pub(crate) fn new(chi_seed: &[u8; 32], payload_words: usize) -> Self {
+        let point = |lane: usize| {
+            Tower128(u128::from_le_bytes(core::array::from_fn(|i| {
+                chi_seed[16 * lane + i]
+            })))
+        };
+        let points = [point(0), point(1)];
+        let mut cur = points;
+        let mut powers = Vec::with_capacity(payload_words.div_ceil(2));
+        for _ in 0..payload_words.div_ceil(2) {
+            powers.push([cur[0].0, cur[1].0]);
+            cur = [cur[0].mul(points[0]), cur[1].mul(points[1])];
+        }
+        Self {
+            payload_words,
+            powers,
+        }
+    }
+
+    /// Hash one column. Constant time in `col`.
+    pub(crate) fn hash(&self, col: &[u64]) -> [u128; 2] {
+        let payload = self.payload_words;
+        assert_eq!(col.len(), payload + OT_EXT_SACRIFICIAL_WORDS);
+        let join = |lo: u64, hi: u64| u128::from(lo) | (u128::from(hi) << 64);
+        let mut out = [
+            join(col[payload], col[payload + 1]),
+            join(col[payload + 2], col[payload + 3]),
+        ];
+        let mut lhs = [[0u128; 2]; 64];
+        for (chunk, weights) in self.powers.chunks(64).enumerate() {
+            for (i, slot) in lhs[..weights.len()].iter_mut().enumerate() {
+                let w = 2 * (64 * chunk + i);
+                let hi = if w + 1 < payload { col[w + 1] } else { 0 };
+                let block = join(col[w], hi);
+                *slot = [block, block];
+            }
+            let mut part = dregg_sig_asm::tower128_bdoz_2lane_mac(&lhs[..weights.len()], weights);
+            out[0] ^= part[0];
+            out[1] ^= part[1];
+            crate::wipe::wipe_u128s(&mut part);
+        }
+        crate::wipe::wipe_u128s(lhs.as_flattened_mut());
+        out
+    }
 }
 
 /// Fast 4-way SIMD (`keccak_f1600_x4`) single-block `SHAKE256` transcript-bound correlation-robust
@@ -4639,68 +4751,14 @@ fn crh_ot_sender_pad_pairs_batch(
     pad_pairs
 }
 
-fn derive_interactive_kos_challenges(
-    session_id: &[u8; 32],
-    sender_id: usize,
-    receiver_id: usize,
-    batch_ctr: u64,
-    u_cols_digest: &[u8; 32],
-    chi_seed: &[u8; 32],
-    total_rows: usize,
-) -> Vec<Tower128> {
-    let mut xof = Cshake256Xof::new(b"QSAG.OT.KOS.ICHAL/v2");
-    xof.absorb(session_id);
-    xof.absorb(&(sender_id as u64).to_be_bytes());
-    xof.absorb(&(receiver_id as u64).to_be_bytes());
-    xof.absorb(&batch_ctr.to_be_bytes());
-    xof.absorb(u_cols_digest);
-    xof.absorb(chi_seed);
-    let mut raw = vec![0u8; 16 * total_rows];
-    xof.squeeze(&mut raw);
-    #[expect(
-        clippy::chunks_exact_to_as_chunks,
-        reason = "Keep the workspace Rust 1.85 minimum; slice as_chunks requires a newer compiler"
-    )]
-    raw.chunks_exact(16)
-        .map(|c| {
-            let mut b = [0u8; 16];
-            b.copy_from_slice(c);
-            Tower128(u128::from_le_bytes(b))
-        })
-        .collect()
-}
-
-// Pack consecutive products into the two existing assembly lanes. This is the
-// same tower-field inner product as the scalar KOS equation, including tails.
-fn kos_inner_product(rows: &[u128], challenges: &[Tower128]) -> Tower128 {
-    assert_eq!(rows.len(), challenges.len());
-    let mut total = Tower128::ZERO;
-    for (values, weights) in rows.chunks(128).zip(challenges.chunks(128)) {
-        let mut lhs = [[0u128; 2]; 64];
-        let mut rhs = [[0u128; 2]; 64];
-        for (i, (&value, weight)) in values.iter().zip(weights).enumerate() {
-            lhs[i / 2][i % 2] = value;
-            rhs[i / 2][i % 2] = weight.0;
-        }
-        let count = values.len().div_ceil(2);
-        let mut folded = dregg_sig_asm::tower128_bdoz_2lane_mac(&lhs[..count], &rhs[..count]);
-        total = total.add(Tower128(folded[0] ^ folded[1]));
-        crate::wipe::wipe_u128s(lhs.as_flattened_mut());
-        crate::wipe::wipe_u128s(rhs.as_flattened_mut());
-        crate::wipe::wipe_u128s(&mut folded);
-    }
-    total
-}
-
 impl OtExtReceiverChannel {
-    /// Interactive KOS Step 1 (`OT Receiver -> OT Sender`): append 256 sacrificial random OTs,
-    /// expand `128` parity-combined PRG columns, lock `KosOtUColsMsg` **before** seeing Sender's
-    /// random `chi_seed`, and retain `KosOtReceiverPending`.
+    /// Extension step 1 (`OT Receiver -> OT Sender`): append 256 sacrificial random OTs, expand
+    /// the 128 PRG columns and send `OtExtUColsMsg`, before the sender picks its hash key.
     pub fn round1_send_u_cols(
         &mut self,
         choice_words: &[u64],
         rng: &mut PartyPrivateRng,
-    ) -> (KosOtReceiverPending, KosOtUColsMsg) {
+    ) -> (OtExtReceiverPending, OtExtUColsMsg) {
         assert!(
             self.batch_ctr < u64::MAX,
             "OtExtReceiverChannel batch counter exhausted"
@@ -4718,13 +4776,13 @@ impl OtExtReceiverChannel {
         &mut self,
         choice_words: &[u64],
         sac_words: [u64; 4],
-    ) -> (KosOtReceiverPending, KosOtUColsMsg) {
+    ) -> (OtExtReceiverPending, OtExtUColsMsg) {
         assert!(
             self.batch_ctr < u64::MAX,
             "OtExtReceiverChannel batch counter exhausted"
         );
         let payload_words = choice_words.len();
-        let padded_words = payload_words + 4; // +256 sacrificial OTs masking x_kos & t_kos
+        let padded_words = payload_words + OT_EXT_SACRIFICIAL_WORDS;
         let batch_ctr = self.batch_ctr;
         self.batch_ctr += 1;
 
@@ -4814,11 +4872,7 @@ impl OtExtReceiverChannel {
             );
         }
 
-        let t_rows = transpose_cols128_to_rows(&t0_cols, padded_words);
-        for col in &mut t0_cols {
-            wipe_u64s(col);
-        }
-        let u_cols_digest = hash_kos_u_cols(
+        let u_cols_digest = hash_ot_ext_u_cols(
             &self.session_id,
             self.sender_id,
             self.receiver_id,
@@ -4826,66 +4880,54 @@ impl OtExtReceiverChannel {
             &u_cols,
         );
         (
-            KosOtReceiverPending {
+            OtExtReceiverPending {
                 batch_ctr,
                 payload_words,
                 full_choices,
-                t_rows,
+                t0_cols,
                 u_cols_digest,
             },
-            KosOtUColsMsg { u_cols },
+            OtExtUColsMsg { u_cols },
         )
     }
 
-    /// Interactive KOS Step 3 (`OT Receiver -> OT Sender`): respond to `KosOtChallengeMsg` with
-    /// `(x_kos, t_kos)` and derive transcript-bound receiver pads.
+    /// Extension step 3 (`OT Receiver -> OT Sender`): answer `OtExtChallengeMsg` with the hash
+    /// of the choice bits and of every column, and derive the transcript-bound receiver pads.
     pub fn round3_prove_and_finish(
         &self,
-        mut pending: KosOtReceiverPending,
-        chal: &KosOtChallengeMsg,
-    ) -> (KosOtProofMsg, Vec<[u8; 48]>) {
-        let total_rows = pending.t_rows.len();
-        let chis = derive_interactive_kos_challenges(
-            &self.session_id,
-            self.sender_id,
-            self.receiver_id,
-            pending.batch_ctr,
-            &pending.u_cols_digest,
-            &chal.chi_seed,
-            total_rows,
-        );
-        let mut x_kos = Tower128::ZERO;
-        let t_kos = kos_inner_product(&pending.t_rows, &chis);
-        for (ell, chis_ell_item) in chis[..total_rows].iter().enumerate() {
-            let r_bit = ((pending.full_choices[ell / 64] >> (ell % 64)) & 1) as u128;
-            let mask = 0u128.wrapping_sub(black_box(r_bit));
-            x_kos = x_kos.add(Tower128(chis_ell_item.0 & mask));
-        }
+        mut pending: OtExtReceiverPending,
+        chal: &OtExtChallengeMsg,
+    ) -> (OtExtProofMsg, Vec<[u8; 48]>) {
+        let key = OtExtCheckKey::new(&chal.chi_seed, pending.payload_words);
+        let proof = OtExtProofMsg {
+            x_hash: key.hash(&pending.full_choices),
+            t_hash: Box::new(core::array::from_fn(|col| key.hash(&pending.t0_cols[col]))),
+        };
         wipe_u64s(&mut pending.full_choices);
 
-        let proof = KosOtProofMsg { x_kos, t_kos };
-        let bind = compute_kos_transcript_bind(&pending.u_cols_digest, &chal.chi_seed, &proof);
-        let payload_rows = 64 * pending.payload_words;
+        let bind = compute_ot_ext_transcript_bind(&pending.u_cols_digest, &chal.chi_seed, &proof);
+        let mut t_rows = transpose_cols128_to_rows(&pending.t0_cols, pending.payload_words);
         let pads = crh_ot_receiver_pads_batch(
             &self.session_id,
             &bind,
             self.sender_id,
             self.receiver_id,
             pending.batch_ctr,
-            &pending.t_rows[..payload_rows],
+            &t_rows,
         );
+        wipe_u128s(&mut t_rows);
         (proof, pads)
     }
 }
 
 impl OtExtSenderChannel {
-    /// Interactive KOS Step 2 (`OT Sender -> OT Receiver`): validate 128-column `KosOtUColsMsg`,
-    /// expand `q_rows`, and sample a **fresh** 256-bit `chi_seed` *after* `u_cols` is locked.
+    /// Extension step 2 (`OT Sender -> OT Receiver`): validate the 128-column `OtExtUColsMsg`,
+    /// expand the sender's columns, and sample a fresh 256-bit hash key after `u_cols` arrived.
     pub fn round2_sample_challenge(
         &mut self,
-        u_msg: &KosOtUColsMsg,
+        u_msg: &OtExtUColsMsg,
         sender_rng: &mut PartyPrivateRng,
-    ) -> Result<(KosOtSenderPending, KosOtChallengeMsg), PreprocessError> {
+    ) -> Result<(OtExtSenderPending, OtExtChallengeMsg), PreprocessError> {
         if self.poisoned {
             return Err(PreprocessError::ChannelPoisoned {
                 sender_id: self.sender_id,
@@ -4901,23 +4943,23 @@ impl OtExtSenderChannel {
         }
         if u_msg.u_cols.len() != 128 {
             self.poison_and_wipe();
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.sender_id,
                 receiver_id: self.receiver_id,
             });
         }
         let padded_words = u_msg.u_cols[0].len();
-        if padded_words < 4
+        if padded_words < OT_EXT_SACRIFICIAL_WORDS
             || validate_frame_count(padded_words, 128 * 8, MAX_FRAME_BUDGET).is_err()
             || u_msg.u_cols.iter().any(|c| c.len() != padded_words)
         {
             self.poison_and_wipe();
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.sender_id,
                 receiver_id: self.receiver_id,
             });
         }
-        let payload_words = padded_words - 4;
+        let payload_words = padded_words - OT_EXT_SACRIFICIAL_WORDS;
         let batch_ctr = self.batch_ctr;
         self.batch_ctr += 1;
         let chi_seed = sender_rng.next_bytes32();
@@ -4932,9 +4974,9 @@ impl OtExtSenderChannel {
 
     pub(super) fn round2_sample_challenge_with_chi(
         &mut self,
-        u_msg: &KosOtUColsMsg,
+        u_msg: &OtExtUColsMsg,
         chi_seed: [u8; 32],
-    ) -> Result<(KosOtSenderPending, KosOtChallengeMsg), PreprocessError> {
+    ) -> Result<(OtExtSenderPending, OtExtChallengeMsg), PreprocessError> {
         if self.poisoned {
             return Err(PreprocessError::ChannelPoisoned {
                 sender_id: self.sender_id,
@@ -4950,23 +4992,23 @@ impl OtExtSenderChannel {
         }
         if u_msg.u_cols.len() != 128 {
             self.poison_and_wipe();
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.sender_id,
                 receiver_id: self.receiver_id,
             });
         }
         let padded_words = u_msg.u_cols[0].len();
-        if padded_words < 4
+        if padded_words < OT_EXT_SACRIFICIAL_WORDS
             || validate_frame_count(padded_words, 128 * 8, MAX_FRAME_BUDGET).is_err()
             || u_msg.u_cols.iter().any(|c| c.len() != padded_words)
         {
             self.poison_and_wipe();
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.sender_id,
                 receiver_id: self.receiver_id,
             });
         }
-        let payload_words = padded_words - 4;
+        let payload_words = padded_words - OT_EXT_SACRIFICIAL_WORDS;
         let batch_ctr = self.batch_ctr;
         self.batch_ctr += 1;
         self.round2_sample_challenge_with_chi_inner(
@@ -4983,9 +5025,9 @@ impl OtExtSenderChannel {
         batch_ctr: u64,
         payload_words: usize,
         padded_words: usize,
-        u_msg: &KosOtUColsMsg,
+        u_msg: &OtExtUColsMsg,
         chi_seed: [u8; 32],
-    ) -> Result<(KosOtSenderPending, KosOtChallengeMsg), PreprocessError> {
+    ) -> Result<(OtExtSenderPending, OtExtChallengeMsg), PreprocessError> {
         let mut q_cols = vec![Vec::new(); 128];
         let fill_q_group8 = |sid: &[u8; 32],
                              seeds: &[[u8; 32]; 128],
@@ -5046,12 +5088,14 @@ impl OtExtSenderChannel {
             );
         }
 
-        let q_rows = transpose_cols128_to_rows(&q_cols, padded_words);
+        let key = OtExtCheckKey::new(&chi_seed, payload_words);
+        let q_hash = core::array::from_fn(|col| key.hash(&q_cols[col]));
+        let q_rows = transpose_cols128_to_rows(&q_cols, payload_words);
         for col in &mut q_cols {
             wipe_u64s(col);
         }
 
-        let u_cols_digest = hash_kos_u_cols(
+        let u_cols_digest = hash_ot_ext_u_cols(
             &self.session_id,
             self.sender_id,
             self.receiver_id,
@@ -5059,24 +5103,25 @@ impl OtExtSenderChannel {
             &u_msg.u_cols,
         );
         Ok((
-            KosOtSenderPending {
+            OtExtSenderPending {
                 batch_ctr,
-                payload_words,
                 q_rows,
+                q_hash,
                 u_cols_digest,
                 chi_seed,
             },
-            KosOtChallengeMsg { chi_seed },
+            OtExtChallengeMsg { chi_seed },
         ))
     }
 
-    /// Interactive KOS Step 4 (`OT Sender` local): verify `q_kos == t_kos + x_kos * delta` against
-    /// the post-`u_cols` random `chi_seed`. On mismatch, **permanently poisons and wipes** this
-    /// channel (`0` multi-batch column probes!) before returning `Err(KosOtCheckFailed)`.
+    /// Extension step 4 (`OT Sender`, local): for every column `c`, check that the hash of
+    /// the sender's column equals `t_hash[c] + delta_c * x_hash` (Roy Fig. 9). On mismatch the
+    /// channel is poisoned and wiped for good before `Err(OtExtCheckFailed)` is returned, so
+    /// all guesses at `delta` over the life of a channel are one attempt.
     pub fn round4_verify_and_finish(
         &mut self,
-        pending: KosOtSenderPending,
-        proof: &KosOtProofMsg,
+        pending: OtExtSenderPending,
+        proof: &OtExtProofMsg,
     ) -> Result<Vec<OtPadPair>, PreprocessError> {
         if self.poisoned {
             return Err(PreprocessError::ChannelPoisoned {
@@ -5084,28 +5129,24 @@ impl OtExtSenderChannel {
                 receiver_id: self.receiver_id,
             });
         }
-        let total_rows = pending.q_rows.len();
-        let chis = derive_interactive_kos_challenges(
-            &self.session_id,
-            self.sender_id,
-            self.receiver_id,
-            pending.batch_ctr,
-            &pending.u_cols_digest,
-            &pending.chi_seed,
-            total_rows,
-        );
-        let q_kos = kos_inner_product(&pending.q_rows, &chis);
-        let expected_q = proof.t_kos.add(proof.x_kos.mul(Tower128(self.delta)));
-        if !q_kos.ct_eq(expected_q) {
+        let mut diff = 0u128;
+        for col in 0..128 {
+            let mask = 0u128.wrapping_sub(black_box((self.delta >> col) & 1));
+            for lane in 0..2 {
+                diff |= pending.q_hash[col][lane]
+                    ^ proof.t_hash[col][lane]
+                    ^ (mask & proof.x_hash[lane]);
+            }
+        }
+        if black_box(diff) != 0 {
             self.poison_and_wipe();
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id: self.sender_id,
                 receiver_id: self.receiver_id,
             });
         }
 
-        let bind = compute_kos_transcript_bind(&pending.u_cols_digest, &pending.chi_seed, proof);
-        let payload_rows = 64 * pending.payload_words;
+        let bind = compute_ot_ext_transcript_bind(&pending.u_cols_digest, &pending.chi_seed, proof);
         let pad_pairs = crh_ot_sender_pad_pairs_batch(
             &self.session_id,
             &bind,
@@ -5113,7 +5154,7 @@ impl OtExtSenderChannel {
             self.receiver_id,
             pending.batch_ctr,
             self.delta,
-            &pending.q_rows[..payload_rows],
+            &pending.q_rows,
         );
         Ok(pad_pairs)
     }
@@ -5304,8 +5345,8 @@ impl OtMesh {
         Self::try_establish(session_id, party_rngs)
     }
 
-    /// Execute an interactive 3-message KOS correlated OT batch from `sender_id` to `receiver_id`
-    /// on `choice_words`, drawing `chi_seed` from `party_rngs[sender_id]` *after* `u_cols` is locked.
+    /// Execute one 3-message correlated OT extension batch from `sender_id` to `receiver_id`
+    /// on `choice_words`, drawing the hash key from `party_rngs[sender_id]` after `u_cols`.
     pub fn run_correlated_ot_words(
         &mut self,
         sender_id: usize,
@@ -5318,14 +5359,14 @@ impl OtMesh {
             || receiver_id >= self.n
             || party_rngs.len() != self.n
         {
-            return Err(PreprocessError::KosOtCheckFailed {
+            return Err(PreprocessError::OtExtCheckFailed {
                 sender_id,
                 receiver_id,
             });
         }
         // Large local preprocessing jobs are split into independently challenged frames.
         // The peer-facing receiver keeps a strict budget even when a vault needs more OTs.
-        const WORDS_PER_FRAME: usize = MAX_FRAME_BUDGET / (128 * 8) - 4;
+        const WORDS_PER_FRAME: usize = MAX_FRAME_BUDGET / (128 * 8) - OT_EXT_SACRIFICIAL_WORDS;
         if choice_words.len() > WORDS_PER_FRAME {
             let (mut send, mut recv) = (OtSendPads(Vec::new()), OtRecvPads(Vec::new()));
             for choices in choice_words.chunks(WORDS_PER_FRAME) {
@@ -5355,8 +5396,11 @@ impl OtMesh {
         let (s_pending, chal_msg) = s_chan.round2_sample_challenge(&u_msg, sender_rng)?;
         let (proof_msg, recv_pads) = r_chan.round3_prove_and_finish(r_pending, &chal_msg);
         let recv_pads = OtRecvPads(recv_pads);
-        let bind =
-            compute_kos_transcript_bind(&s_pending.u_cols_digest, &s_pending.chi_seed, &proof_msg);
+        let bind = compute_ot_ext_transcript_bind(
+            &s_pending.u_cols_digest,
+            &s_pending.chi_seed,
+            &proof_msg,
+        );
         let send_pads = OtSendPads(s_chan.round4_verify_and_finish(s_pending, &proof_msg)?);
         self.absorb_batch(sender_id, receiver_id, &bind);
         Ok((send_pads, recv_pads))
@@ -6185,7 +6229,7 @@ impl PreprocessedKeccakPartyVault {
     }
 }
 
-/// Multiply XOR-shared Boolean words using the production KOS/MASCOT pool.
+/// Multiply XOR-shared Boolean words using the production OT-extension/MASCOT pool.
 /// All masked openings carry two-lane GF(2^128) MACs; the pool performs batch
 /// companion sacrifice before any triple is used. Full-field n-of-n Shamir
 /// shares are converted back by the linear bit-zero projection only at the end.
@@ -11027,7 +11071,7 @@ mod legacy_sparse_pcg {
     }
 
     /// Experimental sparse correlation format, not suitable for online masks.
-    /// Production vault APIs use uniform KOS/MASCOT preprocessing.
+    /// Production vault APIs use uniform OT-extension/MASCOT preprocessing.
     /// Compact `< 24 KB` sublinear Silent-OT / `SHAKE256` GGM + QC-LPN Pseudorandom Correlation
     /// Generator (`PCG`) seed held by one party.
     ///
@@ -12983,7 +13027,7 @@ mod legacy_sparse_pcg {
 #[cfg(test)]
 use legacy_sparse_pcg::*;
 
-/// Compatibility entry point using uniform KOS/MASCOT preprocessing.
+/// Compatibility entry point using uniform OT-extension/MASCOT preprocessing.
 /// Compact sparse PCG correlations are not suitable as online Beaver masks.
 pub fn run_dealerless_pcg_keccak_vaults(
     session_id: [u8; 32],
@@ -13252,7 +13296,7 @@ pub fn expand_and_materialize_silent_pcg_keccak_vaults<
 /// End-to-end silent `pcg_dense` preprocessing entrypoint: establishes compact expand-accumulate
 /// dual-LPN [`crate::pcg_dense::DensePcgPartySeed`]s at `tree_depth`, burns and expands them locally
 /// via `burn_tracker`, and materializes `num_triples_words` authenticated Shamir-SPDZ
-/// [`PreprocessedKeccakPartyVault`]s without interactive KOS/MASCOT triple loops.
+/// [`PreprocessedKeccakPartyVault`]s without interactive OT-extension/MASCOT triple loops.
 #[expect(
     clippy::too_many_arguments,
     reason = "Session, threshold parameters, tree depth, burn tracker, OT mesh and RNGs are distinct ceremony inputs"
@@ -13484,16 +13528,46 @@ mod tests {
     }
 
     #[test]
-    fn kos_batched_inner_product_matches_scalar_including_tails() {
-        let mut rng = PartyPrivateRng::from_seed([0x73; 32], b"kos-dot");
-        let rows: Vec<_> = (0..257).map(|_| rng.next_u128()).collect();
-        let weights: Vec<_> = (0..257).map(|_| rng.next_tower128()).collect();
-        for n in [0, 1, 2, 63, 64, 127, 128, 129, 256, 257] {
-            let expected = rows[..n]
-                .iter()
-                .zip(&weights[..n])
-                .fold(Tower128::ZERO, |sum, (&x, &y)| sum.add(Tower128(x).mul(y)));
-            assert_eq!(kos_inner_product(&rows[..n], &weights[..n]), expected);
+    fn ot_ext_check_hash_matches_scalar_polynomial_and_is_linear() {
+        let mut rng = PartyPrivateRng::from_seed([0x73; 32], b"ot-ext-hash");
+        let seed = rng.next_bytes32();
+        let points: [Tower128; 2] = core::array::from_fn(|lane| {
+            Tower128(u128::from_le_bytes(core::array::from_fn(|i| {
+                seed[16 * lane + i]
+            })))
+        });
+        for payload in [0usize, 1, 2, 3, 127, 128, 129, 300] {
+            let key = OtExtCheckKey::new(&seed, payload);
+            let col: Vec<u64> = (0..payload + 4).map(|_| rng.next_u64()).collect();
+            let other: Vec<u64> = (0..payload + 4).map(|_| rng.next_u64()).collect();
+            let word = |w: usize| if w < payload { col[w] } else { 0 };
+            let expected: [u128; 2] = core::array::from_fn(|lane| {
+                let mut acc = Tower128(
+                    u128::from(col[payload + 2 * lane])
+                        | (u128::from(col[payload + 2 * lane + 1]) << 64),
+                );
+                let mut power = points[lane];
+                for k in 0..payload.div_ceil(2) {
+                    let block = u128::from(word(2 * k)) | (u128::from(word(2 * k + 1)) << 64);
+                    acc = acc.add(Tower128(block).mul(power));
+                    power = power.mul(points[lane]);
+                }
+                acc.0
+            });
+            assert_eq!(key.hash(&col), expected, "payload {payload}");
+            let sum: Vec<u64> = col.iter().zip(&other).map(|(a, b)| a ^ b).collect();
+            let (h, g, hg) = (key.hash(&col), key.hash(&other), key.hash(&sum));
+            assert_eq!(hg, [h[0] ^ g[0], h[1] ^ g[1]]);
+            // The sacrificial words enter through the identity: whatever the key.
+            let mut tail_only = vec![0u64; payload + 4];
+            tail_only[payload..].copy_from_slice(&col[payload..]);
+            assert_eq!(
+                key.hash(&tail_only),
+                [
+                    u128::from(col[payload]) | (u128::from(col[payload + 1]) << 64),
+                    u128::from(col[payload + 2]) | (u128::from(col[payload + 3]) << 64),
+                ]
+            );
         }
     }
 
@@ -13528,7 +13602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rlwe_crs_orsigma_fo_and_kos_regressions() {
+    fn test_rlwe_crs_orsigma_fo_and_ot_ext_regressions() {
         // Worst-case ternary noise at `RLWE_N = 1024`: `|e| <= 1024 + 1024 + 1 = 2049 < 3072 = floor(q/4)`
         for &mag in &[0u16, 1, 512, 1025, 2049, 3071] {
             let f_pos = mag % RLWE_Q;
@@ -13593,7 +13667,7 @@ mod tests {
         );
         let (_, crs_s0_ok_sh) = BaseOtCrsSenderRound0::respond(sid, 0, 1, &crs_com, &mut rng_s);
         let _ = crs_s0_ok_sh;
-        // Exercise KOS with ideal base OTs; the full bootstrap has a separate soak.
+        // Exercise the extension with ideal base OTs; the full bootstrap has a separate soak.
         let (mut s_chan, mut r_chan) =
             establish_ideal_ot_ext_channel_for_test(sid, 0, 1, &mut rng_s, &mut rng_r);
         let _ = (r_crs_coin, good_crs_open);
@@ -13609,12 +13683,285 @@ mod tests {
         }
     }
 
+    /// Ideal base OTs for a chosen `delta`, so a test can state which guesses are right.
+    fn ot_ext_channel_with_delta(
+        delta: u128,
+        tag: u8,
+    ) -> (OtExtSenderChannel, OtExtReceiverChannel) {
+        let mut rng = PartyPrivateRng::from_seed([tag; 32], b"ot-ext-delta");
+        let pairs: [([u8; 32], [u8; 32]); 128] =
+            core::array::from_fn(|_| (rng.next_bytes32(), rng.next_bytes32()));
+        let selected = core::array::from_fn(|i| {
+            if (delta >> i) & 1 == 0 {
+                pairs[i].0
+            } else {
+                pairs[i].1
+            }
+        });
+        (
+            OtExtSenderChannel {
+                session_id: [tag; 32],
+                sender_id: 0,
+                receiver_id: 1,
+                delta,
+                combined_seeds: selected,
+                batch_ctr: 0,
+                poisoned: false,
+            },
+            OtExtReceiverChannel {
+                session_id: [tag; 32],
+                sender_id: 0,
+                receiver_id: 1,
+                combined_seed_pairs: pairs,
+                batch_ctr: 0,
+            },
+        )
+    }
+
+    /// One batch against an honest sender holding `delta`, with a receiver that alters its
+    /// columns before the key is known and its proof after. Returns the sender's verdict.
+    fn ot_ext_run_with_cheating_receiver(
+        delta: u128,
+        choices: &[u64],
+        tamper_cols: impl FnOnce(&mut OtExtUColsMsg),
+        tamper_proof: impl FnOnce(&OtExtCheckKey, &mut OtExtProofMsg),
+    ) -> Result<(), PreprocessError> {
+        let mut rng_s = PartyPrivateRng::from_seed([0x61; 32], b"ot-ext-s");
+        let mut rng_r = PartyPrivateRng::from_seed([0x62; 32], b"ot-ext-r");
+        let (mut s_chan, mut r_chan) = ot_ext_channel_with_delta(delta, 0x5a);
+        let (pend_r, mut u_msg) = r_chan.round1_send_u_cols(choices, &mut rng_r);
+        tamper_cols(&mut u_msg);
+        let (pend_s, chal) = s_chan.round2_sample_challenge(&u_msg, &mut rng_s)?;
+        let (mut proof, _) = r_chan.round3_prove_and_finish(pend_r, &chal);
+        tamper_proof(
+            &OtExtCheckKey::new(&chal.chi_seed, choices.len()),
+            &mut proof,
+        );
+        let verdict = s_chan.round4_verify_and_finish(pend_s, &proof).map(|_| ());
+        assert_eq!(s_chan.poisoned, verdict.is_err());
+        verdict
+    }
+
+    const OT_EXT_REJECT: Result<(), PreprocessError> = Err(PreprocessError::OtExtCheckFailed {
+        sender_id: 0,
+        receiver_id: 1,
+    });
+    const OT_EXT_TEST_DELTA: u128 = 0x9d3c_55aa_0f0f_1234_8001_fedc_ba98_7655;
+
+    fn xor_lanes(dst: &mut [u128; 2], src: [u128; 2]) {
+        dst[0] ^= src[0];
+        dst[1] ^= src[1];
+    }
+
     #[test]
-    fn test_interactive_kos_ot_extension_kills_roy22_and_poisons_channel() {
-        let mut rng_s = PartyPrivateRng::from_seed([0x31; 32], b"kos-s");
-        let mut rng_r = PartyPrivateRng::from_seed([0x32; 32], b"kos-r");
+    fn ot_ext_honest_batches_give_correct_ots_at_every_size() {
+        let mut rng_s = PartyPrivateRng::from_seed([0x31; 32], b"ot-ext-s");
+        let mut rng_r = PartyPrivateRng::from_seed([0x32; 32], b"ot-ext-r");
         let (mut s_chan, mut r_chan) =
             establish_ideal_ot_ext_channel_for_test([0x55; 32], 0, 1, &mut rng_s, &mut rng_r);
+        let mut seen_keys = Vec::new();
+        // 61 and 200 words take the threaded column expansion; 33 words the threaded hashing.
+        for words in [0usize, 1, 2, 3, 33, 61, 200] {
+            let choices: Vec<u64> = (0..words).map(|_| rng_r.next_u64()).collect();
+            let (pend_r, u_msg) = r_chan.round1_send_u_cols(&choices, &mut rng_r);
+            assert_eq!(u_msg.u_cols[0].len(), words + 4);
+            let (pend_s, chal) = s_chan.round2_sample_challenge(&u_msg, &mut rng_s).unwrap();
+            let (proof, recv_pads) = r_chan.round3_prove_and_finish(pend_r, &chal);
+            let decoded = OtExtProofMsg::from_bytes(&proof.to_bytes()).unwrap();
+            assert_eq!(decoded, proof);
+            let send_pads = s_chan.round4_verify_and_finish(pend_s, &decoded).unwrap();
+            assert_eq!((recv_pads.len(), send_pads.len()), (64 * words, 64 * words));
+            for (k, (recv, send)) in recv_pads.iter().zip(&send_pads).enumerate() {
+                let bit = (choices[k / 64] >> (k % 64)) & 1 == 1;
+                assert_eq!(
+                    *recv,
+                    if bit { send.1 } else { send.0 },
+                    "words {words} ot {k}"
+                );
+                assert_ne!(send.0, send.1);
+            }
+            // The key is fresh per batch.
+            assert!(!seen_keys.contains(&chal.chi_seed));
+            seen_keys.push(chal.chi_seed);
+        }
+    }
+
+    #[test]
+    fn ot_ext_proof_encoding_is_strict() {
+        let proof = OtExtProofMsg {
+            x_hash: [3, 4],
+            t_hash: Box::new(core::array::from_fn(|c| {
+                [c as u128 + 7, (c as u128) << 100]
+            })),
+        };
+        let bytes = proof.to_bytes();
+        assert_eq!(bytes.len(), OT_EXT_PROOF_BYTES);
+        assert_eq!(OtExtProofMsg::from_bytes(&bytes).unwrap(), proof);
+        assert!(OtExtProofMsg::from_bytes(&bytes[1..]).is_none());
+        assert!(OtExtProofMsg::from_bytes(&[bytes.as_slice(), &[0]].concat()).is_none());
+        // The 32-byte proof of the deleted check does not decode.
+        assert!(OtExtProofMsg::from_bytes(&bytes[..32]).is_none());
+    }
+
+    /// A receiver that uses another choice bit in one column of one row must know that column's
+    /// bit of `delta`: with the honest proof it passes exactly when the bit is 0, with the proof
+    /// adjusted for the other guess exactly when it is 1.
+    #[test]
+    fn ot_ext_one_inconsistent_column_passes_exactly_on_the_right_delta_guess() {
+        let choices = [0xDEAD_BEEF_CAFE_BABEu64, 0x0123_4567_89AB_CDEFu64];
+        let mut outcomes = [0usize; 2];
+        for col in 0..128 {
+            let delta_bit = (OT_EXT_TEST_DELTA >> col) & 1 == 1;
+            let row = (37 * col + 5) % 128;
+            let mut error = vec![0u64; choices.len() + 4];
+            error[row / 64] = 1 << (row % 64);
+            let flip = |u: &mut OtExtUColsMsg| u.u_cols[col][row / 64] ^= 1 << (row % 64);
+
+            let guess_zero =
+                ot_ext_run_with_cheating_receiver(OT_EXT_TEST_DELTA, &choices, flip, |_, _| {});
+            assert_eq!(guess_zero.is_ok(), !delta_bit, "column {col}");
+            let guess_one = ot_ext_run_with_cheating_receiver(
+                OT_EXT_TEST_DELTA,
+                &choices,
+                flip,
+                |key, proof| xor_lanes(&mut proof.t_hash[col], key.hash(&error)),
+            );
+            assert_eq!(guess_one.is_ok(), delta_bit, "column {col}");
+            assert_eq!(
+                if delta_bit { guess_zero } else { guess_one },
+                OT_EXT_REJECT
+            );
+            outcomes[usize::from(delta_bit)] += 1;
+        }
+        // Both values of a `delta` bit occurred, so both branches above ran.
+        assert!(outcomes[0] > 0 && outcomes[1] > 0);
+    }
+
+    /// Inconsistent choice bits in many rows of eight columns, including a sacrificial row. Of
+    /// the 256 proofs a receiver can prepare, one per guess of those eight bits of `delta`, the
+    /// sender accepts exactly the one that guessed right: probability `2^-8`, as Roy Theorem 4.5
+    /// states (the number of nonzero columns of the error is the number of bits to guess).
+    #[test]
+    fn ot_ext_many_rows_in_eight_columns_pass_for_exactly_one_guess_in_256() {
+        const COLS: [usize; 8] = [3, 17, 40, 64, 65, 90, 101, 127];
+        let mut rng = PartyPrivateRng::from_seed([0x44; 32], b"ot-ext-many");
+        let choices: Vec<u64> = (0..5).map(|_| rng.next_u64()).collect();
+        let error: Vec<u64> = (0..choices.len() + 4).map(|_| rng.next_u64()).collect();
+        let mut accepted = Vec::new();
+        for guess in 0..256usize {
+            let verdict = ot_ext_run_with_cheating_receiver(
+                OT_EXT_TEST_DELTA,
+                &choices,
+                |u| {
+                    for col in COLS {
+                        for (w, e) in u.u_cols[col].iter_mut().zip(&error) {
+                            *w ^= e;
+                        }
+                    }
+                },
+                |key, proof| {
+                    for (i, col) in COLS.into_iter().enumerate() {
+                        if (guess >> i) & 1 == 1 {
+                            xor_lanes(&mut proof.t_hash[col], key.hash(&error));
+                        }
+                    }
+                },
+            );
+            match verdict {
+                Ok(()) => accepted.push(guess),
+                other => assert_eq!(other, OT_EXT_REJECT),
+            }
+        }
+        let right = COLS.into_iter().enumerate().fold(0, |acc, (i, col)| {
+            acc | (((OT_EXT_TEST_DELTA >> col) & 1) as usize) << i
+        });
+        assert_eq!(accepted, [right]);
+    }
+
+    /// Roy's collision deviation (Section 4.1.3 and Appendix D.1): uniformly random columns, an
+    /// honest row hash, and the choice hash set to the value that column 0 implies. Against the
+    /// deleted check this made the test independent of `delta_0` and of every column whose
+    /// 128-bit compressed value collided with column 0. Here nothing is compressed across
+    /// columns, so it frees column 0 and nothing else: it passes when `delta` has no other bit,
+    /// and fails as soon as one other bit is set.
+    #[test]
+    fn ot_ext_roy_collision_deviation_frees_one_column_only() {
+        let mut rng = PartyPrivateRng::from_seed([0x45; 32], b"ot-ext-roy");
+        let choices: Vec<u64> = (0..3).map(|_| rng.next_u64()).collect();
+        let errors: Vec<Vec<u64>> = (0..128)
+            .map(|_| (0..choices.len() + 4).map(|_| rng.next_u64()).collect())
+            .collect();
+        let run = |delta: u128| {
+            ot_ext_run_with_cheating_receiver(
+                delta,
+                &choices,
+                |u| {
+                    for (col, error) in u.u_cols.iter_mut().zip(&errors) {
+                        for (w, e) in col.iter_mut().zip(error) {
+                            *w ^= e;
+                        }
+                    }
+                },
+                |key, proof| xor_lanes(&mut proof.x_hash, key.hash(&errors[0])),
+            )
+        };
+        assert_eq!(run(0), Ok(()));
+        assert_eq!(run(1), Ok(()));
+        for other in 1..128 {
+            assert_eq!(run(1 | (1 << other)), OT_EXT_REJECT, "column {other}");
+            assert_eq!(run(1 << other), OT_EXT_REJECT, "column {other}");
+        }
+        assert_eq!(run(OT_EXT_TEST_DELTA), OT_EXT_REJECT);
+    }
+
+    #[test]
+    fn ot_ext_wrong_proof_message_is_rejected() {
+        let choices = [0x0F0F_F0F0_1234_5678u64];
+        let honest = |tamper: &dyn Fn(&OtExtCheckKey, &mut OtExtProofMsg)| {
+            ot_ext_run_with_cheating_receiver(OT_EXT_TEST_DELTA, &choices, |_| {}, tamper)
+        };
+        assert_eq!(honest(&|_, _| {}), Ok(()));
+        for lane in 0..2 {
+            for bit in [0, 1, 63, 64, 127] {
+                assert_eq!(
+                    honest(&|_, proof| proof.x_hash[lane] ^= 1 << bit),
+                    OT_EXT_REJECT
+                );
+                for col in [0, 1, 64, 127] {
+                    assert_eq!(
+                        honest(&|_, proof| proof.t_hash[col][lane] ^= 1 << bit),
+                        OT_EXT_REJECT
+                    );
+                }
+            }
+        }
+        // A proof for another key (the receiver answered a different challenge).
+        assert_eq!(
+            honest(&|key, proof| {
+                let other = OtExtCheckKey::new(&[0x77; 32], key.payload_words);
+                for col in 0..128 {
+                    let mut probe = vec![0u64; key.payload_words + 4];
+                    probe[0] = 1;
+                    xor_lanes(&mut proof.t_hash[col], key.hash(&probe));
+                    xor_lanes(&mut proof.t_hash[col], other.hash(&probe));
+                }
+            }),
+            OT_EXT_REJECT
+        );
+        // Swapping two columns' hashes.
+        assert_eq!(honest(&|_, proof| proof.t_hash.swap(5, 6)), OT_EXT_REJECT);
+    }
+
+    /// Regression for the grinding and column-probe attacks on the first, non-interactive
+    /// version of this extension: the columns are fixed before the sender samples its key, and
+    /// the first failed check ends the channel, so a receiver gets one attempt per channel
+    /// rather than one probe per batch.
+    #[test]
+    fn test_interactive_ot_extension_rejects_inconsistent_columns_and_poisons_channel() {
+        let mut rng_s = PartyPrivateRng::from_seed([0x31; 32], b"ot-ext-s");
+        let mut rng_r = PartyPrivateRng::from_seed([0x32; 32], b"ot-ext-r");
+        let (mut s_chan, mut r_chan) = ot_ext_channel_with_delta(OT_EXT_TEST_DELTA, 0x55);
+        assert_eq!(OT_EXT_TEST_DELTA >> 127, 1);
         let choices = [0xDEAD_BEEF_CAFE_BABEu64, 0x0123_4567_89AB_CDEFu64];
 
         let (pend_r, u_msg) = r_chan.round1_send_u_cols(&choices, &mut rng_r);
@@ -13633,21 +13980,25 @@ mod tests {
             }
         }
 
-        // Corrupt 1 bit in column 127 (full 128-column KOS!) BEFORE seeing `chi_seed` -> rejects & poisons!
+        // One flipped bit in column 127, sent before the key exists: rejected, channel poisoned.
         let (pend_r_bad, mut u_msg_bad) = r_chan.round1_send_u_cols(&choices, &mut rng_r);
         u_msg_bad.u_cols[127][0] ^= 1;
         let (pend_s_bad, chal_bad) = s_chan
             .round2_sample_challenge(&u_msg_bad, &mut rng_s)
             .unwrap();
+        assert_ne!(chal_bad.chi_seed, chal_msg.chi_seed);
         let (proof_bad, _) = r_chan.round3_prove_and_finish(pend_r_bad, &chal_bad);
         assert_eq!(
             s_chan.round4_verify_and_finish(pend_s_bad, &proof_bad),
-            Err(PreprocessError::KosOtCheckFailed {
+            Err(PreprocessError::OtExtCheckFailed {
                 sender_id: 0,
                 receiver_id: 1
             })
         );
+        assert_eq!(s_chan.delta, 0);
+        assert!(s_chan.combined_seeds.iter().all(|seed| *seed == [0; 32]));
 
+        // No second probe: an honest batch on the same channel is refused.
         let (_, u_msg_after) = r_chan.round1_send_u_cols(&choices, &mut rng_r);
         assert!(matches!(
             s_chan.round2_sample_challenge(&u_msg_after, &mut rng_s),
@@ -13656,6 +14007,34 @@ mod tests {
                 receiver_id: 1
             })
         ));
+    }
+
+    /// Pads are a correlation-robust hash with a tweak; Roy Theorem 5.1 with `t_max = 1` needs
+    /// the tweak of every extended OT under one `delta` to be distinct. Rows that are equal
+    /// across OT indices, batches and channels must therefore give unrelated pads.
+    #[test]
+    fn ot_ext_pad_tweak_separates_index_batch_and_channel() {
+        let rows = [0x1234_5678_9abc_def0_0fed_cba9_8765_4321u128; 4];
+        let bind = [7u8; 32];
+        let base = crh_ot_receiver_pads_batch(&[1; 32], &bind, 0, 1, 0, &rows);
+        let mut all: Vec<[u8; 48]> = base.clone();
+        all.extend(crh_ot_receiver_pads_batch(&[1; 32], &bind, 0, 1, 1, &rows));
+        all.extend(crh_ot_receiver_pads_batch(&[2; 32], &bind, 0, 1, 0, &rows));
+        all.extend(crh_ot_receiver_pads_batch(
+            &[1; 32], &[8; 32], 0, 1, 0, &rows,
+        ));
+        all.extend(crh_ot_receiver_pads_batch(&[1; 32], &bind, 1, 0, 0, &rows));
+        for i in 0..all.len() {
+            for j in 0..i {
+                assert_ne!(all[i], all[j], "pads {i} and {j}");
+            }
+        }
+        // The sender's pair for the same row and tweak agrees with the receiver's pad.
+        let pairs = crh_ot_sender_pad_pairs_batch(&[1; 32], &bind, 0, 1, 0, 5, &rows);
+        for (k, pair) in pairs.iter().enumerate() {
+            assert_eq!(pair.0, base[k]);
+            assert_ne!(pair.1, base[k]);
+        }
     }
 
     #[test]
@@ -14669,7 +15048,7 @@ mod hardening_regressions {
 
     use super::*;
     #[test]
-    fn kos_transpose_orientation_and_tail() {
+    fn ot_ext_transpose_orientation_and_tail() {
         let cols: Vec<Vec<u64>> = (0..128).map(|i| vec![1u64 << (i % 64), !0u64]).collect();
         let rows = transpose_cols128_to_rows(&cols, 2);
         for b in 0..64 {

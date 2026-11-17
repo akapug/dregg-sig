@@ -5,7 +5,7 @@
 //! raw triples at adaptive arity, then converts the result to degree-`< t` Shamir form:
 //!
 //! 1. **Authenticated bits.** For each ordered pair (key holder `i`, bit owner `p`) one
-//!    KOS-checked correlated OT extension is run whose fixed correlation is the holder's share
+//!    consistency-checked correlated OT extension is run whose fixed correlation is the holder's share
 //!    `alpha_i` of both MAC-key lanes. Row `k` gives `t_k ^ q_k = x_k * alpha_i`: one unhashed
 //!    row per authenticated bit. The correlation is bound to the holder by its base-OT choice
 //!    bits, so a holder cannot make a MAC depend on the owner's bit; an owner whose columns are
@@ -61,11 +61,10 @@ type ChoiceTamper<'a> = dyn FnMut(usize, usize, &mut u128) + 'a;
 type OpeningTamper<'a> = dyn FnMut(usize, &mut [u128]) + 'a;
 
 const ABIT_COL_MID: [u64; 25] = cshake256_static_midstate(b"QSAG.ABIT.COL/v1");
-const ABIT_CHI_MID: [u64; 25] = cshake256_static_midstate(b"QSAG.ABIT.CHI/v1");
 const SACRIFICE_CHI_MID: [u64; 25] = cshake256_static_midstate(b"QSAG.TRIPLE.F2.CHI/v1");
 
 /// Extra random rows per extension that mask the owner's consistency-check response.
-const SACRIFICIAL_ROWS: usize = 256;
+const SACRIFICIAL_ROWS: usize = OT_EXT_SACRIFICIAL_OTS;
 /// Below this vector length fold cross terms use fresh chosen-choice products.
 const GENERIC_FOLD_LEN: usize = 64;
 /// Rate blocks squeezed per hashed row; bounds the number of structured fold rounds.
@@ -306,7 +305,6 @@ fn extend_pair(
     rows: usize,
 ) -> Result<PairRows, PreprocessError> {
     let words = rho.len();
-    let total_rows = 64 * words;
     let holder_le = (job.holder as u64).to_le_bytes();
     let owner_le = (job.owner as u64).to_le_bytes();
 
@@ -397,48 +395,38 @@ fn extend_pair(
         q_cols.push(q_a);
         q_cols.push(q_b);
     }
-    let mut t_lanes: [Vec<u128>; 2] =
-        core::array::from_fn(|l| transpose_cols128_to_rows(&t_cols[128 * l..128 * (l + 1)], words));
-    let mut q_lanes: [Vec<u128>; 2] =
-        core::array::from_fn(|l| transpose_cols128_to_rows(&q_cols[128 * l..128 * (l + 1)], words));
+    // Consistency check (Roy Fig. 9 over the length-256 repetition code; see the parent module
+    // doc). The key is the holder's fresh randomness, used only after the owner's `u` columns
+    // are fixed; the 256 sacrificial rows are the identity block of the hash and are dropped.
+    let key = OtExtCheckKey::new(&job.chi_seed, words - SACRIFICIAL_ROWS / 64);
+    let mut x_hash = key.hash(rho);
+    let mut diff = 0u128;
+    for col in 0..256 {
+        let mut t_hash = key.hash(&t_cols[col]);
+        let mut q_hash = key.hash(&q_cols[col]);
+        let mask = bit_mask(((delta[col / 128] >> (col % 128)) & 1) as u64);
+        for lane in 0..2 {
+            diff |= q_hash[lane] ^ t_hash[lane] ^ (mask & x_hash[lane]);
+        }
+        wipe_u128s(&mut t_hash);
+        wipe_u128s(&mut q_hash);
+    }
+    wipe_u128s(&mut x_hash);
+    let consistent = black_box(diff) == 0;
+    let payload_words = rows / 64;
+    let mut t_lanes: [Vec<u128>; 2] = core::array::from_fn(|l| {
+        transpose_cols128_to_rows(&t_cols[128 * l..128 * (l + 1)], payload_words)
+    });
+    let mut q_lanes: [Vec<u128>; 2] = core::array::from_fn(|l| {
+        transpose_cols128_to_rows(&q_cols[128 * l..128 * (l + 1)], payload_words)
+    });
     drop((t_cols, q_cols, t1_a, t1_b));
-
-    // KOS consistency check. The challenge is the holder's fresh randomness, sent only after
-    // the owner's `u` columns; the sacrificial rows keep `x_bar` and `t_bar` uniform.
-    let mut chi_words = vec![0u64; 2 * total_rows];
-    stream_words(
-        &ABIT_CHI_MID,
-        &[session_id, &holder_le, &owner_le, &job.chi_seed],
-        &mut chi_words,
-    );
-    let chi: Vec<u128> = chi_words
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|w| gf_join([w[0], w[1]]))
-        .collect();
-    let mut x_bar = 0u128;
-    for (k, weight) in chi.iter().enumerate() {
-        x_bar ^= *weight & bit_mask(word_bit(rho, k));
-    }
-    let mut consistent = true;
-    for lane in 0..2 {
-        let t_bar = gf_dot(&t_lanes[lane], &chi);
-        let q_bar = gf_dot(&q_lanes[lane], &chi);
-        consistent &= black_box(q_bar ^ t_bar ^ gf_mul(x_bar, delta[lane])) == 0;
-    }
-    for lane in 0..2 {
-        wipe_u128s(&mut t_lanes[lane][rows..]);
-        wipe_u128s(&mut q_lanes[lane][rows..]);
-        t_lanes[lane].truncate(rows);
-        q_lanes[lane].truncate(rows);
-    }
     if !consistent {
         for lane in 0..2 {
             wipe_u128s(&mut t_lanes[lane]);
             wipe_u128s(&mut q_lanes[lane]);
         }
-        return Err(PreprocessError::KosOtCheckFailed {
+        return Err(PreprocessError::OtExtCheckFailed {
             sender_id: job.holder,
             receiver_id: job.owner,
         });
@@ -494,7 +482,7 @@ impl DeltaCotPool {
             owner: usize,
             choice: [u64; 4],
             sac_words: [u64; 4],
-            kos_chi_seed: [u8; 32],
+            ext_chi_seed: [u8; 32],
             chi_seed: [u8; 32],
             s_chan: Option<crate::preprocessing::OtExtSenderChannel>,
             r_chan: Option<crate::preprocessing::OtExtReceiverChannel>,
@@ -538,14 +526,14 @@ impl DeltaCotPool {
                     party_rngs[holder].next_u64(),
                     party_rngs[holder].next_u64(),
                 ];
-                let kos_chi_seed = party_rngs[owner].next_bytes32();
+                let ext_chi_seed = party_rngs[owner].next_bytes32();
                 let chi_seed = party_rngs[holder].next_bytes32();
                 boot_jobs.push(PairBootstrapJob {
                     holder,
                     owner,
                     choice,
                     sac_words,
-                    kos_chi_seed,
+                    ext_chi_seed,
                     chi_seed,
                     s_chan: Some(s_chan),
                     r_chan: Some(r_chan),
@@ -563,9 +551,9 @@ impl DeltaCotPool {
                 let (r_pend, u_msg) =
                     r_chan.round1_send_u_cols_with_sac(&bjob.choice, bjob.sac_words);
                 let (s_pend, chal_msg) =
-                    s_chan.round2_sample_challenge_with_chi(&u_msg, bjob.kos_chi_seed)?;
+                    s_chan.round2_sample_challenge_with_chi(&u_msg, bjob.ext_chi_seed)?;
                 let (proof_msg, recv) = r_chan.round3_prove_and_finish(r_pend, &chal_msg);
-                *bind = compute_kos_transcript_bind(
+                *bind = compute_ot_ext_transcript_bind(
                     &s_pend.u_cols_digest,
                     &s_pend.chi_seed,
                     &proof_msg,
@@ -585,7 +573,7 @@ impl DeltaCotPool {
             let res = run();
             crate::wipe::wipe_u64s(&mut bjob.choice);
             crate::wipe::wipe_u64s(&mut bjob.sac_words);
-            crate::wipe::wipe_bytes32(&mut bjob.kos_chi_seed);
+            crate::wipe::wipe_bytes32(&mut bjob.ext_chi_seed);
             bjob.outcome = Some(res);
         });
 
@@ -620,7 +608,7 @@ impl DeltaCotPool {
     }
 
     /// Local expansion of a bootstrapped pool: the per-pair column PRG, the transpose to rows
-    /// and the KOS consistency check. Needs neither the OT mesh nor any party's RNG.
+    /// and the consistency check. Needs neither the OT mesh nor any party's RNG.
     pub(super) fn extend(session_id: &[u8; 32], boot: PoolBoot) -> Result<Self, PreprocessError> {
         let PoolBoot {
             n,
@@ -701,7 +689,7 @@ impl DeltaCotPool {
 
     /// Populate a two-lane correlated-OT pool directly from two locally expanded silent
     /// [`crate::pcg_dense::DensePcgExpandedVault`] lanes per party without running interactive
-    /// `KosOtExtension`. The first `b_words_prefix[p].len() * 64` bits of `rho[p]` are pinned
+    /// the interactive OT extension. The first `b_words_prefix[p].len() * 64` bits of `rho[p]` are pinned
     /// to `b_words_prefix[p]` via 1-bit Beaver derandomization against each peer's silent
     /// Subfield-VOLE choice bits.
     pub(super) fn from_silent_pcg_vaults(
@@ -2407,7 +2395,7 @@ fn pair_pads(n: usize, nbits: usize, plan: &FoldPlan) -> Vec<PairPads> {
     pads
 }
 
-/// One KOS-backed raw ceremony over a bootstrapped pool: `plan.nbits` authenticated raw bit
+/// One OT-extension-backed raw ceremony over a bootstrapped pool: `plan.nbits` authenticated raw bit
 /// triples and the pending private sacrifice opening, checked by the coordinator.
 fn raw_ceremony(
     session_id: [u8; 32],
@@ -2503,7 +2491,7 @@ fn raw_ceremony(
 }
 
 /// One raw ceremony whose triples and correlated-OT pool come from locally expanded
-/// [`crate::pcg_dense::DensePcgExpandedVault`]s instead of `KosOtExtension`.
+/// [`crate::pcg_dense::DensePcgExpandedVault`]s instead of the interactive OT extension.
 fn raw_silent_ceremony(
     session_id: [u8; 32],
     plan: &FoldPlan,
@@ -2737,7 +2725,7 @@ fn combine_input_words(out_words: usize, arity: usize) -> usize {
 /// Which raw factors a deviating party can aim a selective failure at.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Leak {
-    /// Only `b`. With KOS-backed raw triples every OT choice is a raw `b` row, a share of the
+    /// Only `b`. With OT-extension-backed raw triples every OT choice is a raw `b` row, a share of the
     /// folded `b` that [`bind_choice`] ties to those rows, or the mask `v` of the folded `b`;
     /// `a` and its mask are only ever payloads, and a receiver has no freedom in its choices.
     ChoiceSide,
@@ -3019,7 +3007,7 @@ fn pool_sizes(words: usize) -> Vec<usize> {
         .collect()
 }
 
-/// `out_words` final additive triples from one combine pool: as many equal KOS-backed raw
+/// `out_words` final additive triples from one combine pool: as many equal OT-extension-backed raw
 /// ceremonies as the combine needs, all under the MAC key `alpha_contribs`, then the combine.
 /// Every ceremony draws from its own substream of each party's RNG, forked in ceremony order,
 /// so the result does not depend on scheduling. No ceremony is larger than `ceremony_words`
@@ -3410,6 +3398,62 @@ fn silent_raw_words(num_triples: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// An owner that lies about one column of its pool extension (here: a wrong `t1` stream, so
+    /// a wrong `u` column) passes the consistency check exactly when the holder's key bit of
+    /// that column is 0, where the lie has no effect; otherwise the extension is refused.
+    #[test]
+    fn pool_extension_with_a_lying_owner_passes_exactly_when_the_key_bit_is_zero() {
+        let sid = [0x6b; 32];
+        let alpha = [
+            [Tower128(0b101), Tower128(1 << 127)],
+            [Tower128(0x1234_5678), Tower128(0x9abc_def0)],
+        ];
+        for (col, key_bit) in [
+            (None, false),
+            (Some(0), true),
+            (Some(1), false),
+            (Some(2), true),
+            (Some(128), false),
+            (Some(255), true),
+        ] {
+            let mut rngs: Vec<_> = (0..2)
+                .map(|i| PartyPrivateRng::from_seed([i + 0x21; 32], b"pool-lie"))
+                .collect();
+            let mut mesh = OtMesh::establish_ideal_for_test(sid, &mut rngs);
+            let mut boot = DeltaCotPool::bootstrap(&mut mesh, &alpha, 128, 64, &mut rngs).unwrap();
+            if let Some(col) = col {
+                let job = boot.jobs.iter_mut().find(|job| job.holder == 0).unwrap();
+                assert_eq!(job.owner, 1);
+                job.seeds1[col][0] ^= 1;
+            }
+            match DeltaCotPool::extend(&sid, boot) {
+                Ok(pool) => {
+                    assert!(!key_bit, "column {col:?}");
+                    // The rows of pair (holder 0, owner 1) still carry the owner's bits under
+                    // the holder's key.
+                    for lane in 0..2 {
+                        for k in 0..64 {
+                            let want = alpha[0][lane].0 & bit_mask(word_bit(&pool.rho[1], k));
+                            let got =
+                                pool.owner_rows[0][1][lane][k] ^ pool.holder_rows[0][1][lane][k];
+                            assert_eq!(got, want, "column {col:?} lane {lane} row {k}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    assert!(key_bit, "column {col:?}");
+                    assert_eq!(
+                        err,
+                        PreprocessError::OtExtCheckFailed {
+                            sender_id: 0,
+                            receiver_id: 1
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn crh_x8_is_one_shake256_per_row() {
         let prefix = crh_prefix(&[0x5a; 32], 2, 1, 7);
@@ -3419,7 +3463,10 @@ mod tests {
             [v, !v ^ (s as u128)]
         });
         let mut out: CrhOut = [[0u64; RATE_WORDS * MAX_CRH_BLOCKS]; CRH_WIDTH];
-        for backend in [dregg_sig_asm::SimdBackend::Portable, dregg_sig_asm::detect_backend()] {
+        for backend in [
+            dregg_sig_asm::SimdBackend::Portable,
+            dregg_sig_asm::detect_backend(),
+        ] {
             crh_x8(&prefix, index, &rows, MAX_CRH_BLOCKS, backend, &mut out);
             for s in 0..CRH_WIDTH {
                 let mut msg = Vec::new();
