@@ -259,6 +259,8 @@ uses statistical masking with 40 bits for range-limited openings. An elliptic-cu
 addition that can be a doubling selects chord or tangent on shares, so no abort depends
 on the key;
 its privacy argument is written in the module and is not machine-checked.
-Statements from a master seed, with a hidden derivation path or with a taproot script
-tree (their relations take inputs beyond the bits of one secret), and relations with
-lookups, are not supported by the threshold prover.
+Master seeds, hidden derivation paths and Taproot script trees are covered: the path
+and the script-tree root are known to the whole quorum and hidden from the verifier.
+Witness generation runs in as many rounds as the relation is deep (about 15,000 for a
+Bitcoin HASH160 statement), not as many as it is large. Relations with lookups into
+range tables are covered; lookups into other tables are refused.

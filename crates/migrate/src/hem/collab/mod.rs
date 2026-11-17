@@ -162,8 +162,8 @@
 //! ([`CustodyInput`]) and enters them as public constants of the engine, and a seed
 //! shorter than 64 bytes is padded with public zeros.
 //!
-//! Not covered: relations with lookups (a multiplicity is a count over the whole witness;
-//! `ConstraintSystem::finish_recorded` refuses them).
+//! Relations with lookups into range tables are covered: the multiplicities are
+//! computed on shares ([`witgen`], "Lookups"). Lookups into other tables are refused.
 //!
 //! # Preprocessing
 //!

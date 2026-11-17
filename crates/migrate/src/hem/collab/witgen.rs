@@ -54,6 +54,23 @@
 //!   masked inversion in Goldilocks, and the interpolating polynomial through
 //!   `(0, 0), (i, 1 / i)`.
 //!
+//! # Lookups
+//!
+//! A relation with lookups has one variable per table row, the number of lookups whose
+//! tuple is that row (`Def::Multiplicity`). For a range table `0..2^bits` of one column
+//! the quorum computes them on shares: the looked-up value is decomposed into `bits`
+//! bits (a statistically masked decomposition), the products of every subset of the
+//! bits are formed by halves (`2^bits - bits - 1` products in `log2 bits` rounds), the
+//! indicator of the value over the table rows is a signed sum of those, and a
+//! multiplicity is the sum of the indicators of all lookups. A byte lookup costs 302
+//! triples and 48 uniform values, and all lookups run in the rounds their values become
+//! known, about twelve rounds each. A value outside the table gives multiplicities
+//! that do not satisfy the relation, and no proof. Lookups into any other table (rows
+//! that are not `0..2^bits` in order, or more than one column) are refused with
+//! [`WitgenError::Table`]: an indicator over arbitrary rows needs an equality test per
+//! row, which is not built. The rest of a lookup proof (helper table, lookup
+//! sumcheck) is the prover's (`prover`, "Lookups") and takes these shares as they are.
+//!
 //! # What is opened, and why it tells nothing
 //!
 //! Beaver openings; `a^2` of random-bit generation; the top-bits product of an exact
@@ -188,6 +205,11 @@ pub enum WitgenError {
     ZeroDenominator,
     /// An opened value that the protocol defines as a bit is not one.
     NotABit,
+    /// The relation has a lookup into a table that is not a range table `0..2^bits`
+    /// of one column (the index of the lookup is given).
+    Table {
+        lookup: usize,
+    },
 }
 
 impl From<MpcError> for WitgenError {
@@ -653,15 +675,15 @@ async fn join2<A, C>(a: impl Future<Output = A>, c: impl Future<Output = C>) -> 
     let (mut a, mut c) = (Box::pin(a), Box::pin(c));
     let (mut ra, mut rc) = (None, None);
     poll_fn(move |cx| {
-        if ra.is_none() {
-            if let Poll::Ready(v) = a.as_mut().poll(cx) {
-                ra = Some(v);
-            }
+        if ra.is_none()
+            && let Poll::Ready(v) = a.as_mut().poll(cx)
+        {
+            ra = Some(v);
         }
-        if rc.is_none() {
-            if let Poll::Ready(v) = c.as_mut().poll(cx) {
-                rc = Some(v);
-            }
+        if rc.is_none()
+            && let Poll::Ready(v) = c.as_mut().poll(cx)
+        {
+            rc = Some(v);
         }
         if ra.is_some() && rc.is_some() {
             Poll::Ready((ra.take().expect("set"), rc.take().expect("set")))
@@ -707,7 +729,7 @@ pub struct Witgen<'a, B: Backend> {
     chains: Chains,
     counting: bool,
     /// Random bits and exact masks made before the relation's first round.
-    pool: RefCell<(Vec<B::S>, Vec<Vec<B::S>>)>,
+    pool: RefCell<Pool<B::S>>,
     /// Random bits and exact masks asked for so far.
     asked: Cell<(usize, usize)>,
     /// A run that only counts what [`Self::asked`] comes to.
@@ -717,6 +739,12 @@ pub struct Witgen<'a, B: Backend> {
 }
 
 type Shares<B> = Result<Vec<<B as Backend>::S>, WitgenError>;
+/// Random bits, and exact masks of 64 bits each.
+type Pool<S> = (Vec<S>, Vec<Vec<S>>);
+/// What a unit's dependencies are reported to: the terms of each form it reads.
+type Visit<'v> = dyn FnMut(&[(u32, F)]) + 'v;
+/// Two integers to be multiplied.
+type IntPair<S> = (Int<S>, Int<S>);
 
 impl<'a, B: Backend> Witgen<'a, B> {
     pub fn new(b: &'a mut B) -> Self {
@@ -1209,7 +1237,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
     /// `sum_j a_j b_j + linear`, the products in one round.
     async fn int_sum(
         &self,
-        products: &[(Int<B::S>, Int<B::S>)],
+        products: &[IntPair<B::S>],
         linear: Int<B::S>,
     ) -> Result<Int<B::S>, WitgenError> {
         let futures: Vec<Boxed<'_, _>> = products
@@ -1227,7 +1255,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
         &self,
         z: &[B::S],
         products: &[(Vec<IntCoef>, Vec<IntCoef>)],
-    ) -> Vec<(Int<B::S>, Int<B::S>)> {
+    ) -> Vec<IntPair<B::S>> {
         products
             .iter()
             .map(|(a, b)| (self.int_of(z, a), self.int_of(z, b)))
@@ -1277,7 +1305,8 @@ impl<'a, B: Backend> Witgen<'a, B> {
             if most >= 1 << 63 {
                 return Err(WitgenError::Unsupported { index: usize::MAX });
             }
-            let t = x.c[k] - self.public(f_signed(x.lo[k])) + self.public(F::from_u64_reduced(digit));
+            let t =
+                x.c[k] - self.public(f_signed(x.lo[k])) + self.public(F::from_u64_reduced(digit));
             futures.push(Box::pin(self.decompose(t, 128 - most.leading_zeros())));
         }
         let mut columns: Vec<Vec<B::S>> = vec![Vec::new(); width];
@@ -1457,9 +1486,7 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 break;
             }
             scale = None;
-            bits = self
-                .normalize(&folded, &[], nat_bitlen(&next_most))
-                .await?;
+            bits = self.normalize(&folded, &[], nat_bitlen(&next_most)).await?;
             most = next_most;
         }
         let count = nat_divrem(&most, &q.p).0;
@@ -1662,6 +1689,57 @@ impl<'a, B: Backend> Witgen<'a, B> {
         ])
     }
 
+    /// The indicator of the value of `x` over `0..2^bits`: entry `j` is one where
+    /// `x = j`. For an `x` outside that range the entries are not an indicator, and the
+    /// relation has no proof.
+    async fn one_hot(&self, x: B::S, bits: u32) -> Shares<B> {
+        // Products of every subset of the bits, by halves: one round per doubling.
+        let mut blocks: Vec<Vec<B::S>> = self
+            .decompose(x, bits)
+            .await?
+            .iter()
+            .map(|&b| vec![self.one, b])
+            .collect();
+        while blocks.len() > 1 {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            for pair in blocks.chunks_exact(2) {
+                for &h in &pair[1][1..] {
+                    for &l in &pair[0][1..] {
+                        xs.push(l);
+                        ys.push(h);
+                    }
+                }
+            }
+            let products = self.mul(&xs, &ys).await?;
+            let mut at = 0;
+            let mut next = Vec::with_capacity(blocks.len().div_ceil(2));
+            for pair in blocks.chunks(2) {
+                let mut joined = pair[0].clone();
+                if let Some(high) = pair.get(1) {
+                    for &h in &high[1..] {
+                        joined.push(h);
+                        let n = pair[0].len() - 1;
+                        joined.extend_from_slice(&products[at..at + n]);
+                        at += n;
+                    }
+                }
+                next.push(joined);
+            }
+            blocks = next;
+        }
+        // From subset products to the indicator: where a bit is zero the factor is
+        // `1 - bit`.
+        let mut out = blocks.pop().unwrap_or_else(|| vec![self.one]);
+        for bit in 0..bits as usize {
+            for mask in 0..out.len() {
+                if (mask >> bit) & 1 == 0 {
+                    out[mask] = out[mask] - out[mask | (1 << bit)];
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The task of a variable that is neither a product nor read from a source.
     fn var_task<'s>(&'s self, z: &[B::S], def: &Def) -> Option<Boxed<'s, Shares<B>>> {
         Some(match def {
@@ -1792,13 +1870,56 @@ impl<'a, B: Backend> Witgen<'a, B> {
         let first = 1 + shape.num_public;
         let stop = shape.mask_var_base;
         let vars = shape.num_vars;
-        let units = vars + defs.sources.len();
+        let after_sources = vars + defs.sources.len();
+        let lookups = shape.lookups();
+        let units = after_sources + lookups.map_or(0, |l| l.num_lookups);
+        // The range tables of the relation: per table tag, its first entry and its bits.
+        let constant = |m: &dregg_sig_agg::zk_hem::relation::Csr, i: usize| {
+            m.row(i)
+                .try_fold(F::ZERO, |acc, (col, c)| (col == 0).then_some(acc + c))
+        };
+        let mut tables: BTreeMap<u64, (usize, u32)> = BTreeMap::new();
+        if let Some(l) = lookups {
+            let rows = l.num_lookups..l.num_lookups + l.num_table_rows;
+            let mut at = rows.start;
+            while at < rows.end {
+                let tag = constant(&l.den[0], at);
+                let len = (at..rows.end)
+                    .take_while(|&e| constant(&l.den[0], e) == tag)
+                    .count();
+                let range = len.is_power_of_two()
+                    && l.den.len() >= 2
+                    && (0..len).all(|j| {
+                        constant(&l.den[1], at + j) == Some(F::from_u64_reduced(j as u64))
+                            && l.den[2..].iter().all(|m| m.row(at + j).next().is_none())
+                    });
+                if let (Some(tag), true) = (tag, range) {
+                    tables.insert(tag.to_canonical_u64(), (at, len.trailing_zeros()));
+                }
+                at += len;
+            }
+        }
+        // The table of lookup `i`, when it is a range table and the tuple has one column.
+        let table_of = |i: usize| {
+            let l = lookups?;
+            let tag = constant(&l.den[0], i)?.to_canonical_u64();
+            let narrow = l.den[2..].iter().all(|m| m.row(i).next().is_none());
+            tables.get(&tag).copied().filter(|_| narrow)
+        };
+        if let Some(l) = lookups
+            && let Some(lookup) = (0..l.num_lookups).find(|&i| table_of(i).is_none())
+        {
+            return Err(WitgenError::Table { lookup });
+        }
 
         // The variables read from each source; the forms each unit waits for.
         let mut readers: Vec<Vec<u32>> = vec![Vec::new(); defs.sources.len()];
         for i in first..stop {
             match &defs.vars[i] {
-                Def::Bits { source, .. } | Def::Coefficient { product: source, .. } => readers
+                Def::Bits { source, .. }
+                | Def::Coefficient {
+                    product: source, ..
+                } => readers
                     .get_mut(source.index())
                     .ok_or(unsupported(i))?
                     .push(i as u32),
@@ -1806,9 +1927,10 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 _ => {}
             }
         }
-        let unit_forms = |unit: usize, visit: &mut dyn FnMut(&Lc)| {
-            let coefs = |v: &[IntCoef], visit: &mut dyn FnMut(&Lc)| v.iter().for_each(|c| visit(&c.lc));
-            let pairs = |v: &[(Vec<IntCoef>, Vec<IntCoef>)], visit: &mut dyn FnMut(&Lc)| {
+        let unit_forms = |unit: usize, visit: &mut Visit<'_>| {
+            let coefs =
+                |v: &[IntCoef], visit: &mut Visit<'_>| v.iter().for_each(|c| visit(c.lc.terms()));
+            let pairs = |v: &[(Vec<IntCoef>, Vec<IntCoef>)], visit: &mut Visit<'_>| {
                 for (a, b) in v {
                     coefs(a, visit);
                     coefs(b, visit);
@@ -1817,32 +1939,43 @@ impl<'a, B: Backend> Witgen<'a, B> {
             if unit < vars {
                 match &defs.vars[unit] {
                     Def::Product(a, b) => {
-                        visit(a);
-                        visit(b);
+                        visit(a.terms());
+                        visit(b.terms());
                     }
-                    Def::Power7(a) => visit(a),
+                    Def::Power7(a) => visit(a.terms()),
                     Def::SumOfProducts { base, products } => {
-                        visit(base);
+                        visit(base.terms());
                         for (a, b) in products {
-                            visit(a);
-                            visit(b);
+                            visit(a.terms());
+                            visit(b.terms());
                         }
                     }
                     Def::Ratio {
                         num, den, minus, ..
                     } => {
-                        visit(num);
-                        visit(den);
-                        visit(minus);
+                        visit(num.terms());
+                        visit(den.terms());
+                        visit(minus.terms());
                     }
-                    Def::InverseOrZero { of, .. } => visit(of),
+                    Def::InverseOrZero { of, .. } => visit(of.terms()),
                     _ => {}
+                }
+            } else if unit >= after_sources {
+                // A lookup waits for the variables of its value.
+                if let Some(l) = lookups {
+                    let terms: Vec<(u32, F)> = l.den[1]
+                        .row(unit - after_sources)
+                        .map(|(col, c)| (col as u32, c))
+                        .collect();
+                    visit(&terms);
                 }
             } else {
                 match &defs.sources[unit - vars] {
                     Source::Input { .. } => {}
-                    Source::PolyProduct { a, b } => a.iter().chain(b).for_each(|lc| visit(lc)),
-                    Source::Form { lc, .. } => visit(lc),
+                    Source::PolyProduct { a, b } => {
+                        a.iter().chain(b).for_each(|lc| visit(lc.terms()))
+                    }
+                    Source::Form { lc, .. } => visit(lc.terms()),
                     Source::Integer {
                         products, linear, ..
                     } => {
@@ -1880,7 +2013,12 @@ impl<'a, B: Backend> Witgen<'a, B> {
         let is_unit = |unit: usize| {
             if unit < vars {
                 (first..stop).contains(&unit)
-                    && !matches!(defs.vars[unit], Def::Bits { .. } | Def::Coefficient { .. })
+                    && !matches!(
+                        defs.vars[unit],
+                        Def::Bits { .. } | Def::Coefficient { .. } | Def::Multiplicity
+                    )
+            } else if unit >= after_sources {
+                true
             } else {
                 !readers[unit - vars].is_empty()
                     && !matches!(defs.sources[unit - vars], Source::Input { .. })
@@ -1892,9 +2030,13 @@ impl<'a, B: Backend> Witgen<'a, B> {
         let mut starts = vec![0u32; vars + 1];
         let mut bad = None;
         for unit in (0..units).filter(|&u| is_unit(u)) {
-            let limit = if unit < vars { unit } else { stop };
-            unit_forms(unit, &mut |lc| {
-                for &(v, _) in lc.terms() {
+            let limit = match (unit < vars, lookups) {
+                (true, _) => unit,
+                (false, Some(l)) => l.mult_var_base,
+                (false, None) => stop,
+            };
+            unit_forms(unit, &mut |terms| {
+                for &(v, _) in terms {
                     let v = v as usize;
                     if v >= limit {
                         bad = Some(unit);
@@ -1914,8 +2056,8 @@ impl<'a, B: Backend> Witgen<'a, B> {
         let mut dependents = vec![0u32; starts[vars] as usize];
         let mut fill = starts.clone();
         for unit in (0..units).filter(|&u| is_unit(u)) {
-            unit_forms(unit, &mut |lc| {
-                for &(v, _) in lc.terms() {
+            unit_forms(unit, &mut |terms| {
+                for &(v, _) in terms {
                     let v = v as usize;
                     if v >= first {
                         dependents[fill[v] as usize] = unit as u32;
@@ -1952,12 +2094,14 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 Def::Coefficient { index, .. } => {
                     values.get(*index as usize).copied().ok_or(unsupported(i))
                 }
-                Def::Bits { lo, width, .. } => Ok((0..*width as usize).fold(self.zero, |acc, t| {
-                    match values.get(*lo as usize + t) {
-                        Some(&b) => acc + B::scale(b, pow2(t)),
-                        None => acc,
-                    }
-                })),
+                Def::Bits { lo, width, .. } => {
+                    Ok((0..*width as usize).fold(self.zero, |acc, t| {
+                        match values.get(*lo as usize + t) {
+                            Some(&b) => acc + B::scale(b, pow2(t)),
+                            None => acc,
+                        }
+                    }))
+                }
                 _ => Err(unsupported(i)),
             }
         };
@@ -1989,6 +2133,14 @@ impl<'a, B: Backend> Witgen<'a, B> {
             let (bits, masks) = plan(shape, defs, self.chains)?;
             self.wait(self.fill_pool(bits, masks))?;
         }
+        // Multiplicities: the sum over the lookups of the indicator of each one's row.
+        let mut counts: Vec<B::S> = vec![self.zero; lookups.map_or(0, |l| l.num_table_rows)];
+        let mut uncounted = lookups.map_or(0, |l| l.num_lookups);
+        if let (Some(l), 0) = (lookups, uncounted) {
+            for (r, &count) in counts.iter().enumerate() {
+                set(&mut z, &mut ready, l.mult_var_base + r, count);
+            }
+        }
         let mut cx = Context::from_waker(Waker::noop());
         let mut active: Vec<(u32, Boxed<'_, Shares<B>>)> = Vec::new();
         let mut direct: Vec<(usize, u32)> = Vec::new();
@@ -2000,15 +2152,24 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 while next < ready.len() {
                     let unit = ready[next] as usize;
                     next += 1;
-                    if unit < vars {
-                        if let Def::Product(a, b) = &defs.vars[unit] {
-                            let at = self.push_mul(&[self.eval(&z, a)], &[self.eval(&z, b)]);
-                            direct.push((at, unit as u32));
-                            continue;
-                        }
+                    if unit < vars
+                        && let Def::Product(a, b) = &defs.vars[unit]
+                    {
+                        let at = self.push_mul(&[self.eval(&z, a)], &[self.eval(&z, b)]);
+                        direct.push((at, unit as u32));
+                        continue;
                     }
                     let task = if unit < vars {
                         self.var_task(&z, &defs.vars[unit])
+                    } else if unit >= after_sources {
+                        lookups
+                            .zip(table_of(unit - after_sources))
+                            .map(|(l, (_, bits))| {
+                                let x = l.den[1]
+                                    .row(unit - after_sources)
+                                    .fold(self.zero, |acc, (col, c)| acc + B::scale(z[col], c));
+                                Box::pin(self.one_hot(x, bits)) as Boxed<'_, Shares<B>>
+                            })
                     } else {
                         self.source_task(&z, &defs.sources[unit - vars])
                     };
@@ -2026,6 +2187,20 @@ impl<'a, B: Backend> Witgen<'a, B> {
                     if unit < vars {
                         let value = *values.first().ok_or(unsupported(unit))?;
                         set(&mut z, &mut ready, unit, value);
+                    } else if unit >= after_sources {
+                        let (l, (start, _)) = lookups
+                            .zip(table_of(unit - after_sources))
+                            .ok_or(unsupported(unit))?;
+                        let row = start - l.num_lookups;
+                        for (count, &hit) in counts[row..].iter_mut().zip(&values) {
+                            *count = *count + hit;
+                        }
+                        uncounted -= 1;
+                        if uncounted == 0 {
+                            for (r, &count) in counts.iter().enumerate() {
+                                set(&mut z, &mut ready, l.mult_var_base + r, count);
+                            }
+                        }
                     } else {
                         for &i in &readers[unit - vars] {
                             let value = read(i as usize, &values)?;
@@ -2056,6 +2231,20 @@ impl<'a, B: Backend> Witgen<'a, B> {
                 if unit < vars {
                     let value = *values.first().ok_or(unsupported(unit))?;
                     set(&mut z, &mut ready, unit, value);
+                } else if unit >= after_sources {
+                    let (l, (start, _)) = lookups
+                        .zip(table_of(unit - after_sources))
+                        .ok_or(unsupported(unit))?;
+                    let row = start - l.num_lookups;
+                    for (count, &hit) in counts[row..].iter_mut().zip(&values) {
+                        *count = *count + hit;
+                    }
+                    uncounted -= 1;
+                    if uncounted == 0 {
+                        for (r, &count) in counts.iter().enumerate() {
+                            set(&mut z, &mut ready, l.mult_var_base + r, count);
+                        }
+                    }
                 } else {
                     for &i in &readers[unit - vars] {
                         let value = read(i as usize, &values)?;
@@ -2404,8 +2593,8 @@ pub(super) mod tests {
 
     use crate::hem::relations::{
         Bip32Root, Ed25519ExtendedKey, KeySource, Lock, OwnershipStatement, OwnershipWitness,
-        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions,
-        ownership_shape, synthesize_ownership,
+        PathSpec, bip32_derive, ownership_auxiliary_inputs, ownership_definitions, ownership_shape,
+        synthesize_ownership,
     };
 
     fn statement(lock: Lock, source: KeySource, witness: &OwnershipWitness) -> OwnershipStatement {
@@ -2618,7 +2807,12 @@ pub(super) mod tests {
             };
             let z = run(&inputs).unwrap();
             let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
-            assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None, "{:?}", st.source);
+            assert_eq!(
+                wrong.map(|i| (i, defs.vars[i].clone())),
+                None,
+                "{:?}",
+                st.source
+            );
 
             // The auxiliary inputs matter: flipping the first or the last of them moves
             // the assignment (or leaves the relation without one).
@@ -2637,12 +2831,19 @@ pub(super) mod tests {
             assert_eq!(aux(65, &path, root.as_ref()), None);
             let long = [path.clone(), vec![H, H, H]].concat();
             assert_eq!(aux(secret.len(), &long, root.as_ref()), None);
-            let flipped = if root.is_some() { None } else { Some(&[1u8; 32]) };
+            let flipped = if root.is_some() {
+                None
+            } else {
+                Some(&[1u8; 32])
+            };
             assert_eq!(aux(secret.len(), &path, flipped), None);
         }
         // A SLIP-0010 path has hardened steps only.
         let (st, _, secret, _, _) = derived_cases().swap_remove(2);
-        assert_eq!(ownership_auxiliary_inputs(&st, secret.len(), &[5], None), None);
+        assert_eq!(
+            ownership_auxiliary_inputs(&st, secret.len(), &[5], None),
+            None
+        );
     }
 
     /// An addition that may be a doubling: the chord where the denominator is nonzero
@@ -2734,13 +2935,27 @@ pub(super) mod tests {
         let mut cases: Vec<OwnershipStatement> =
             reference_cases().into_iter().map(|c| c.0).collect();
         cases.push(derived_cases().swap_remove(0).0);
+        // m/44'/0'/0'/0/0 from a master seed.
+        const H: u32 = 1 << 31;
+        let seed = OwnershipWitness::seed(&[0x31; 16]);
+        let source = KeySource::Bip32 {
+            root: Bip32Root::Seed,
+            path: PathSpec::Public(vec![H + 44, H, H, 0, 0]),
+        };
+        cases.push(statement(Lock::P2pkh, source, &seed));
         for st in cases {
             let (shape, defs) = ownership_definitions(&st).unwrap();
             for chains in [Chains::Ripple, Chains::Prefix, Chains::Mixed] {
                 let c = demand_with(&shape, &defs, chains).unwrap();
                 std::println!(
                     "{:?} {:?} {chains:?}: triples={} randoms={} rounds={} checks={} opened={}",
-                    st.lock, st.source, c.triples, c.randoms, c.rounds, c.checks, c.opened
+                    st.lock,
+                    st.source,
+                    c.triples,
+                    c.randoms,
+                    c.rounds,
+                    c.checks,
+                    c.opened
                 );
             }
         }
@@ -2844,6 +3059,119 @@ pub(super) mod tests {
         let reduced = field.mul(&mut cs, &Lazy::from_bits(&bits), &Lazy::from_bits(&mixed));
         field.enforce_canonical(&mut cs, &reduced);
         cs.finish_recorded()
+    }
+
+    /// A relation over a 4-byte secret, with or without byte lookups of six values: the
+    /// four secret bytes, one of them again, and a constant.
+    fn byte_lookup_recorded(secret: &[u8; 4], lookups: bool) -> (Shape, Vec<F>, Definitions) {
+        let mut cs = ConstraintSystem::new_recording();
+        let public: Lc = cs
+            .public_input(f(u64::from(secret[0]) * u64::from(secret[1])))
+            .into();
+        let bits = alloc_bits(&mut cs, secret);
+        let bytes: Vec<Lc> = bits.chunks(8).map(pack_bits).collect();
+        let product = cs.mul(&bytes[0], &bytes[1]);
+        cs.enforce_equal(&product.into(), &public);
+        if lookups {
+            for byte in bytes.iter().chain([&bytes[2], &Lc::constant(f(200))]) {
+                cs.enforce_byte(byte);
+            }
+        }
+        cs.finish_recorded()
+    }
+
+    /// Multiplicities on shares: the count of each table row over the lookups, at 302
+    /// triples and 48 uniform values a byte lookup, in the rounds the rest takes.
+    #[test]
+    fn multiplicities_of_byte_lookups_are_counted_on_shares() {
+        let secret = [0xa7, 0x00, 0xff, 0xa7];
+        let (shape, assignment, defs) = byte_lookup_recorded(&secret, true);
+        assert!(shape.is_satisfied(&assignment));
+        assert_eq!(defs.undefined(), Vec::<usize>::new());
+        let l = shape.lookups().unwrap();
+        assert_eq!((l.num_lookups, l.num_table_rows), (6, 256));
+        // 0xa7 twice, 0xff twice (bytes[2] is looked up again), 0x00 and 200 once.
+        let count = |row: usize| assignment[l.mult_var_base + row].to_canonical_u64();
+        assert_eq!(
+            (count(0xa7), count(0xff), count(0), count(200), count(1)),
+            (2, 2, 1, 1, 0)
+        );
+
+        let inputs = clear_inputs(&defs, &secret, &[]);
+        let publics = assignment[1..=shape.num_public].to_vec();
+        let mut plain = Plain::new(9);
+        let z = Witgen::new(&mut plain)
+            .run(&shape, &defs, &publics, &inputs)
+            .unwrap();
+        let wrong = (0..shape.mask_var_base).find(|&i| z[i].0 != assignment[i]);
+        assert_eq!(wrong.map(|i| (i, defs.vars[i].clone())), None);
+
+        let with = demand(&shape, &defs).unwrap();
+        assert_eq!(
+            (with.triples, with.randoms),
+            (plain.count.triples, plain.count.randoms)
+        );
+        let (bare, _, bare_defs) = byte_lookup_recorded(&secret, false);
+        let without = demand(&bare, &bare_defs).unwrap();
+        assert_eq!(with.triples - without.triples, 6 * 302);
+        assert_eq!(with.randoms - without.randoms, 6 * 48);
+        std::println!(
+            "rounds with lookups {} without {}",
+            with.rounds,
+            without.rounds
+        );
+        assert!(with.rounds <= without.rounds + 14);
+    }
+
+    /// A table that is not a range table is refused by name.
+    #[test]
+    fn a_lookup_into_a_table_that_is_not_a_range_is_refused() {
+        let mut cs = ConstraintSystem::new_recording();
+        let bits = alloc_bits(&mut cs, &[5]);
+        let table = cs.table(1, vec![f(5), f(9)]);
+        cs.enforce_in_table(table, &[pack_bits(&bits)]);
+        let (shape, _, defs) = cs.finish_recorded();
+        assert_eq!(
+            demand(&shape, &defs).err(),
+            Some(WitgenError::Table { lookup: 0 })
+        );
+    }
+
+    /// From shares of the secret to a proof of a relation with lookups that the split
+    /// verifier accepts; a wrong message during it makes the honest custodians abort.
+    #[test]
+    fn a_quorum_proves_a_relation_with_lookups_from_shares_of_its_inputs() {
+        use super::super::prover::{prove_party, prover_demand};
+        use dregg_sig_agg::pcs::WhirSecurityRegime;
+        use dregg_sig_agg::zk_hem::protocol::verify_split;
+        let regime = WhirSecurityRegime::default();
+        let secret = [0x31, 0x07, 0xe0, 0x31];
+        let (shape, assignment, defs) = byte_lookup_recorded(&secret, true);
+        let publics = assignment[1..=shape.num_public].to_vec();
+        let need = demand(&shape, &defs).unwrap();
+        let prove = prover_demand(&shape, regime).unwrap();
+        for fault in [None, Some(2 * need.rounds / 3)] {
+            let mut dealer = Dealer::new(3, &[11; 32]);
+            let inputs = deal_bits(&mut dealer, 3, &secret);
+            let preps = dealer.preprocessing(need.triples + prove.0, need.randoms + prove.1);
+            let out = run_engines(preps, fault, |e| {
+                let z = generate(e, &shape, &defs, &publics, &[inputs[e.me()].clone()])
+                    .map_err(|e| std::format!("{e:?}"))?;
+                prove_party(e, &shape, &publics, b"lookups", regime, z)
+                    .map_err(|e| std::format!("{e:?}"))
+            });
+            match fault {
+                None => {
+                    let proof = out[0].0.clone().unwrap();
+                    assert!(out.iter().all(|(p, _)| p.as_ref() == Ok(&proof)));
+                    assert!(verify_split(&shape, &publics, b"lookups", regime, &proof));
+                    let mut other = publics.clone();
+                    other[0] += F::ONE;
+                    assert!(!verify_split(&shape, &other, b"lookups", regime, &proof));
+                }
+                Some(_) => assert!(out[0].0.is_err() && out[2].0.is_err(), "{:?}", out[0].0),
+            }
+        }
     }
 
     /// A transport that flips one bit of its `at`-th outgoing message.
