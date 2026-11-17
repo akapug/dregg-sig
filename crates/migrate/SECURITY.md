@@ -187,8 +187,8 @@ at the master extended key it is below. Of its rows, 22 SHA-512 compressions are
 row type that would bring the multiplications to about 14,000 rows each and the
 statement under 2^20.
 
-Proving memory follows the padded row count: 5.3 GB peak for the batch of 10, 11.2 GB
-for 30 and 35.2 GB for 100 (one statement per process). A batch too large for the
+Proving memory follows the padded row count: about 5 GB peak for the batch of 10,
+about 11 GB for 30 and 35.2 GB for 100 (one statement per process). A batch too large for the
 prover's memory is cut with `BatchStatement::chunks` into independent proofs of the
 same claims: up to 43 P2PKH entries below a seed-rooted `m/44'/0'/0'/0` pad to 2^23
 rows, so 100 addresses are three proofs of about 950 KiB at about 11 GB each.
