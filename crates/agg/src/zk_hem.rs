@@ -22,6 +22,11 @@
 //! `uncommitted_*` tests). [`protocol`] is the committed protocol built from it: masks and
 //! companions are committed with the witness and WHIR runs on the blended word only.
 //! [`relation`] is the constraint system it proves.
+//!
+//! These algebraic ingredients do not establish security of the composed Rust protocol.
+//! [`protocol::prove`] lists the unresolved composed simulator, unopened-leaf hiding bound,
+//! batching proximity loss and concrete knowledge-soundness bound. The name `zk-Hem`
+//! identifies the intended masking construction, not a completed zero-knowledge theorem.
 
 use alloc::vec;
 use alloc::vec::Vec;
