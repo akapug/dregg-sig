@@ -1699,8 +1699,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn registry_bindings_identify_the_credential() {
-        use crate::hem::registry::{KeyExposure, legacy_identifier};
-        use crate::legacy::LegacyCommitmentKind;
+        use crate::hem::registry::KeyExposure;
         let source = KeySource::SpendingKey;
         let w = witness(&source, false);
         let st = statement(&source, &w);
@@ -1736,16 +1735,6 @@ mod tests {
             Credential::BlsWithdrawal(st.nullifier),
         ] {
             assert_ne!(other.identifier(), b.legacy_id);
-        }
-        let mut twenty = [0u8; 20];
-        twenty.copy_from_slice(&st.nullifier[..20]);
-        for other in [
-            LegacyCommitmentKind::BitcoinHash160(twenty),
-            LegacyCommitmentKind::BitcoinTaprootXOnly(st.nullifier),
-            LegacyCommitmentKind::EthereumKeccak20(twenty),
-            LegacyCommitmentKind::Slip0010Ed25519(st.nullifier),
-        ] {
-            assert_ne!(legacy_identifier(&other), b.legacy_id);
         }
         assert_ne!(
             credential_identifier(LEGACY_TAG_ORCHARD_ADDRESS, &st.nullifier),

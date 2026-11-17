@@ -1017,7 +1017,7 @@ impl SaplingAddressStatement {
         crate::hem::registry::MigrationBinding {
             nullifier: self.nullifier(),
             migration_domain: self.migration_domain,
-            legacy_id: super::recovery::zcash_legacy_identifier(
+            legacy_id: crate::hem::relations::credential_identifier(
                 LEGACY_TAG_SAPLING_ADDRESS,
                 &self.address,
             ),
@@ -1738,7 +1738,8 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn registry_binding_identifies_the_address() {
-        use super::super::recovery::{LEGACY_TAG_ORCHARD_ADDRESS, zcash_legacy_identifier};
+        use super::super::recovery::LEGACY_TAG_ORCHARD_ADDRESS;
+        use crate::hem::relations::credential_identifier as zcash_legacy_identifier;
         use crate::hem::registry::KeyExposure;
         let st = statement(&SaplingKeySource::SpendingKey, &diversifier(3));
         let b = st.binding();
