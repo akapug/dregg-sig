@@ -1538,6 +1538,7 @@ fn prove_with_claimed_publics(
     // so a repeated `seed` does not repeat masks across different proofs. The schedule
     // matters: it enters the transcript, so two regimes give two transcripts, and equal masks
     // under different challenges cancel (`bounds::tests::coins_do_not_repeat_across_regimes`).
+    let coins_phase = crate::profile::span("hem_coins");
     let mut coin_input = seed.to_vec();
     coin_input.extend_from_slice(&shape.digest());
     coin_input.extend_from_slice(&layout.schedule.to_bytes());
@@ -1549,9 +1550,8 @@ fn prove_with_claimed_publics(
     dregg_sig_asm::volatile_fill(&mut coin_input, 0u8);
     let mut stream = SeedStream::new(b"QSAG.ZKHEM.COINS/v1", &coin_seed);
     dregg_sig_asm::volatile_fill(&mut coin_seed, 0u8);
-    for slot in &mut assignment[shape.mask_var_base..] {
-        *slot = stream.next_base();
-    }
+    stream.fill_base(&mut assignment[shape.mask_var_base..]);
+    drop(coins_phase);
     // Row values `(Az, Bz, Cz)`, taken before the table moves into the commitment.
     let row_base = if check && assignment[0] != F::ONE {
         None
@@ -1576,16 +1576,19 @@ fn prove_with_claimed_publics(
     table[..shape.num_vars].copy_from_slice(&assignment);
     let public_inputs =
         claimed.map_or_else(|| assignment[1..=shape.num_public].to_vec(), <[F]>::to_vec);
-    for slot in &mut table[cells - layout.blind_cells..] {
-        *slot = stream.next_base();
-    }
+    stream.fill_base(&mut table[cells - layout.blind_cells..]);
 
     dregg_sig_asm::volatile_fill(&mut assignment, F::ZERO);
 
     let mut polys = Vec::with_capacity(1 + COMPANIONS);
     polys.push(table);
-    for _ in 0..COMPANIONS {
-        polys.push((0..cells).map(|_| stream.next_base()).collect());
+    {
+        let _phase = crate::profile::span("hem_companions");
+        for _ in 0..COMPANIONS {
+            let mut companion = vec![F::ZERO; cells];
+            stream.fill_base(&mut companion);
+            polys.push(companion);
+        }
     }
     let mut salt_seed = [0u8; 32];
     for chunk in salt_seed.chunks_mut(8) {
@@ -2555,13 +2558,13 @@ fn lookup_prove_front(
         }
     }
     mask.write(&mut table, LOOKUP_MASK_BITS, |i, j| ll.mask_block(i, j));
-    for slot in &mut table[cells - ll.blind_cells..] {
-        *slot = stream.next_base();
-    }
+    stream.fill_base(&mut table[cells - ll.blind_cells..]);
     let mut polys = Vec::with_capacity(1 + COMPANIONS);
     polys.push(table);
     for _ in 0..COMPANIONS {
-        polys.push((0..cells).map(|_| stream.next_base()).collect());
+        let mut companion = vec![F::ZERO; cells];
+        stream.fill_base(&mut companion);
+        polys.push(companion);
     }
     let mut salt_seed = [0u8; 32];
     for chunk in salt_seed.chunks_mut(8) {

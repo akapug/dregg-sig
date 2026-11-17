@@ -233,15 +233,85 @@ impl Csr {
             .fold(F::ZERO, |acc, (c, v)| acc + v.const_mul(z[c]))
     }
 
-    fn stream_into(&self, mut push: impl FnMut(&[u8])) {
-        push(&(self.ptr.len() as u64).to_le_bytes());
+    fn stream_into(&self, sponge: &mut ShapeSponge) {
+        sponge.u64(self.ptr.len() as u64);
         for &p in &self.ptr {
-            push(&p.to_le_bytes());
+            sponge.u32(p);
         }
         for (&c, &v) in self.col.iter().zip(&self.val) {
-            push(&c.to_le_bytes());
-            push(&v.to_le_bytes());
+            sponge.u32(c);
+            sponge.u64(v.to_canonical_u64());
         }
+    }
+}
+
+/// The cSHAKE256 sponge of [`Shape::digest`], absorbing little-endian words straight into
+/// the rate lanes. Absorbing `u32(x)` or `u64(x)` is absorbing the little-endian bytes of
+/// `x`; the digest is that of the concatenated bytes.
+struct ShapeSponge {
+    state: [u64; 25],
+    /// Bytes absorbed into the current rate block, below [`ShapeSponge::RATE`].
+    pos: usize,
+}
+
+impl ShapeSponge {
+    const RATE: usize = 136;
+
+    fn new(midstate: [u64; 25]) -> Self {
+        Self {
+            state: midstate,
+            pos: 0,
+        }
+    }
+
+    /// Absorb the low `bytes <= 8` bytes of `v`, whose other bytes are zero.
+    #[inline(always)]
+    fn word(&mut self, v: u64, bytes: usize) {
+        let lane = self.pos / 8;
+        let at = self.pos % 8;
+        self.state[lane] ^= v << (8 * at);
+        let room = 8 - at;
+        if bytes < room {
+            self.pos += bytes;
+            return;
+        }
+        let next = if lane == Self::RATE / 8 - 1 {
+            keccak_f1600(&mut self.state);
+            0
+        } else {
+            lane + 1
+        };
+        if bytes > room {
+            self.state[next] ^= v >> (8 * room);
+        }
+        self.pos = (self.pos + bytes) % Self::RATE;
+    }
+
+    #[inline(always)]
+    fn u32(&mut self, v: u32) {
+        self.word(u64::from(v), 4);
+    }
+
+    #[inline(always)]
+    fn u64(&mut self, v: u64) {
+        self.word(v, 8);
+    }
+
+    fn bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.word(u64::from(b), 1);
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        self.state[self.pos / 8] ^= 0x04 << (8 * (self.pos % 8));
+        self.state[Self::RATE / 8 - 1] ^= 0x80 << 56;
+        keccak_f1600(&mut self.state);
+        let mut out = [0u8; 32];
+        for (lane, dst) in self.state.iter().take(4).zip(out.as_chunks_mut::<8>().0) {
+            *dst = lane.to_le_bytes();
+        }
+        out
     }
 }
 
@@ -436,8 +506,8 @@ impl Lookups {
         sums.values().all(|s| s.is_zero())
     }
 
-    fn stream_into(&self, mut push: impl FnMut(&[u8])) {
-        push(b"QSAG.ZKHEM.SHAPE.LOOKUP/v1");
+    fn stream_into(&self, sponge: &mut ShapeSponge) {
+        sponge.bytes(b"QSAG.ZKHEM.SHAPE.LOOKUP/v1");
         for n in [
             self.log_entries,
             self.num_lookups,
@@ -445,11 +515,11 @@ impl Lookups {
             self.mult_var_base,
             self.den.len(),
         ] {
-            push(&(n as u64).to_le_bytes());
+            sponge.u64(n as u64);
         }
-        self.num.stream_into(&mut push);
+        self.num.stream_into(sponge);
         for m in &self.den {
-            m.stream_into(&mut push);
+            m.stream_into(sponge);
         }
     }
 }
@@ -547,29 +617,8 @@ impl Shape {
 
     fn compute_digest(&self) -> [u8; 32] {
         const SHAPE_MIDSTATE: [u64; 25] = cshake256_static_midstate(b"QSAG.ZKHEM.SHAPE/v1");
-        const RATE: usize = 136;
-
-        let mut state = SHAPE_MIDSTATE;
-        let mut buf = [0u8; RATE];
-        let mut filled = 0usize;
-        let xor_rate = |st: &mut [u64; 25], blk: &[u8; RATE]| {
-            for (lane, chunk) in st.iter_mut().take(17).zip(blk.as_chunks::<8>().0) {
-                *lane ^= u64::from_le_bytes(*chunk);
-            }
-        };
-        let mut push = |mut data: &[u8]| {
-            while !data.is_empty() {
-                let take = (RATE - filled).min(data.len());
-                buf[filled..filled + take].copy_from_slice(&data[..take]);
-                filled += take;
-                data = &data[take..];
-                if filled == RATE {
-                    xor_rate(&mut state, &buf);
-                    keccak_f1600(&mut state);
-                    filled = 0;
-                }
-            }
-        };
+        let _phase = crate::profile::span("hem_shape_digest");
+        let mut sponge = ShapeSponge::new(SHAPE_MIDSTATE);
         for n in [
             self.log_rows,
             self.num_sbox,
@@ -577,25 +626,15 @@ impl Shape {
             self.num_public,
             self.mask_var_base,
         ] {
-            push(&(n as u64).to_le_bytes());
+            sponge.u64(n as u64);
         }
-        self.a.stream_into(&mut push);
-        self.b.stream_into(&mut push);
-        self.c.stream_into(&mut push);
+        self.a.stream_into(&mut sponge);
+        self.b.stream_into(&mut sponge);
+        self.c.stream_into(&mut sponge);
         if let Some(lookups) = &self.lookups {
-            lookups.stream_into(&mut push);
+            lookups.stream_into(&mut sponge);
         }
-
-        buf[filled..].fill(0);
-        buf[filled] ^= 0x04;
-        buf[RATE - 1] ^= 0x80;
-        xor_rate(&mut state, &buf);
-        keccak_f1600(&mut state);
-        let mut out = [0u8; 32];
-        for (lane, dst) in state.iter().take(4).zip(out.as_chunks_mut::<8>().0) {
-            *dst = lane.to_le_bytes();
-        }
-        out
+        sponge.finish()
     }
 
     /// Whether `z` (with `z[0] = 1`) satisfies every row.
@@ -725,15 +764,20 @@ impl ConstraintSystem {
         cs
     }
 
-    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices.
-    /// The resulting assignment must still be checked against the compiled shape.
-    pub(crate) fn witness_only() -> Self {
+    /// Re-evaluate a compiled relation's assignment without rebuilding its matrices: run
+    /// the synthesis that produced a [`Shape`] on this builder and close it with
+    /// [`Self::finish_assignment`]. The resulting assignment must still be checked against
+    /// the compiled shape (the prover's row check does).
+    pub fn witness_only() -> Self {
         let mut cs = Self::new();
         cs.record_rows = false;
         cs
     }
 
-    pub(crate) fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
+    /// The assignment of a [`Self::witness_only`] builder, laid out for `shape` (masking
+    /// variables zero). `None` when the synthesis allocated a different number of public
+    /// inputs or variables than `shape` has.
+    pub fn finish_assignment(mut self, shape: &Shape) -> Option<Vec<F>> {
         assert!(!self.record_rows && !self.hologram_aligned);
         self.push_multiplicities();
         if self.num_public != shape.num_public || self.values.len() != shape.mask_var_base {
@@ -1505,6 +1549,110 @@ mod tests {
     fn f(x: u64) -> F {
         F::from_u64_reduced(x)
     }
+
+    fn hex32(bytes: [u8; 32]) -> alloc::string::String {
+        bytes.iter().map(|b| alloc::format!("{b:02x}")).collect()
+    }
+
+    /// A relation that uses every kind of row and every way of recording one: public
+    /// inputs, S-box and multiplication rows, Poseidon2 permutations, forked parts
+    /// appended in order and, when not hologram-aligned, lookups into two tables of
+    /// different widths (the wider one registered after the first lookups).
+    fn every_kind_of_row(aligned: bool) -> (Shape, Vec<F>) {
+        let mut cs = if aligned {
+            ConstraintSystem::new_hologram_aligned()
+        } else {
+            ConstraintSystem::new()
+        };
+        let p: Lc = cs.public_input(f(5)).into();
+        let q: Lc = cs.public_input(f(9)).into();
+        let pairs = (!aligned).then(|| {
+            cs.range_table(8);
+            cs.table(2, [1, 2, 3, 4, 5, 6].map(f).to_vec())
+        });
+        let part = |cs: &mut ConstraintSystem, k: u64| {
+            let x: Lc = cs.alloc(f(k + 2)).into();
+            let y: Lc = cs.mul(&x, &p).into();
+            let s: Lc = cs.sbox7(&y.plus(&q)).into();
+            cs.enforce_boolean(&Lc::constant(f(1)));
+            cs.enforce_equal(&s.minus(&s), &Lc::zero());
+            let out = sponge12(cs, &[x.clone(), y.clone(), s.scaled(f(3)).plus_const(f(k))]);
+            cs.enforce_mul(out[0].clone(), x.clone(), out[0].scaled(f(k + 2)));
+            let sel = cs.select(&Lc::constant(f(1)), &out[1], &y);
+            cs.enforce_equal(&sel, &out[1]);
+            if let Some(pairs) = pairs {
+                cs.enforce_byte(&x);
+                cs.enforce_in_table(pairs, &[Lc::constant(f(3)), x.plus_const(f(4)).minus(&x)]);
+                cs.enforce_byte(&x.plus_const(f(200)));
+            }
+        };
+        // Forks are taken before the parent allocates anything of its own.
+        let mut forks: Vec<ConstraintSystem> = Vec::new();
+        for k in 1..4 {
+            let mut child = cs.fork_public_inputs();
+            part(&mut child, k);
+            forks.push(child);
+        }
+        for child in forks {
+            cs.append(child);
+        }
+        part(&mut cs, 0);
+        let last: Lc = cs.alloc(f(77)).into();
+        cs.enforce_zero(last.plus_const(F::ZERO - f(77)));
+        cs.finish()
+    }
+
+    /// The digest binds the exact matrices. These values were computed by the builder
+    /// that kept every row as a list of linear forms until `finish` (commit `f303896`).
+    #[test]
+    fn shape_digests_of_every_kind_of_row_are_pinned() {
+        let got: Vec<_> = [false, true]
+            .into_iter()
+            .map(|aligned| {
+                let (shape, z) = every_kind_of_row(aligned);
+                assert!(shape.is_satisfied(&z), "aligned={aligned}");
+                assert_eq!(shape.lookups().is_some(), !aligned);
+                (
+                    aligned,
+                    shape.log_rows,
+                    shape.num_sbox,
+                    shape.num_vars,
+                    hex32(shape.digest()),
+                )
+            })
+            .collect();
+        let want = [
+            (
+                false,
+                PIN_PLAIN.0,
+                PIN_PLAIN.1,
+                PIN_PLAIN.2,
+                PIN_PLAIN.3.into(),
+            ),
+            (
+                true,
+                PIN_ALIGNED.0,
+                PIN_ALIGNED.1,
+                PIN_ALIGNED.2,
+                PIN_ALIGNED.3.into(),
+            ),
+        ];
+        assert_eq!(got, want);
+    }
+
+    /// `(log_rows, num_sbox, num_vars, digest)`.
+    const PIN_PLAIN: (usize, usize, usize, &str) = (
+        10,
+        476,
+        771,
+        "352ed98e0b9702b246b636c7461ddb08fc96506e8e3dd21c56860d7ce7bdd2fe",
+    );
+    const PIN_ALIGNED: (usize, usize, usize, &str) = (
+        10,
+        516,
+        669,
+        "8bb1b9cfa74638c39783b86973cf53faff986a166b45109f13ef8da04e492345",
+    );
 
     #[test]
     fn canonical_rate6_sponge_matches_accelerator_at_boundaries() {

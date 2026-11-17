@@ -1799,27 +1799,40 @@ fn shape_entries(shape: &Shape) -> usize {
 /// Shapes are a pure function of the relation; with `std` the most recent ones are kept,
 /// up to 32 of them and [`SHAPE_CACHE_ENTRIES`] matrix entries.
 #[cfg(feature = "std")]
-fn shape_of(relation: &Relation) -> Arc<Shape> {
-    use std::sync::{Mutex, PoisonError};
+static SHAPE_CACHE: std::sync::Mutex<Vec<(Relation, Arc<Shape>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The kept shape of `relation`, if there is one.
+#[cfg(feature = "std")]
+fn kept_shape(relation: &Relation) -> Option<Arc<Shape>> {
+    SHAPE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(r, _)| r == relation)
+        .map(|(_, shape)| shape.clone())
+}
+
+#[cfg(not(feature = "std"))]
+fn kept_shape(_: &Relation) -> Option<Arc<Shape>> {
+    None
+}
+
+/// Keep `shape`, the shape of `relation`, unless it is too large or one is already kept
+/// (which is then returned).
+#[cfg(feature = "std")]
+fn keep_shape(relation: &Relation, shape: Shape) -> Arc<Shape> {
     const KEEP: usize = 32;
-    static CACHE: Mutex<Vec<(Relation, Arc<Shape>)>> = Mutex::new(Vec::new());
-    let find = |cache: &[(Relation, Arc<Shape>)]| {
-        cache
-            .iter()
-            .find(|(r, _)| r == relation)
-            .map(|(_, shape)| shape.clone())
-    };
-    if let Some(hit) = find(&CACHE.lock().unwrap_or_else(PoisonError::into_inner)) {
-        return hit;
-    }
-    let shape = Arc::new(build_shape(relation));
+    let shape = Arc::new(shape);
     let size = shape_entries(&shape);
     if size > SHAPE_CACHE_ENTRIES {
         return shape;
     }
-    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(hit) = find(&cache) {
-        return hit;
+    let mut cache = SHAPE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, hit)) = cache.iter().find(|(r, _)| r == relation) {
+        return hit.clone();
     }
     while cache.len() == KEEP
         || cache.iter().map(|(_, s)| shape_entries(s)).sum::<usize>() + size > SHAPE_CACHE_ENTRIES
@@ -1831,8 +1844,34 @@ fn shape_of(relation: &Relation) -> Arc<Shape> {
 }
 
 #[cfg(not(feature = "std"))]
+fn keep_shape(_: &Relation, shape: Shape) -> Arc<Shape> {
+    Arc::new(shape)
+}
+
 fn shape_of(relation: &Relation) -> Arc<Shape> {
-    Arc::new(build_shape(relation))
+    kept_shape(relation).unwrap_or_else(|| keep_shape(relation, build_shape(relation)))
+}
+
+/// The shape of `relation` and the assignment `synthesize` produces. When the shape is
+/// kept, only the assignment is computed (no matrices, no digest); otherwise both come
+/// from one synthesis and the shape is kept for the next call. The shape does not depend
+/// on the witness, so both ways give the same pair.
+fn synthesize_shared(
+    relation: &Relation,
+    synthesize: impl Fn(ConstraintSystem) -> ConstraintSystem,
+) -> (Arc<Shape>, Vec<F>) {
+    match kept_shape(relation) {
+        Some(shape) => {
+            let assignment = synthesize(ConstraintSystem::witness_only())
+                .finish_assignment(&shape)
+                .expect("a relation's synthesis allocates the variables of its shape");
+            (shape, assignment)
+        }
+        None => {
+            let (shape, assignment) = synthesize(ConstraintSystem::new()).finish();
+            (keep_shape(relation, shape), assignment)
+        }
+    }
 }
 
 /// The public relation of a statement: it depends on the lock and the source (with its
@@ -1860,6 +1899,25 @@ pub fn synthesize_ownership(
     statement: &OwnershipStatement,
     witness: &OwnershipWitness,
 ) -> Result<(Shape, Vec<F>), OwnershipError> {
+    check_ownership(statement, witness)?;
+    let (shape, assignment, _) = build(
+        statement.lock,
+        &statement.source,
+        &statement.public_bits(),
+        &RelationWitness {
+            secret: &witness.secret,
+            path: &witness.path,
+            merkle_root: witness.merkle_root.unwrap_or([0; 32]),
+        },
+    );
+    Ok((shape, assignment))
+}
+
+/// That `statement` is well formed and `witness` produces it, natively.
+fn check_ownership(
+    statement: &OwnershipStatement,
+    witness: &OwnershipWitness,
+) -> Result<(), OwnershipError> {
     if !statement.is_well_formed() {
         return Err(OwnershipError::MalformedStatement);
     }
@@ -1874,17 +1932,33 @@ pub fn synthesize_ownership(
     if derived.as_ref() != Some(statement) {
         return Err(OwnershipError::WitnessMismatch);
     }
-    let (shape, assignment, _) = build(
-        statement.lock,
-        &statement.source,
-        &statement.public_bits(),
-        &RelationWitness {
-            secret: &witness.secret,
-            path: &witness.path,
-            merkle_root: witness.merkle_root.unwrap_or([0; 32]),
+    Ok(())
+}
+
+/// [`synthesize_ownership`] with the relation's kept shape ([`synthesize_shared`]).
+fn synthesize_ownership_shared(
+    statement: &OwnershipStatement,
+    witness: &OwnershipWitness,
+) -> Result<(Arc<Shape>, Vec<F>), OwnershipError> {
+    check_ownership(statement, witness)?;
+    let public_bits = statement.public_bits();
+    let relation_witness = RelationWitness {
+        secret: &witness.secret,
+        path: &witness.path,
+        merkle_root: witness.merkle_root.unwrap_or([0; 32]),
+    };
+    Ok(synthesize_shared(
+        &Relation::Single(statement.lock, statement.source.clone()),
+        |cs| {
+            build_in(
+                cs,
+                statement.lock,
+                &statement.source,
+                &public_bits,
+                &relation_witness,
+            )
         },
-    );
-    Ok((shape, assignment))
+    ))
 }
 
 fn with_regime(mut bytes: Vec<u8>, regime: WhirSecurityRegime) -> Vec<u8> {
@@ -2161,9 +2235,31 @@ fn build_batch(
     public_bits: &[bool],
     secret: &[u8],
 ) -> (Shape, Vec<F>, usize) {
+    let cs = build_batch_in(
+        ConstraintSystem::new(),
+        lock,
+        root,
+        prefix,
+        tails,
+        public_bits,
+        secret,
+    );
+    let rows = cs.num_rows();
+    let (shape, assignment) = cs.finish();
+    (shape, assignment, rows)
+}
+
+fn build_batch_in(
+    mut cs: ConstraintSystem,
+    lock: Lock,
+    root: Bip32Root,
+    prefix: &[u32],
+    tails: &[Vec<u32>],
+    public_bits: &[bool],
+    secret: &[u8],
+) -> ConstraintSystem {
     let per_entry = 8 * lock.credential_bytes() + 512;
     assert_eq!(public_bits.len(), tails.len() * per_entry);
-    let mut cs = ConstraintSystem::new();
     let public = alloc_public(&mut cs, public_bits);
     let (node, nullifier_secret) = bip32_root(&mut cs, root, secret);
     let order = Modulus::secp256k1_order();
@@ -2181,9 +2277,7 @@ fn build_batch(
         let credential = secp_lock(&mut cs, lock, &leaf.key, &[0; 32]);
         bind_credential(&mut cs, public, &credential, &nullifier_secret);
     }
-    let rows = cs.num_rows();
-    let (shape, assignment) = cs.finish();
-    (shape, assignment, rows)
+    cs
 }
 
 /// The public relation of a batch. `None` for a malformed batch.
@@ -2197,6 +2291,43 @@ pub fn synthesize_batch(
     batch: &BatchStatement,
     witness: &OwnershipWitness,
 ) -> Result<(Shape, Vec<F>), OwnershipError> {
+    let tails = check_batch(batch, witness)?;
+    let (shape, assignment, _) = build_batch(
+        batch.lock,
+        batch.root,
+        &batch.prefix,
+        &tails,
+        &batch.public_bits(),
+        &witness.secret,
+    );
+    Ok((shape, assignment))
+}
+
+/// [`synthesize_batch`] with the relation's kept shape ([`synthesize_shared`]).
+fn synthesize_batch_shared(
+    batch: &BatchStatement,
+    witness: &OwnershipWitness,
+) -> Result<(Arc<Shape>, Vec<F>), OwnershipError> {
+    let tails = check_batch(batch, witness)?;
+    let public_bits = batch.public_bits();
+    Ok(synthesize_shared(&batch.relation(), |cs| {
+        build_batch_in(
+            cs,
+            batch.lock,
+            batch.root,
+            &batch.prefix,
+            &tails,
+            &public_bits,
+            &witness.secret,
+        )
+    }))
+}
+
+/// That `batch` is well formed and `witness` produces it, natively; returns the tails.
+fn check_batch(
+    batch: &BatchStatement,
+    witness: &OwnershipWitness,
+) -> Result<Vec<Vec<u32>>, OwnershipError> {
     if !batch.is_well_formed() {
         return Err(OwnershipError::MalformedStatement);
     }
@@ -2217,16 +2348,7 @@ pub fn synthesize_batch(
     if derived.as_ref() != Some(batch) {
         return Err(OwnershipError::WitnessMismatch);
     }
-    let tails: Vec<Vec<u32>> = targets.into_iter().map(|(tail, _)| tail).collect();
-    let (shape, assignment, _) = build_batch(
-        batch.lock,
-        batch.root,
-        &batch.prefix,
-        &tails,
-        &batch.public_bits(),
-        &witness.secret,
-    );
-    Ok((shape, assignment))
+    Ok(targets.into_iter().map(|(tail, _)| tail).collect())
 }
 
 /// The statement bytes [`prove_batch`] and [`verify_batch`] hand to zk-Hem.
@@ -2277,7 +2399,7 @@ impl OwnershipProof {
 }
 
 fn prove(
-    synthesized: Result<(Shape, Vec<F>), OwnershipError>,
+    synthesized: Result<(Arc<Shape>, Vec<F>), OwnershipError>,
     transcript: &[u8],
     regime: WhirSecurityRegime,
     seed: &[u8; 32],
@@ -2297,7 +2419,7 @@ pub fn prove_ownership(
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
     prove(
-        synthesize_ownership(statement, witness),
+        synthesize_ownership_shared(statement, witness),
         &ownership_transcript(statement, regime),
         regime,
         seed,
@@ -2334,7 +2456,7 @@ pub fn prove_batch(
     seed: &[u8; 32],
 ) -> Result<OwnershipProof, OwnershipError> {
     prove(
-        synthesize_batch(batch, witness),
+        synthesize_batch_shared(batch, witness),
         &batch_transcript(batch, regime),
         regime,
         seed,
@@ -3732,6 +3854,142 @@ mod tests {
         const { assert!(47_846_552 < SHAPE_CACHE_ENTRIES && SHAPE_CACHE_ENTRIES < 350_554_982) };
     }
 
+    /// The prover's synthesis gives the pair a full synthesis gives, whether the shape
+    /// was kept (assignment only) or not, and proofs do not depend on which path ran.
+    #[test]
+    fn kept_shape_synthesis_is_the_full_synthesis() {
+        let witness = OwnershipWitness::secp256k1_key(&KEY);
+        let st = derive(Lock::P2pkhUncompressed, KeySource::Secp256k1Key, &witness);
+        let (shape, assignment) = synthesize_ownership(&st, &witness).unwrap();
+        // Twice: the second call finds the shape the first one kept.
+        for _ in 0..2 {
+            let (shared, z) = synthesize_ownership_shared(&st, &witness).unwrap();
+            assert_eq!(*shared, shape);
+            assert_eq!(shared.digest(), shape.digest());
+            assert_eq!(z, assignment);
+            assert!(Arc::ptr_eq(&shared, &ownership_shape(&st).unwrap()));
+        }
+        let direct = protocol::prove(
+            &shape,
+            assignment,
+            &ownership_transcript(&st, REGIME),
+            REGIME,
+            &[9; 32],
+        )
+        .unwrap();
+        let kept = prove_ownership(&st, &witness, REGIME, &[9; 32]).unwrap();
+        assert_eq!(kept.proof.to_bytes(), direct.to_bytes());
+
+        let (batch, witness) = batch_case();
+        let (shape, assignment) = synthesize_batch(&batch, &witness).unwrap();
+        for _ in 0..2 {
+            let (shared, z) = synthesize_batch_shared(&batch, &witness).unwrap();
+            assert_eq!(*shared, shape);
+            assert_eq!(z, assignment);
+        }
+        // A witness for another statement is still refused before any synthesis.
+        let other = OwnershipWitness::secp256k1_key(&[7; 32]);
+        assert_eq!(
+            synthesize_ownership_shared(&st, &other).err(),
+            Some(OwnershipError::WitnessMismatch)
+        );
+    }
+
+    /// The relation of every reference statement, bound by its digest. These values were
+    /// computed at commit `f303896`; a change means every proof of that statement changes.
+    #[test]
+    fn ownership_shape_digests_are_pinned() {
+        let hex =
+            |bytes: [u8; 32]| -> String { bytes.iter().map(|b| std::format!("{b:02x}")).collect() };
+        let mut got: Vec<(String, String)> = cases()
+            .into_iter()
+            .map(|(name, lock, source, witness)| {
+                let st = derive(lock, source, &witness);
+                (
+                    String::from(name),
+                    hex(ownership_shape(&st).unwrap().digest()),
+                )
+            })
+            .collect();
+        let (batch, _) = batch_case();
+        got.push((
+            String::from("batch"),
+            hex(batch_shape(&batch).unwrap().digest()),
+        ));
+        let want: Vec<(String, String)> = PINNED_SHAPE_DIGESTS
+            .iter()
+            .map(|(name, digest)| (String::from(*name), String::from(*digest)))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    const PINNED_SHAPE_DIGESTS: &[(&str, &str)] = &[
+        (
+            "p2pkh/key",
+            "5dd41609885ad8ffdeb9e15393b0a34eb6f6f0b12189944b485b364208625511",
+        ),
+        (
+            "p2pkh-uncompressed/key",
+            "97ffead9d859dd7ff1391ca14b481f02626f55534581608c0badf5a14f6082db",
+        ),
+        (
+            "p2sh-p2wpkh/key",
+            "91e5a1b2bb9125c3ccf8a42d3f7f2c52e368df6780051cf7493ac2740f81b6c7",
+        ),
+        (
+            "ethereum/key",
+            "529ca2d4f9d6f069872486e1e308d245722018f237e0d75889c809670f4d1a46",
+        ),
+        (
+            "taproot/key",
+            "63b3b676596cf98112a2bc66c44a96e8d6425c8b9031b3c06f2bf846d2716c60",
+        ),
+        (
+            "taproot-tree/key",
+            "e448f5fb7def865ec357b7a8a416ebec04d59d832736a53d5121e4460dd9b9c4",
+        ),
+        (
+            "ed25519/seed",
+            "4f5de0450a9ab81e18978c8ec1cc3a0d95f8c6438c8bd59cc77c131666ad7999",
+        ),
+        (
+            "ed25519/slip10",
+            "c8e1a06e475f93f6039a815fe2bf784750acd526e2acb89e6bb06ad30fa63ce8",
+        ),
+        (
+            "ed25519/slip10-hidden",
+            "37662cb73c273e7195199e178eebe09ef4e82e343fcce3f72db8fa193302a509",
+        ),
+        (
+            "ed25519/bip32-ed25519",
+            "beec6217f6c3838fb5acd8c846fc65612034afe95ec79f94a7f5713ae42b7b4f",
+        ),
+        (
+            "p2pkh/bip32-seed",
+            "970f9c66748912295193fea0dc9f473e8b557bf09f682801fab12dc4ecf42da3",
+        ),
+        (
+            "ethereum/bip32-seed",
+            "2901bd0c85fe4a657abe795c7081fcd2e1c8b0636ddbab5b3b46e1289fc05cea",
+        ),
+        (
+            "taproot/bip32-xprv",
+            "726ec637dbb842871fc05d394195d33f0efb60d8706103faed0e17e8ae361e3a",
+        ),
+        (
+            "p2pkh/bip32-hidden",
+            "8a329751b001549eedf2c0a0b9b78f0003b3ed4a20d9059d76889a1e75fe3cab",
+        ),
+        (
+            "bls-withdrawal/key",
+            "2aea5380fa764cdf978bac6747d96dc72629e0cd199705eacf05798050835926",
+        ),
+        (
+            "batch",
+            "1e2db1f76e594dcb42f816a35dc485c1d93c988a098dbe21b61173039d33e8d4",
+        ),
+    ];
+
     #[test]
     fn batch_chunks_make_the_claims_of_the_whole() {
         let witness = OwnershipWitness::seed(&seed(32));
@@ -3984,6 +4242,12 @@ mod tests {
         let proof = prove();
         let prove_s = t.elapsed().as_secs_f64();
         let bytes = proof.to_bytes();
+        // A second proof of the same relation: its shape is kept, unless it is too large.
+        let again = std::env::var("HEM_MEASURE_AGAIN").is_ok().then(|| {
+            let t = std::time::Instant::now();
+            assert_eq!(prove().to_bytes(), bytes);
+            std::format!(" prove_again_s={:.2}", t.elapsed().as_secs_f64())
+        });
         // The first verification also builds and caches the shape.
         let t = std::time::Instant::now();
         assert!(verify(&bytes));
@@ -3997,8 +4261,9 @@ mod tests {
             .collect();
         warm.sort_by(f64::total_cmp);
         println!(
-            "{head} prove_s={prove_s:.2} verify_cold_s={verify_cold_s:.2} verify_warm_ms={:.1} \
+            "{head} prove_s={prove_s:.2}{} verify_cold_s={verify_cold_s:.2} verify_warm_ms={:.1} \
              proof_bytes={} proof_kib={:.1} stages=[{}] early_stop_vars={} peak_rss_mib={}",
+            again.unwrap_or_default(),
             warm[1] * 1e3,
             bytes.len(),
             bytes.len() as f64 / 1024.0,
@@ -4011,7 +4276,7 @@ mod tests {
     /// `cargo test --release -p dregg-sig-migrate --features std --lib -- --ignored --nocapture
     /// --test-threads 1 hem::relations::tests::measure_ownership_proofs`. `HEM_MEASURE_ONLY`
     /// filters by name; `HEM_MEASURE_ROWS_ONLY` skips proving; `HEM_MEASURE_BATCH` lists
-    /// batch sizes (default `1,10`).
+    /// batch sizes (default `1,10`); `HEM_MEASURE_AGAIN` times a second proof.
     #[test]
     #[ignore = "measurement"]
     fn measure_ownership_proofs() {
