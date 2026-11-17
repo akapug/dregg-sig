@@ -1,9 +1,26 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![allow(clippy::chunks_exact_to_as_chunks)]
-//! Post-Quantum Threshold Credentials, 2-Round Verifiable Lattice OPRF (`PiVoprf`),
-//! Blind Threshold Verifiable Credentials + Unlinkable Selective Disclosure (`PiBlindVc`),
-//! and Dealerless Standard-Verifier `FIPS 204` Threshold `ML-DSA` (`ThresholdMlDsa`).
+//! Threshold cryptographic building blocks and accumulator-based credentials.
+//!
+//! [`voprf`] evaluates a custom symmetric Poseidon2/cSHAKE PRF using actively
+//! checked replicated sharing (five online servers, privacy against one corrupt
+//! server). [`voprf_spdz`] evaluates the same function with Shamir/SPDZ shares.
+//! Neither is a lattice OPRF or a publicly transferable proof of PRF evaluation:
+//! verifiability relies on authenticated server responses and the enrolled key
+//! record. The SPDZ API handles all online states together; its authenticated
+//! network deployment is not implemented here.
+//!
+//! [`blind_vc`] enrolls issuer-approved attribute commitments in an issuer-managed
+//! Merkle accumulator. Issuance discloses the attributes and commitment to the
+//! issuer while hiding the holder blind. Presentations prove selective disclosure
+//! and membership against an issuer-signed root, which verifiers must authenticate
+//! and apply an epoch policy to. There is no independent publicly verifiable
+//! signature on each credential. Fresh presentation entropy avoids an intentional
+//! stable pseudonym; attributes and application metadata may still link holders.
+//!
+//! The crate also implements standard-verifier FIPS 204 ML-DSA and dealerless
+//! threshold ML-DSA. These are separate from the symmetric OPRF construction.
 extern crate alloc;
 #[cfg(any(test, feature = "std"))]
 extern crate std;

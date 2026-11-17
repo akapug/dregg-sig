@@ -3256,6 +3256,8 @@ fn e2e_policy_biscuit_anchored_mint_attenuate_step_retirement_seal_and_rollback(
     let tok1 = dir.path("b1.json");
     let step1 = dir.path("step1.sk");
     let sealed = dir.path("sealed.json");
+    let seal_store = dir.path("seal-ledger");
+    let intent_digest = &"56".repeat(32);
     let audience = &"12".repeat(32);
     let resource = &"34".repeat(32);
 
@@ -3357,6 +3359,8 @@ fn e2e_policy_biscuit_anchored_mint_attenuate_step_retirement_seal_and_rollback(
             "--step-key",
             &step1,
             "--bind-request",
+            "--intent-digest-hex",
+            intent_digest,
             "--audience-hex",
             audience,
             "--resource-hex",
@@ -3377,34 +3381,44 @@ fn e2e_policy_biscuit_anchored_mint_attenuate_step_retirement_seal_and_rollback(
             .unwrap()
             .contains("\"retired\": true")
     );
-    expect(
-        &[
-            "policy",
-            "biscuit",
-            "verify",
-            "--public",
-            &auth_pk,
-            "--in",
-            &sealed,
-            "--audience-hex",
-            audience,
-            "--resource-hex",
-            resource,
-            "--actions",
-            "3",
-            "--amount",
-            "50000000000000000000",
-            "--now",
-            "1700000000",
-        ],
-        0,
-    );
+    let verify_args = [
+        "policy",
+        "biscuit",
+        "verify",
+        "--intent-digest-hex",
+        intent_digest,
+        "--seal-store",
+        &seal_store,
+        "--public",
+        &auth_pk,
+        "--in",
+        &sealed,
+        "--audience-hex",
+        audience,
+        "--resource-hex",
+        resource,
+        "--actions",
+        "3",
+        "--amount",
+        "50000000000000000000",
+        "--now",
+        "1700000000",
+    ];
+    let mut first_verify = verify_args.to_vec();
+    first_verify.push("--create-seal-store");
+    expect(&first_verify, 0);
+    // A new CLI process reopening the same ledger must refuse the same seal.
+    expect(&verify_args, 3);
     // Request mismatch (different amount than bound request) fails verification!
     expect(
         &[
             "policy",
             "biscuit",
             "verify",
+            "--intent-digest-hex",
+            intent_digest,
+            "--seal-store",
+            &seal_store,
             "--public",
             &auth_pk,
             "--in",
