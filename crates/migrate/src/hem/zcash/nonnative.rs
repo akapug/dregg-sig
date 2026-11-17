@@ -314,6 +314,11 @@ impl Num {
             .collect())
     }
 
+    /// The coefficient forms, least significant first.
+    pub fn limb_forms(&self) -> Vec<Lc> {
+        self.0.iter().map(|c| c.lc.clone()).collect()
+    }
+
     fn is_constant(&self) -> bool {
         self.0.iter().all(|c| c.lo == c.hi && is_const(&c.lc))
     }

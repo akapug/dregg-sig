@@ -498,6 +498,30 @@ impl Point {
         Some((self.x * zi, self.y * zi))
     }
 
+    /// Affine coordinates of many points with one inversion; `None` for the identity.
+    /// Public points only.
+    pub fn batch_to_affine(points: &[Point]) -> alloc::vec::Vec<Option<(Fp, Fp)>> {
+        let mut prefix = alloc::vec::Vec::with_capacity(points.len());
+        let mut acc = Fp::ONE;
+        for p in points {
+            prefix.push(acc);
+            if !p.z.is_zero() {
+                acc = acc * p.z;
+            }
+        }
+        let mut inv = acc.invert();
+        let mut out = alloc::vec![None; points.len()];
+        for (i, p) in points.iter().enumerate().rev() {
+            if p.z.is_zero() {
+                continue;
+            }
+            let zi = inv * prefix[i];
+            inv = inv * p.z;
+            out[i] = Some((p.x * zi, p.y * zi));
+        }
+        out
+    }
+
     /// `Extract_P`: the affine `x` coordinate, or zero for the identity.
     pub fn extract(&self) -> Fp {
         self.to_affine().map_or(Fp::ZERO, |(x, _)| x)
@@ -773,5 +797,11 @@ mod tests {
         sign_only[31] = 0x80;
         assert!(Point::from_bytes(&sign_only).is_none());
         assert!(Point::from_bytes(&BASE_MODULUS_LE).is_none());
+        // Batch conversion agrees with the single one, identity included.
+        let pts = [g, Point::IDENTITY, two, g.mul(&Fq::from_u64(77))];
+        let batch = Point::batch_to_affine(&pts);
+        for (p, a) in pts.iter().zip(&batch) {
+            assert_eq!(p.to_affine(), *a);
+        }
     }
 }
