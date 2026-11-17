@@ -2,25 +2,27 @@
 #![no_main]
 
 //! Coverage-guided hostile wire-decoder & canonical roundtrip fuzzer across
-//! `dregg-sig-core` (FIPS 205 `SLH-DSA` keys/signatures/SPKI/ADRS for all six SHAKE parameter
-//! sets) and `dregg-sig-fts` (`FrontierSumFts` signatures & `RotatedEpochVote` in both profiles,
+//! `qsag-core` (FIPS 205 `SLH-DSA` keys/signatures/SPKI/ADRS for all six SHAKE parameter
+//! sets) and `qsag-fts` (`FrontierSumFts` signatures & `RotatedEpochVote` in both profiles,
 //! and the threshold `ParallelSeededSignature`).
 //!
 //! Every fixture is built in `LLVMFuzzerInitialize` (the `init:` block), before libFuzzer
 //! arms its per-input watchdog.
 
-use dregg_sig_accel::CpuReferenceBackend;
-use dregg_sig_core::fips205::{Fips205Params, SlhPublicKey, decode_slh_sig, slh_verify};
-use dregg_sig_core::tsw_baggy::decode_adrs;
-use dregg_sig_fts::parallel_mpc::{
+use libfuzzer_sys::fuzz_target;
+use qsag_accel::CpuReferenceBackend;
+use qsag_core::fips205::{
+    Fips205Params, SlhPublicKey, decode_slh_sig, slh_verify,
+};
+use qsag_core::tsw_baggy::decode_adrs;
+use qsag_fts::parallel_mpc::{
     LeafBurnPersistence, ParallelSeededError, ParallelSeededParams, ParallelSeededPublicKey,
     ParallelSeededSignature, ParallelSeededThresholdSetup, verify_parallel_seeded_fts,
 };
-use dregg_sig_fts::{
+use qsag_fts::{
     FrontierDpTable, FrontierFtsProfile, FrontierFtsPublicKey, FrontierFtsSignature,
     RotatedEpochVote, verify_frontier_fts,
 };
-use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
 /// The custody chain geometry on a two-leaf tree: the smallest tree whose codeword space
@@ -77,13 +79,7 @@ fn fixtures() -> &'static Fixtures {
         )
         .expect("two-party parallel-seeded setup");
         let sig = setup
-            .threshold_sign(
-                0,
-                SEEDED_MSG,
-                [0x73; 32],
-                &mut OneUseBurnLog::default(),
-                &accel,
-            )
+            .threshold_sign(0, SEEDED_MSG, [0x73; 32], &mut OneUseBurnLog::default(), &accel)
             .expect("threshold signature on leaf 0");
         verify_parallel_seeded_fts(&setup.pk, SEEDED_MSG, &sig, &accel)
             .expect("seed signature verifies");
@@ -111,7 +107,7 @@ fuzz_target!(init: {
 }, |data: &[u8]| {
     let fx = fixtures();
 
-    // 1. `dregg-sig-core`: FIPS 205 SLH-DSA public keys, SPKI DER, ADRS, and signature verification
+    // 1. `qsag-core`: FIPS 205 SLH-DSA public keys, SPKI DER, ADRS, and signature verification
     if let Ok(arr32) = <[u8; 32]>::try_from(data) {
         let _ = decode_adrs(&arr32);
     }
@@ -139,7 +135,7 @@ fuzz_target!(init: {
         let _ = slh_verify(&params, b"fuzz-slh-msg", data, b"ctx", &dummy_pk);
     }
 
-    // 2. `dregg-sig-fts`: FrontierSumFts signatures and `RotatedEpochVote`, decoded, re-encoded
+    // 2. `qsag-fts`: FrontierSumFts signatures and `RotatedEpochVote`, decoded, re-encoded
     //    and verified in both profiles.
     for (profile, dp) in [
         (FrontierFtsProfile::Compact1122, &fx.dp_compact),
@@ -166,7 +162,7 @@ fuzz_target!(init: {
         }
     }
 
-    // 3. `dregg-sig-fts`: threshold `ParallelSeededSignature` strict decoder, canonical
+    // 3. `qsag-fts`: threshold `ParallelSeededSignature` strict decoder, canonical
     //    re-encoding and verification under a real public key, in two geometries.
     let accel = CpuReferenceBackend::new();
     for pk in [&fx.seeded_pk, &fx.custody_pk] {

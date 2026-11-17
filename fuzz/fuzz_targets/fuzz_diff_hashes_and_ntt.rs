@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![no_main]
 
-//! Coverage-guided differential fuzzer cross-checking `dregg-sig-asm`, `dregg-sig-accel`, `dregg-sig-core`,
-//! and `dregg-sig-agg` hardware/SIMD kernels (`AVX-512` 8-way Keccak, `SHA-NI` SHA-256, `GFNI`
+//! Coverage-guided differential fuzzer cross-checking `qsag-asm`, `qsag-accel`, `qsag-core`,
+//! and `qsag-agg` hardware/SIMD kernels (`AVX-512` 8-way Keccak, `SHA-NI` SHA-256, `GFNI`
 //! `GF(2^8)`, `VPCLMULQDQ` `GF(2^128)`, `AVX-512` Seiler `ML-DSA` NTT, and `BMI2/ADX`
 //! `Goldilocks`) against independent references on arbitrary fuzzer-synthesized inputs and
 //! slice alignments.
@@ -14,23 +14,23 @@
 //! quadratic and quartic extensions, written as `F_p[u]/(u^2 - 7)` and `F_p[v]/(v^4 - 7)`.
 
 use arbitrary::Arbitrary;
-use dregg_sig_accel::goldilocks as accel_gl;
-use dregg_sig_accel::keccak::{cshake256_framed_xof, keccak256, sha3_256, shake256_xof};
-use dregg_sig_accel::sha2::sha256;
-use dregg_sig_agg::field::GoldilocksExt4;
-use dregg_sig_asm::{
+use ghash::universal_hash::{KeyInit, UniversalHash};
+use libfuzzer_sys::fuzz_target;
+use p3_field::{AbstractField, Field as P3Field, PrimeField64};
+use p3_goldilocks::Goldilocks as P3Goldilocks;
+use qsag_accel::goldilocks as accel_gl;
+use qsag_accel::keccak::{cshake256_framed_xof, keccak256, sha3_256, shake256_xof};
+use qsag_accel::sha2::sha256;
+use qsag_agg::field::GoldilocksExt4;
+use qsag_asm::{
     SimdBackend, detect_backend, gf2_128_dot_with_backend, gf256_shamir_mac_with_backend,
     goldilocks_add_ct, goldilocks_dot2_ct, goldilocks_mul_ct, goldilocks_mul_ct_with_backend,
     goldilocks_pow7_ct, goldilocks_pow7_ct_with_backend, goldilocks_sub_ct, keccak_f1600_batch,
     mldsa_inv_ntt_with_backend, mldsa_ntt_with_backend, mldsa_pointwise_mul_with_backend,
     sha256_compress_blocks,
 };
-use dregg_sig_core::field::goldilocks::{Goldilocks as CoreGl, GoldilocksExt2};
-use dregg_sig_core::field::tower::TowerGf256;
-use ghash::universal_hash::{KeyInit, UniversalHash};
-use libfuzzer_sys::fuzz_target;
-use p3_field::{AbstractField, Field as P3Field, PrimeField64};
-use p3_goldilocks::Goldilocks as P3Goldilocks;
+use qsag_core::field::goldilocks::{Goldilocks as CoreGl, GoldilocksExt2};
+use qsag_core::field::tower::TowerGf256;
 use sha2::Digest as _;
 use tiny_keccak::{CShake, Hasher as _, Shake as TinyShake, Xof as _};
 
@@ -217,10 +217,7 @@ fn ext4_powers(x: GoldilocksExt4) -> [u64; 4] {
 }
 
 fn ext2_of(l: [u64; 2]) -> GoldilocksExt2 {
-    GoldilocksExt2::new(
-        CoreGl::from_u64_reduced(l[0]),
-        CoreGl::from_u64_reduced(l[1]),
-    )
+    GoldilocksExt2::new(CoreGl::from_u64_reduced(l[0]), CoreGl::from_u64_reduced(l[1]))
 }
 
 fn ext2_limbs(x: GoldilocksExt2) -> [u64; 2] {
@@ -240,7 +237,7 @@ fn check_goldilocks_base(a: u64, b: u64, backend: SimdBackend) {
     assert_eq!((pa * pb).as_canonical_u64(), prod);
     assert_eq!(pa.exp_u64(7).as_canonical_u64(), seventh);
 
-    // `dregg-sig-asm` kernels take the raw words.
+    // `qsag-asm` kernels take the raw words.
     assert_eq!(goldilocks_add_ct(a, b), sum, "asm add {a:#x} {b:#x}");
     assert_eq!(goldilocks_sub_ct(a, b), diff, "asm sub {a:#x} {b:#x}");
     assert_eq!(goldilocks_mul_ct(a, b), prod, "asm mul {a:#x} {b:#x}");
@@ -250,7 +247,7 @@ fn check_goldilocks_base(a: u64, b: u64, backend: SimdBackend) {
         assert_eq!(goldilocks_pow7_ct_with_backend(a, be), seventh, "{be:?}");
     }
 
-    // `dregg-sig-accel` scalar field, documented canonical for every `u64` input.
+    // `qsag-accel` scalar field, documented canonical for every `u64` input.
     assert_eq!(accel_gl::gl_reduce_u64(a), a % P);
     assert_eq!(accel_gl::gl_is_canonical(a), a < P);
     assert_eq!(accel_gl::gl_add(a, b), sum);
@@ -265,7 +262,7 @@ fn check_goldilocks_base(a: u64, b: u64, backend: SimdBackend) {
     assert!(accel_inv < P);
     assert_eq!(r_mul(a, accel_inv), u64::from(!a.is_multiple_of(P)));
 
-    // `dregg-sig-core` field element built from the raw word.
+    // `qsag-core` field element built from the raw word.
     let (qa, qb) = (CoreGl::from_u64_reduced(a), CoreGl::from_u64_reduced(b));
     assert_eq!(qa.to_canonical_u64(), a % P);
     assert_eq!(CoreGl::from_canonical(a).is_ok(), a < P);
@@ -277,14 +274,8 @@ fn check_goldilocks_base(a: u64, b: u64, backend: SimdBackend) {
     assert_eq!(qa.square().to_canonical_u64(), r_mul(a, a));
     assert_eq!(qa.mul_by_7().to_canonical_u64(), r_mul(7, a));
     let wide = (a as u128) << 64 | b as u128;
-    assert_eq!(
-        CoreGl::reduce128(wide).to_canonical_u64(),
-        (wide % P128) as u64
-    );
-    assert_eq!(
-        CoreGl::from_u128_reduced(wide).to_canonical_u64(),
-        (wide % P128) as u64
-    );
+    assert_eq!(CoreGl::reduce128(wide).to_canonical_u64(), (wide % P128) as u64);
+    assert_eq!(CoreGl::from_u128_reduced(wide).to_canonical_u64(), (wide % P128) as u64);
     let core_inv = qa.inv().to_canonical_u64();
     assert_eq!(r_mul(a, core_inv), u64::from(!a.is_multiple_of(P)));
     assert_eq!(
@@ -301,7 +292,7 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
         "asm dot2 {w:#x?} {x:#x?}"
     );
 
-    // Quadratic extension: `dregg-sig-core` type and `dregg-sig-accel` limb pairs.
+    // Quadratic extension: `qsag-core` type and `qsag-accel` limb pairs.
     let (a2, b2) = ([w[0], w[1]], [x[0], x[1]]);
     let (ra2, rb2) = (a2.map(|v| v % P), b2.map(|v| v % P));
     let (ea, eb) = (ext2_of(a2), ext2_of(b2));
@@ -328,7 +319,10 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
     assert_eq!(accel_gl::ext2_mul(a2, b2), prod2);
     assert_eq!(accel_gl::ext2_neg(a2), [r_sub(0, a2[0]), r_sub(0, a2[1])]);
     let accel_inv2 = accel_gl::ext2_inv_or_zero(a2);
-    assert_eq!(r_binomial_mul(ra2, accel_inv2), [u64::from(!is_zero2), 0]);
+    assert_eq!(
+        r_binomial_mul(ra2, accel_inv2),
+        [u64::from(!is_zero2), 0]
+    );
 
     // Quartic extension against the schoolbook product in `F_p[v]/(v^4 - 7)`.
     let (a4, b4) = (ext4_of(w), ext4_of(x));
@@ -337,14 +331,8 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
         tower_to_powers(x.map(|v| v % P)),
     );
     let prod4 = r_binomial_mul(pa4, pb4);
-    assert_eq!(
-        ext4_powers(a4 + b4),
-        core::array::from_fn(|i| r_add(pa4[i], pb4[i]))
-    );
-    assert_eq!(
-        ext4_powers(a4 - b4),
-        core::array::from_fn(|i| r_sub(pa4[i], pb4[i]))
-    );
+    assert_eq!(ext4_powers(a4 + b4), core::array::from_fn(|i| r_add(pa4[i], pb4[i])));
+    assert_eq!(ext4_powers(a4 - b4), core::array::from_fn(|i| r_sub(pa4[i], pb4[i])));
     assert_eq!(ext4_powers(-a4), pa4.map(|v| r_sub(0, v)));
     assert_eq!(ext4_powers(a4 * b4), prod4);
     assert_eq!(ext4_powers(a4.square()), r_binomial_mul(pa4, pa4));
@@ -365,10 +353,7 @@ fn check_goldilocks_extensions(w: [u64; 4], x: [u64; 4]) {
         [u64::from(!is_zero4), 0, 0, 0]
     );
     // Canonical 32-byte codec of the element.
-    assert_eq!(
-        GoldilocksExt4::from_le_bytes_canonical(a4.to_le_bytes()),
-        Some(a4)
-    );
+    assert_eq!(GoldilocksExt4::from_le_bytes_canonical(a4.to_le_bytes()), Some(a4));
 }
 
 /// `a * b` in `Z_q[X]/(X^256 + 1)`.
@@ -414,7 +399,7 @@ fuzz_target!(|input: DiffFuzzInput| {
         ];
         let mut st_port = st_hw;
         sha256_compress_blocks(&mut st_hw, blocks);
-        dregg_sig_asm::sha256_compress_blocks_portable(&mut st_port, blocks);
+        qsag_asm::sha256_compress_blocks_portable(&mut st_port, blocks);
         assert_eq!(st_hw, st_port);
     }
 
@@ -454,7 +439,7 @@ fuzz_target!(|input: DiffFuzzInput| {
     framed_u64.extend_from_slice(&(msg.len() as u64).to_le_bytes());
     framed_u64.extend_from_slice(msg);
     assert_eq!(
-        dregg_sig_core::sponge::keccak::cshake256_xof(out_len, custom, &framed_u64),
+        qsag_core::sponge::keccak::cshake256_xof(out_len, custom, &framed_u64),
         q_cshake
     );
     // Every customization length, including 129 and 265, against SP 800-185 assembled here.
@@ -466,10 +451,7 @@ fuzz_target!(|input: DiffFuzzInput| {
     let mut states = vec![[0u64; 25]; batch_n];
     for (idx, st) in states.iter_mut().enumerate() {
         for (lane, w) in st.iter_mut().enumerate() {
-            let b = msg
-                .get((idx * 25 + lane) % msg.len().max(1))
-                .copied()
-                .unwrap_or(0);
+            let b = msg.get((idx * 25 + lane) % msg.len().max(1)).copied().unwrap_or(0);
             *w = (b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((idx * 31 + lane) as u64);
         }
     }

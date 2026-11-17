@@ -3,63 +3,63 @@
 version = 4
 
 [[package]]
-name = "dregg-sig-accel"
+name = "qsag-accel"
 version = "0.1.0"
 dependencies = [
- "dregg-sig-asm",
+ "qsag-asm",
 ]
 
 [[package]]
-name = "dregg-sig-agg"
+name = "qsag-agg"
 version = "0.1.0"
 dependencies = [
- "dregg-sig-accel",
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-fts",
- "dregg-sig-quorum",
- "dregg-sig-whir-verified",
+ "qsag-accel",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-fts",
+ "qsag-quorum",
+ "qsag-whir-verified",
 ]
 
 [[package]]
-name = "dregg-sig-asm"
+name = "qsag-asm"
 version = "0.1.0"
 
 [[package]]
-name = "dregg-sig-core"
+name = "qsag-core"
 version = "0.1.0"
 dependencies = [
- "dregg-sig-accel",
- "dregg-sig-asm",
- "dregg-sig-verified",
+ "qsag-accel",
+ "qsag-asm",
+ "qsag-verified",
 ]
 
 [[package]]
-name = "dregg-sig-fts"
+name = "qsag-fts"
 version = "0.1.0"
 dependencies = [
- "dregg-sig-accel",
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-verified",
+ "qsag-accel",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-verified",
 ]
 
 [[package]]
-name = "dregg-sig-quorum"
+name = "qsag-quorum"
 version = "0.1.0"
 dependencies = [
- "dregg-sig-accel",
- "dregg-sig-agg",
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-fts",
- "dregg-sig-verified",
+ "qsag-accel",
+ "qsag-agg",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-fts",
+ "qsag-verified",
 ]
 
 [[package]]
-name = "dregg-sig-verified"
+name = "qsag-verified"
 version = "0.1.0"
 
 [[package]]
-name = "dregg-sig-whir-verified"
+name = "qsag-whir-verified"
 version = "0.1.0"

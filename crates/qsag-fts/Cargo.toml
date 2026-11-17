@@ -1,0 +1,28 @@
+[package]
+name = "qsag-fts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Post-quantum compact few-time hash signatures: constant-time bijective FrontierSumFts (Compact1122 1,122 B / Full256Bit 2,338 B profiles) and experimental height-independent 48-round bijective x^7 SPN MPC ParallelSeededFts."
+
+[features]
+test-dealer = []
+testing-ephemeral = ["qsag-core/testing-ephemeral"]
+test-params = []
+default = ["alloc"]
+alloc = ["qsag-accel/alloc"]
+std = ["qsag-core/std", "qsag-asm/std", "alloc", "qsag-accel/std"]
+
+[dependencies]
+qsag-asm = { path = "../qsag-asm", default-features = false, features = ["alloc"] }
+qsag-verified = { path = "../qsag-verified", default-features = false }
+qsag-core = { path = "../qsag-core", default-features = false }
+qsag-accel = { path = "../qsag-accel", default-features = false }
+
+[dev-dependencies]
+qsag-core = { path = "../qsag-core", features = ["testing-ephemeral"] }
+
+[[example]]
+name = "dealerless_bench"
+required-features = ["std"]

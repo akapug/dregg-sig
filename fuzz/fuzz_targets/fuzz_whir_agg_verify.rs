@@ -3,7 +3,7 @@
 
 //! Coverage-guided hostile wire-decoder, canonical roundtrip, and adversarial verifier fuzzer
 //! across the `zk-Hem`, recursive shard/WHIR merge, `Corduroy-Poseidon2`, and height-20
-//! `Jorts-Poseidon2` wire codecs in `dregg-sig-agg`:
+//! `Jorts-Poseidon2` wire codecs in `qsag-agg`:
 //!
 //! 1. `zk_hem::protocol::ZkHemProof::from_bytes` + `protocol::verify`
 //! 2. `zk_hem::protocol::PublicHemProof::from_bytes` + `protocol::verify_public`
@@ -25,23 +25,23 @@
 
 use std::sync::OnceLock;
 
-use dregg_sig_agg::field::{Goldilocks, GoldilocksExt4};
-use dregg_sig_agg::pcs::WhirSecurityRegime;
-use dregg_sig_agg::zk_hem::full_shard::{
+use libfuzzer_sys::fuzz_target;
+use qsag_agg::field::{Goldilocks, GoldilocksExt4};
+use qsag_agg::pcs::WhirSecurityRegime;
+use qsag_agg::zk_hem::full_shard::{
     FullShardParams, RECURSIVE_SHARD_WIRE_MAGIC, RecursiveShardProof, RecursiveShardStatement,
     verify_recursive_shard,
 };
-use dregg_sig_agg::zk_hem::protocol::{self, PublicHemProof, ZkHemProof};
-use dregg_sig_agg::zk_hem::recursive_whir::{
+use qsag_agg::zk_hem::protocol::{self, PublicHemProof, ZkHemProof};
+use qsag_agg::zk_hem::recursive_whir::{
     ChildWhirMergeRelation, ChildWhirStatement, FixedPathWhirParams, FixedPathWhirProof,
     SuccinctChildWhirMerge, verify_fixed_path, verify_succinct_children_whir_merge,
 };
-use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape, sponge12};
-use dregg_sig_agg::{
+use qsag_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape, sponge12};
+use qsag_agg::{
     AggSigProfile, SignerBitmap, ValidatorPublicKey, ValidatorSignature,
     verify_individual_signature,
 };
-use libfuzzer_sys::fuzz_target;
 
 struct FuzzFixtures {
     generic_shape: Shape,

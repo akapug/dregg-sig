@@ -91,81 +91,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "dregg-sig-accel"
-version = "0.1.0"
-dependencies = [
- "dregg-sig-asm",
-]
-
-[[package]]
-name = "dregg-sig-agg"
-version = "0.1.0"
-dependencies = [
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-whir-verified",
-]
-
-[[package]]
-name = "dregg-sig-asm"
-version = "0.1.0"
-
-[[package]]
-name = "dregg-sig-core"
-version = "0.1.0"
-dependencies = [
- "dregg-sig-accel",
- "dregg-sig-asm",
- "dregg-sig-verified",
-]
-
-[[package]]
-name = "dregg-sig-fts"
-version = "0.1.0"
-dependencies = [
- "dregg-sig-accel",
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-verified",
-]
-
-[[package]]
 name = "dregg-sig-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
- "dregg-sig-accel",
- "dregg-sig-agg",
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-fts",
- "dregg-sig-quorum",
  "ghash",
  "libfuzzer-sys",
  "p3-field",
  "p3-goldilocks",
+ "qsag-accel",
+ "qsag-agg",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-fts",
+ "qsag-quorum",
  "sha2",
  "sha3",
  "tiny-keccak",
 ]
-
-[[package]]
-name = "dregg-sig-quorum"
-version = "0.1.0"
-dependencies = [
- "dregg-sig-asm",
- "dregg-sig-core",
- "dregg-sig-fts",
- "dregg-sig-verified",
-]
-
-[[package]]
-name = "dregg-sig-verified"
-version = "0.1.0"
-
-[[package]]
-name = "dregg-sig-whir-verified"
-version = "0.1.0"
 
 [[package]]
 name = "either"
@@ -485,6 +428,63 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qsag-accel"
+version = "0.1.0"
+dependencies = [
+ "qsag-asm",
+]
+
+[[package]]
+name = "qsag-agg"
+version = "0.1.0"
+dependencies = [
+ "qsag-asm",
+ "qsag-core",
+ "qsag-whir-verified",
+]
+
+[[package]]
+name = "qsag-asm"
+version = "0.1.0"
+
+[[package]]
+name = "qsag-core"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-asm",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-fts"
+version = "0.1.0"
+dependencies = [
+ "qsag-accel",
+ "qsag-asm",
+ "qsag-core",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-quorum"
+version = "0.1.0"
+dependencies = [
+ "qsag-asm",
+ "qsag-core",
+ "qsag-fts",
+ "qsag-verified",
+]
+
+[[package]]
+name = "qsag-verified"
+version = "0.1.0"
+
+[[package]]
+name = "qsag-whir-verified"
+version = "0.1.0"
 
 [[package]]
 name = "quote"

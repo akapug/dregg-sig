@@ -15,14 +15,14 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.3", features = ["derive"] }
 
-dregg-sig-core = { path = "../crates/core", features = ["std"] }
-dregg-sig-asm = { path = "../crates/asm", features = ["std"] }
-dregg-sig-agg = { path = "../crates/agg", features = ["std"] }
-dregg-sig-accel = { path = "../crates/accel", features = ["std"] }
+qsag-core = { path = "../crates/qsag-core", features = ["std"] }
+qsag-asm = { path = "../crates/qsag-asm", features = ["std"] }
+qsag-agg = { path = "../crates/qsag-agg", features = ["std"] }
+qsag-accel = { path = "../crates/qsag-accel", features = ["std"] }
 # `test-dealer` exposes the trusted-dealer setup that produces the real threshold
 # signature `fuzz_fips205_and_fts_decode` mutates.
-dregg-sig-fts = { path = "../crates/fts", features = ["std", "test-dealer"] }
-dregg-sig-quorum = { path = "../crates/quorum", features = ["std"] }
+qsag-fts = { path = "../crates/qsag-fts", features = ["std", "test-dealer"] }
+qsag-quorum = { path = "../crates/qsag-quorum", features = ["std"] }
 
 # Independent reference implementations for differential fuzzing.
 sha3 = "0.10"
