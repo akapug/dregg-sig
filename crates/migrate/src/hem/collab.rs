@@ -1463,6 +1463,7 @@ mod tests {
         // The prover's coins, as `protocol::prove` derives them.
         let mut coin_input = seed.to_vec();
         coin_input.extend_from_slice(&shape.digest());
+        coin_input.extend_from_slice(&layout.schedule.to_bytes());
         coin_input.extend_from_slice(&cshake256_32(b"QSAG.ZKHEM.COINS.STMT/v1", statement));
         let witness_bytes: Vec<u8> = assignment.iter().flat_map(|v| v.to_le_bytes()).collect();
         coin_input.extend_from_slice(&cshake256_32(b"QSAG.ZKHEM.COINS.WIT/v1", &witness_bytes));

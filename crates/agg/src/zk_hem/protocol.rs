@@ -1,6 +1,6 @@
 //! Committed-mask zk-Hem for a [`Shape`] over the Hem WHIR commitment.
-//! Intended for witness privacy; the composed simulator and concrete security bounds
-//! remain unestablished. See [`prove`] for the precise limitations.
+//! The security statement, with its hypotheses and numbers, is `crates/agg/SECURITY.md`;
+//! [`super::bounds`] computes the numbers. See [`prove`] for a summary.
 //!
 //! One batch commitment holds five base-field tables of `2^l` cells: the masked assignment
 //! table `Z` and four uniform companion tables `C_0..C_3`. `Z` is laid out as
@@ -39,9 +39,8 @@
 //!    symbols are uniform (`opened_symbols_perfectly_simulated`). Unopened Stage-0 leaves
 //!    are salted.
 //!
-//! The uniformity statements above describe the masking ingredients under ideal independent
-//! sampling, not a simulator for this complete seeded transcript. What this file does not
-//! establish is listed on [`prove`].
+//! The simulator that composes these statements is Theorem 4 of `crates/agg/SECURITY.md`;
+//! step 6 is its Lemma 4.1 (top hypercube cells blind exactly as many codeword symbols).
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -136,8 +135,8 @@ impl Layout {
     }
 }
 
-/// The committed-mask zk-Hem wire format. The protocol name does not certify zero knowledge
-/// or a concrete knowledge-soundness bound; see the limitations on [`prove`].
+/// The committed-mask zk-Hem wire format. What it does and does not guarantee is summarised
+/// on [`prove`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkHemProof {
     pub commitment: CanopyCommitment,
@@ -1101,20 +1100,22 @@ fn column_table(shape: &Shape, eq_rx: &[E], combine: &[E], cells: usize) -> Vec<
 /// its masking variables are overwritten here. `seed` must be uniform and secret: it
 /// determines the masks, the companions, the blinders and the leaf salts.
 ///
-/// Not established by this implementation:
-/// * a mechanized proof of the composed simulator for this exact layout. The ingredients
-///   are the theorems of `ZkHemSoundnessAndPrivacy.lean` named in the module comment; their
-///   composition over the cell layout is argued in comments only: the row masks do not
-///   enter the row summand, the column masks and blinders lie outside the variable subcube
-///   the column sumcheck runs over, the masking rows have determinant `k1 k2 k3`, and the
-///   blinders are sampled last, conditioned on everything else;
-/// * hiding of unopened Stage-0 leaves beyond the salted-leaf coupling of that file (no
-///   bound on the bad event is mechanized there);
-/// * the batching step uses scalar weights `beta^j`. Its proximity loss is the standard one
-///   for random linear combinations and is not re-derived for the regime's query schedule,
-///   which was accounted for the affine cascade of the non-hiding opening;
-/// * knowledge soundness of the composition (masked sumchecks, linear batching, companion
-///   challenge, WHIR) has no concrete bound stated or proved here.
+/// Security (`crates/agg/SECURITY.md`; numbers from [`super::bounds::security_report`]):
+/// * zero knowledge: the interactive oracle proof is perfectly honest-verifier zero
+///   knowledge (Theorem 4). The proof string adds the hiding of unopened salted Stage-0
+///   leaves: distance at most `t P / 2^128` for `t` classical hash queries over `P` proofs,
+///   `2 t sqrt(P / 2^128)` for quantum queries;
+/// * the blend with scalar weights `beta^j` has mutual correlated agreement up to the
+///   Johnson radius with error growing as the square of the domain size; it is the weakest
+///   round, `2^-184` to `2^-199` (section 3);
+/// * knowledge soundness: 127 bits in the classical random-oracle model and 81 bits in the
+///   quantum one, both set by the 256-bit digests (Theorems 2 and 3). No regime gives a
+///   128-bit quantum level;
+/// * the argument is on paper, not mechanized: the Lean theorems named in the module
+///   comment cover the masking ingredients only.
+///
+/// A `seed` must not be reused for the same relation, statement and witness under a
+/// different transcript; the coins below bind everything that enters the transcript.
 pub fn prove(
     shape: &Shape,
     assignment: Vec<F>,
@@ -1155,10 +1156,13 @@ fn prove_with_claimed_publics(
         dregg_sig_asm::volatile_fill(&mut assignment, F::ZERO);
         return Err(ZkHemError::Unsatisfied);
     }
-    // Coins are bound to the relation, the statement and the witness, so a repeated `seed`
-    // does not repeat masks across different proofs.
+    // Coins are bound to the relation, the regime's schedule, the statement and the witness,
+    // so a repeated `seed` does not repeat masks across different proofs. The schedule
+    // matters: it enters the transcript, so two regimes give two transcripts, and equal masks
+    // under different challenges cancel (`bounds::tests::coins_do_not_repeat_across_regimes`).
     let mut coin_input = seed.to_vec();
     coin_input.extend_from_slice(&shape.digest());
+    coin_input.extend_from_slice(&layout.schedule.to_bytes());
     coin_input.extend_from_slice(&cshake256_32(b"QSAG.ZKHEM.COINS.STMT/v1", statement));
     let mut witness_bytes: Vec<u8> = assignment.iter().flat_map(|v| v.to_le_bytes()).collect();
     coin_input.extend_from_slice(&cshake256_32(b"QSAG.ZKHEM.COINS.WIT/v1", &witness_bytes));

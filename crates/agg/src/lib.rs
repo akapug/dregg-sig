@@ -49,9 +49,8 @@
 //! # Committed-mask relations
 //!
 //! [`zk_hem::protocol`] implements committed masking for S-box and multiplication-row
-//! relations ([`zk_hem::relation`]). It is intended for witness privacy, but its composed
-//! simulator, unopened-leaf hiding bound, batching proximity loss and concrete knowledge-
-//! soundness bound remain unestablished; see [`zk_hem::protocol::prove`]. Sumcheck masks
+//! relations ([`zk_hem::relation`]). Its zero-knowledge and knowledge-soundness statements
+//! and their bounds are in `crates/agg/SECURITY.md` and [`zk_hem::bounds`]. Sumcheck masks
 //! and companion words are committed with the witness, and WHIR opens their blend.
 //! Full-shard merges and the blind-credential, multisig and capability relations use this
 //! path. The ordinary shard batches and the public hologram recursion paths are non-hiding.

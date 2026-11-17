@@ -1,10 +1,9 @@
 //! Batched presentation of issuer-enrolled bearer capabilities with `SortedRevocationTree`
 //! interval non-membership, as a committed-mask `zk-Hem` relation (`#![no_std]` + `alloc`).
 //!
-//! Witness privacy is an intended property of the masking protocol, not an established
-//! guarantee of this composition. The composed simulator, unopened-leaf hiding bound,
-//! batching proximity loss and concrete knowledge-soundness bound remain unresolved;
-//! see [`protocol::prove`]. The constraints below specify the relation being checked.
+//! Witness privacy and knowledge soundness are those of the masking protocol, summarised
+//! on [`protocol::prove`] and stated in `crates/agg/SECURITY.md`. A presentation reveals
+//! its public inputs and tags. The constraints below specify the relation being checked.
 //!
 //! # Capability model
 //!
@@ -814,7 +813,7 @@ pub struct CapabilityBatchStatement {
     pub request: CapabilityRequest,
     /// Deterministic per-context presentation nullifiers, ordered by witnessed `token_id`.
     /// Equal contexts for the same capability produce equal tags; unlinkability across
-    /// contexts is not established by the composed protocol (see [`protocol::prove`]).
+    /// contexts rests on the tag derivation, which `crates/agg/SECURITY.md` does not analyse.
     pub presentation_tags: Vec<Digest>,
 }
 
