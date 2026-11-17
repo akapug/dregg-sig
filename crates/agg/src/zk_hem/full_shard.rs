@@ -27,9 +27,8 @@
 //!
 //! Scope. Only `JortsPoseidon2` shards. The count is public; signer bits and child proofs
 //! are witnesses of the committed-mask path [`protocol::prove`]. This removes the public
-//! hologram's unmasked witness evaluation, but does not establish zero knowledge of the
-//! composition: the simulator, unopened-leaf bound, batching loss and concrete knowledge
-//! bound listed on [`protocol::prove`] remain outstanding. Parent verification scans the
+//! hologram's unmasked witness evaluation; the zero-knowledge and knowledge-soundness
+//! statements of that path are in `crates/agg/SECURITY.md`. Parent verification scans the
 //! relation matrices (linear time); a parent cannot be a child of another parent. The
 //! CDHZ25 profiles retain their bounded-query assumptions: 108-bit nominal Grover work
 //! for the PoW profile at `Q <= 2^38`, or 107 bits without PoW at `Q + 1 <= 2^40`.

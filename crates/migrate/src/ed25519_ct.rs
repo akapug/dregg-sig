@@ -525,25 +525,6 @@ const BASE_TABLE: [[[u64; 5]; 3]; 16] = [
     ],
 ];
 
-/// Canonical four-limb arithmetic adapter for the mixed-domain circuit.
-pub(crate) fn multiply_limbs(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
-    fn field(x: [u64; 4]) -> Field {
-        Field(core::array::from_fn(|i| {
-            let offset = i * 51;
-            let limb = offset / 64;
-            let shift = offset % 64;
-            let low = x[limb] >> shift;
-            let high = if shift != 0 && limb + 1 < 4 {
-                x[limb + 1] << (64 - shift)
-            } else {
-                0
-            };
-            (low | high) & MASK
-        }))
-    }
-    field(a).mul(&field(b)).limbs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
