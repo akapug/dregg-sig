@@ -198,6 +198,7 @@ pub mod engine;
 pub mod net;
 pub mod prep;
 pub mod prover;
+pub mod witgen;
 
 use dregg_sig_agg::pcs::WhirSecurityRegime;
 use dregg_sig_agg::zk_hem::protocol::{ZkHemSplitProof, verify_split};
