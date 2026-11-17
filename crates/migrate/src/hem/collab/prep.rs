@@ -108,7 +108,8 @@
 //! papers. Papers, in `/Users/ember/paperbin/`: **MASCOT**,
 //! `2016-keller-orsini-scholl-mascot-2016-505`; **KOS**,
 //! `2015-keller-orsini-scholl-actively-secure-ot-extension-kos-2015-546`; **Roy**,
-//! `2022-roy-softspokenot-2022-192`. "Theorem" below means a statement proven in a
+//! `2022-roy-softspokenot-2022-192` (revision of 2025-11-18:
+//! `2022-roy-softspokenot-2022-192-rev20251118`). "Theorem" below means a statement proven in a
 //! paper; "claim" means an argument of this module that no paper states in this form.
 //!
 //! ## What the 192 base OTs are, and why the count is not a security parameter
@@ -140,49 +141,52 @@
 //! pair for one statement) are not derived from the 192: every batch draws them fresh
 //! from the mesh.
 //!
-//! ## The extension underneath: KOS, whose proof is known to be flawed
+//! ## The extension underneath: IKNP columns with the SoftSpokenOT consistency check
 //!
 //! Every OT above comes from one `dregg-sig-core` mesh channel per ordered pair: 128
-//! base OTs (combined from 384 Ring-LWE OTs), one correlation `Delta` in `GF(2^128)`
-//! fixed for the life of the mesh, IKNP columns, and per frame the correlation check of
-//! KOS Fig. 7 (one random linear combination over `GF(2^128)` of all rows and 256
-//! sacrificial rows, challenge sent after the columns), the channel poisoned for good on
-//! a failed check. KOS Theorem 1 would bound a corrupted receiver's advantage by
-//! `O(q 2^-128)` for `q` hash queries, independently of the number of extended OTs and
-//! of how many frames reuse `Delta`: guessing `c` bits of `Delta` passes with
-//! probability `2^-c` and leaves `2^(128-c)` work.
+//! base OTs (combined from 384 Ring-LWE OTs), one correlation `Delta` in `GF(2)^128`
+//! fixed for the life of the mesh, IKNP columns, and per frame the consistency check of
+//! Roy Fig. 9 for the length-128 repetition code: a `GF(2)`-linear universal hash
+//! `[X | I_256]` (a two-point polynomial hash over `GF(2^128)` plus 256 sacrificial
+//! rows) of the receiver's choice bits and of each of its 128 columns, keyed by the
+//! sender after the columns arrived, compared by the sender column by column; the
+//! channel is poisoned for good on a failed check. Rows are hashed into pads with a
+//! tweak that is distinct for every extended OT of a channel. The construction, the
+//! proof obligations and the tests are in the module doc of
+//! `dregg_sig_core::preprocessing` ("Correlated OT extension and its consistency
+//! check"); what follows is what this module relies on. Paper: Roy, revision of
+//! 2025-11-18, `2022-roy-softspokenot-2022-192-rev20251118`.
 //!
-//! That theorem's proof does not stand. Roy, Section 4.1.3 and Appendix D: KOS's Lemma 1,
-//! on which Theorem 1 rests, is false (collision attack, D.1); for field sizes divisible
-//! by 20 and a suitable field representation an attack passes the check with
-//! probability `2^(-3 lambda/5)` and then recovers `Delta` with `2^(lambda/5)` hash
-//! queries, where Theorem 1 allows `2^(-4 lambda/5)` (D.2, under a stated heuristic);
-//! Roy calls KOS "still secure enough in practice" and leaves a sound proof open. So
-//! the security of this ceremony against a corrupted OT receiver (the holder in COPE,
-//! the holder of `a` in a multiplication) rests on an extension with no valid proof,
-//! not on a 128-bit theorem. No attack on it at 128 bits is published. Reader's
-//! remark, unverified and not a result of any paper: the mesh represents `GF(2^128)`
-//! as a Wiedemann tower, in which the subfield `GF(2^32)` is a block of coordinates,
-//! which is the structure D.2 uses; the same counting for degree 4 suggests a check
-//! that passes with probability about `2^-64` and leaves `Delta` in a known set of
-//! `2^64`, no better than plain guessing unless a single pad can be tested against 32
-//! bits of `Delta` (the common mask stream of OT 128 may allow that to a coalition
-//! that knows every other term of an opened key-consistency sum).
+//! Theorem (Roy Theorem 4.5): the columns with that check realise subspace VOLE
+//! against malicious parties, with selective-abort leakage an affine subspace of
+//! `GF(2)^128` and distinguishing advantage at most `eps q/(q-1) + q^(-t-1)`. With the
+//! mesh's parameters (`q = 2`, at most 8,190 hashed blocks per frame, so
+//! `eps < 2^-230`, and `t = 116.7`) that is `2^-229 + 2^-117.7` per frame. Claim of the
+//! mesh, not of the paper: the second term belongs to the pre-commitment property,
+//! which Roy Theorem 5.1 uses only for extended OTs that share a tweak, and no two do,
+//! so the check costs `2 eps < 2^-229`. Theorem (Roy Theorem 5.1 with Proposition
+//! 2.6): the hashed rows are malicious random OTs with no leakage to their consumer,
+//! at an advantage of at most `(q_H + q'/2) 2^-128` for `q_H` hash queries and `q'`
+//! extended OTs when the pad hash is a random oracle; that term already contains the
+//! selective abort (guessing `c` bits of `Delta` passes with probability `2^-c` and
+//! leaves `2^(128-c)` work), independently of how many frames reuse `Delta`. Claim of
+//! the mesh: its single-block Keccak pad hash is modelled as that oracle.
 //!
-//! What follows if a receiver does learn a channel's `Delta`: it reads both pads of
-//! every OT the other party ever sent on that channel, hence, as COPE holder, every
-//! value the owner authenticated (its shares of all triples and uniform values of the
-//! ceremony), and as multiplication receiver the sender's `b` shares. With all but one
-//! member corrupted that is the whole preprocessing in the clear: privacy of everything
-//! the engine masks with it is lost. The MAC keys are not exposed this way (an honest
-//! party's key share is its *choice* input, and Roy's findings concern a corrupted
-//! receiver only), so soundness of the engine's MAC check is not affected.
-//! The cure is in the mesh, not here: replace the KOS check by a check with a proof,
-//! Roy Fig. 9 (proven as Theorem 4.5, with the OT step of Theorem 5.1), whose
-//! selective-abort leakage is an affine set of `Delta`; its cost is a universal hash
-//! of the rows in place of the `GF(2^128)` combination. Until then the statement for
-//! this module is: 128-bit computational security against a corrupted OT
-//! receiver is conjectured, not proven.
+//! So the security of this ceremony against a corrupted OT receiver (the holder in
+//! COPE, the holder of `a` in a multiplication) rests on proven statements: 128-bit
+//! computational security in the random-oracle model, with the statistical terms
+//! above. This replaces the correlation check of KOS Fig. 7, which the mesh ran
+//! before and whose Theorem 1 has no valid proof (Roy, Section 4.1.3 and Appendix D);
+//! an earlier version of this section had to call the same property conjectured.
+//!
+//! What a receiver would gain from a channel's `Delta`, and so what the bound above
+//! protects: both pads of every OT the other party ever sent on that channel, hence,
+//! as COPE holder, every value the owner authenticated (its shares of all triples and
+//! uniform values of the ceremony), and as multiplication receiver the sender's `b`
+//! shares. The MAC keys are not exposed this way (an honest party's key share is its
+//! *choice* input, and the extension never lets a sender test a receiver's choice
+//! bits: the sender sends nothing but the hash key, and every key keeps the hashed
+//! choice bits hidden behind the sacrificial rows).
 //!
 //! ## Selective failure across batches
 //!
@@ -239,9 +243,10 @@
 //!    `2^21.1` triples of a statement; a wrong triple survives both sacrificial pairs
 //!    with probability `2^-128`, once for the whole ceremony since a failure aborts.
 //!
-//! 3. *The mesh's correlation check: bits of a sender's `Delta`.* See the previous
-//!    section; a failed check poisons the channel, so the guesses over all frames, all
-//!    batches and all ceremonies on one mesh are one attempt.
+//! 3. *The mesh's consistency check: bits of a sender's `Delta`.* See the previous
+//!    section: a passing guess is an affine subspace containing `Delta`, and a failed
+//!    check poisons the channel, so the guesses over all frames, all batches and all
+//!    ceremonies on one mesh are one attempt, already counted in that section's bound.
 //!
 //! The key-consistency check and the batch MAC checks fail on the adversary's own
 //! deviation only, independently of honest secrets.
@@ -251,7 +256,8 @@
 //! batches. A ceremony that aborts teaches the adversary nothing it can use against a
 //! rerun (fresh keys), but each rerun is a new attempt, so these are per-attempt
 //! figures. All of it holds in the hybrid model with ideal OTs, coins, commitments and
-//! broadcast; the first of these is where the caveat of the previous section sits.
+//! broadcast; the first of these is what the theorems of the previous section provide,
+//! at the advantage stated there.
 
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
