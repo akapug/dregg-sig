@@ -1,0 +1,84 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+#![deny(unsafe_code)]
+// Only volatile_coupon::memory permits audited Linux memory-protection FFI.
+//! Generalized `(t, n)` quorum-switching `Jorts` signatures and isolated single-party
+//! protocol nodes that talk over a framed wire transport.
+//!
+//! * [`quorum_jorts`] — the full 256-bit `WOTS+C` leaf scheme, the committee-partitioned
+//!   `t`-of-`t` mode (QS-A) and the certified `(t, n)` Shamir mode (QS-B).
+//! * [`wire_channel`] — the [`wire_channel::WireTransport`] trait, the canonical frame
+//!   format and, with `std`, a thread-channel mesh and a loopback socket mesh.
+//! * [`party_node`] — one party per value: QS-A and QS-B custodians over the wire, and a
+//!   three-party replicated `Keccak-f[1600]` engine with a coin-flip barrier.
+//! * [`dzk`] — the `GF(2^128)` polynomial check the barrier runs on the AND gates.
+//!
+//! The crate is `no_std` with `alloc`; only the transport meshes need `std`.
+
+extern crate alloc;
+
+#[cfg(test)]
+mod test_budget;
+
+pub mod access;
+pub use access::{AsymmetricQuorumSystem, MonotoneSpanProgram, PersonalQuorumSlice};
+
+pub mod cnf_party;
+pub mod dealerless_staging;
+pub mod dzk;
+pub mod hash;
+pub mod hem_quorum;
+pub mod party_node;
+pub mod personal_release;
+pub mod quorum_jorts;
+pub mod wire_channel;
+
+pub use dealerless_staging::{
+    DealerlessStagingError, refresh_bft_shamir_shares, refresh_committee_shares,
+    stage_bft_shamir_dealerless_mpc, stage_committee_partitioned_dealerless_mpc,
+};
+pub use quorum_jorts::verify_jorts_signature;
+
+pub use hem_quorum::{
+    HemCommitteePartitionedQuorum, HemDynamicShamirQuorum, HemJortsPublicKey, HemJortsSignature,
+    HemQuorumError, HemQuorumPublicDirectory, HemShamirCustodianShare, HemSpdzSeedQuorum,
+    sign_from_shamir_share_slice,
+};
+pub use cnf_party::{
+    CnfPartyError, CnfPartyKeys, IsolatedCnfParty, IsolatedCnfSweep, run_isolated_cnf_dkg,
+};
+#[cfg(any(test, feature = "std"))]
+pub use cnf_party::run_isolated_cnf_ceremony;
+pub use qsag_core::cnf_rss::{
+    CnfRssConfig, CnfRssError, CnfRssKeyShare256, run_dealerless_cnf_rss_dkg,
+};
+
+#[cfg(feature = "std")]
+pub mod durable_custody;
+#[cfg(feature = "std")]
+pub mod poison_journal;
+
+#[cfg(feature = "std")]
+pub use durable_custody::{
+    AnchoredFirstSignedCustody, AnchoredFirstSignedError, AnchoredSeedBurnError,
+    AnchoredSeedBurnTracker, FsLedgerCheckpointAnchor,
+};
+pub use wire_channel::{ConfidentialWireChannel, MacSealedWireChannel};
+
+#[cfg(feature = "std")]
+mod directory_anchor;
+#[cfg(feature = "std")]
+pub use directory_anchor::FsDirectoryMonotoneAnchor;
+
+#[cfg(all(
+    any(test, feature = "std"),
+    target_os = "linux",
+    target_pointer_width = "64"
+))]
+pub mod volatile_coupon;
+#[cfg(all(
+    any(test, feature = "std"),
+    target_os = "linux",
+    target_pointer_width = "64"
+))]
+pub use volatile_coupon::{BaggySig, baggy_verify};

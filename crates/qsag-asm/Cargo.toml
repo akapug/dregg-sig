@@ -1,0 +1,17 @@
+[package]
+name = "qsag-asm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Zero-dependency SIMD assembly kernels with scoped Lean ISA proofs, binary audits, and empirical timing tests"
+
+[features]
+default = ["std"]
+# Heap-backed secret guards in `wipe` (`Vec`/`Box` erasure, `SecretVec`).
+alloc = []
+std = ["alloc"]
+
+[[example]]
+name = "ct_dudect"
+required-features = ["std"]
