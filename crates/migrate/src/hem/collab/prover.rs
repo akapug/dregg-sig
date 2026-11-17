@@ -938,37 +938,40 @@ pub(super) mod tests {
     fn measure_threshold_ownership() {
         use super::super::verify_threshold_ownership;
         use crate::hem::relations::{
-            ClaimKind, OwnershipStatement, OwnershipWitness, ownership_transcript,
+            KeySource, Lock, OwnershipStatement, OwnershipWitness, ownership_transcript,
             synthesize_ownership,
         };
         let regime = WhirSecurityRegime::default();
         let cases = [
             (
                 "bitcoin-hash160",
-                ClaimKind::BitcoinHash160,
-                OwnershipWitness::Secp256k1Key([0x11; 32]),
+                Lock::P2pkh,
+                KeySource::Secp256k1Key,
+                OwnershipWitness::secp256k1_key(&[0x11; 32]),
                 3usize,
             ),
             (
                 "ed25519-seed",
-                ClaimKind::Ed25519Seed,
-                OwnershipWitness::Ed25519Seed([0x22; 32]),
+                Lock::Ed25519,
+                KeySource::Ed25519Seed,
+                OwnershipWitness::ed25519_seed(&[0x22; 32]),
                 3,
             ),
             (
                 "bitcoin-hash160",
-                ClaimKind::BitcoinHash160,
-                OwnershipWitness::Secp256k1Key([0x11; 32]),
+                Lock::P2pkh,
+                KeySource::Secp256k1Key,
+                OwnershipWitness::secp256k1_key(&[0x11; 32]),
                 5,
             ),
         ];
         let only = std::env::var("COLLAB_MEASURE_ONLY").ok();
-        for (name, kind, witness, parties) in &cases {
+        for (name, lock, source, witness, parties) in &cases {
             let label = std::format!("{name} N={parties}");
             if only.as_ref().is_some_and(|o| !label.contains(o.as_str())) {
                 continue;
             }
-            let st = OwnershipStatement::derive(kind, witness, [5; 32], [6; 32], 9).unwrap();
+            let st = OwnershipStatement::derive(*lock, source.clone(), witness, [5; 32], [6; 32], 9).unwrap();
             let (shape, assignment) = synthesize_ownership(&st, witness).unwrap();
             let (triples, randoms) = prover_demand(&shape, regime).unwrap();
             let layout = Layout::new(&shape, regime).unwrap();
