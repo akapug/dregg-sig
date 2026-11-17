@@ -21,3 +21,7 @@ dregg-sig-asm = { path = "../asm", default-features = false, features = ["alloc"
 [[example]]
 name = "pants_bench"
 required-features = ["testing-ephemeral"]
+
+[[example]]
+name = "slh_dsa_quickstart"
+required-features = ["std"]

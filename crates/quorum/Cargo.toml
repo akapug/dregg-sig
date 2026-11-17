@@ -26,3 +26,7 @@ required-features = ["std", "testing-ephemeral"]
 dregg-sig-accel = { path = "../accel", default-features = false }
 dregg-sig-core = { path = "../core", features = ["testing-ephemeral"] }
 dregg-sig-agg = { path = "../agg", features = ["std"] }
+
+[[example]]
+name = "threshold_slh_dsa_quickstart"
+required-features = ["std"]
