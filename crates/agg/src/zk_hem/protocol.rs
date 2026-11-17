@@ -1363,7 +1363,12 @@ fn column_table(shape: &Shape, eq_rx: &[E], combine: &[E], cells: usize) -> Vec<
 ///   for random linear combinations and is not re-derived for the regime's query schedule,
 ///   which was accounted for the affine cascade of the non-hiding opening;
 /// * knowledge soundness of the composition (masked sumchecks, linear batching, companion
-///   challenge, WHIR) has no concrete bound stated or proved here.
+///   challenge, WHIR) has no concrete bound stated or proved here;
+/// * for a relation with lookups, the steps L1 to L4 of the module comment: their
+///   soundness terms and their masking are argued there and are not mechanized.
+///
+/// For a relation with lookups an unsatisfied lookup is detected by the helper sum being
+/// nonzero, which misses with the soundness error of `alpha`; such a proof does not verify.
 pub fn prove(
     shape: &Shape,
     assignment: Vec<F>,
@@ -6205,13 +6210,13 @@ mod tests {
     fn lookup_relation(x: &[u64], square_of_first: u64) -> (Shape, Vec<F>) {
         let mut cs = ConstraintSystem::new();
         let squares: Vec<F> = (0..20u64).flat_map(|t| [f(t), f(t * t)]).collect();
-        let table = cs.add_table(2, &squares);
+        let table = cs.table(2, squares);
         let vars: Vec<Lc> = x.iter().map(|&v| cs.alloc(f(v)).into()).collect();
         for v in &vars {
-            cs.enforce_range8(v);
+            cs.enforce_byte(v);
         }
         let sq: Lc = cs.alloc(f(square_of_first)).into();
-        cs.enforce_lookup(table, &[vars[0].clone(), sq.clone()]);
+        cs.enforce_in_table(table, &[vars[0].clone(), sq.clone()]);
         let prod = cs.mul(&vars[0], &vars[1]);
         cs.enforce_zero(Lc::from(prod).plus_const(F::ZERO - f(x[0] * x[1])));
         cs.finish()
@@ -6471,7 +6476,7 @@ mod tests {
                 let mut cs = ConstraintSystem::new();
                 for i in 0..n {
                     let v: Lc = cs.alloc(f(byte(i))).into();
-                    cs.enforce_range8(&v);
+                    cs.enforce_byte(&v);
                 }
                 cs.finish()
             };

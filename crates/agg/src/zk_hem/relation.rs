@@ -15,11 +15,17 @@
 //!
 //! A relation may also say that a tuple of linear forms is a row of a public table:
 //!
-//! * [`ConstraintSystem::enforce_range8`]: a linear form takes a value in `[0, 2^8)`. Wider
-//!   ranges are compositions: a `16`-bit value is `lo + 2^8 hi` with both limbs range-checked.
-//! * [`ConstraintSystem::add_table`] and [`ConstraintSystem::enforce_lookup`]:
+//! * [`ConstraintSystem::enforce_byte`]: a linear form takes a value in `[0, 2^8)`, as a
+//!   field element (no reduction modulo anything but the Goldilocks prime). Other ranges
+//!   are compositions: a limb `v` of `w < 8` bits is `enforce_byte(v)` and
+//!   `enforce_byte(2^(8 - w) v)`; a `16`-bit value is `lo + 2^8 hi` with both limbs
+//!   checked.
+//! * [`ConstraintSystem::table`] and [`ConstraintSystem::enforce_in_table`]:
 //!   `(lc_1, .., lc_k)` is a row of a fixed table with `k` columns
 //!   ([`ConstraintSystem::range_table`] is the one-column table `0..2^bits`).
+//!
+//! This is the interface asked for in the module comment of `dregg-sig-migrate`'s
+//! `hem/curve.rs` ("Wanted from the constraint system").
 //!
 //! A lookup adds no row and no variable of its own. Per table row the relation gains one
 //! variable, the number of lookups that hit that row (its multiplicity), which
@@ -248,7 +254,7 @@ pub const MASK_ROWS: usize = 12;
 /// values.
 pub const LOOKUP_MASK_ENTRIES: usize = 4;
 
-/// Handle of a public table registered with [`ConstraintSystem::add_table`].
+/// Handle of a public table registered with [`ConstraintSystem::table`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableId(u32);
 
@@ -502,6 +508,7 @@ pub struct ConstraintSystem {
     tables: Vec<LookupTable>,
     range_tables: Vec<(usize, TableId)>,
     lookups: Vec<(u32, Vec<Lc>)>,
+    num_lookups: usize,
 }
 
 impl Default for ConstraintSystem {
@@ -525,6 +532,7 @@ impl ConstraintSystem {
             tables: Vec::new(),
             range_tables: Vec::new(),
             lookups: Vec::new(),
+            num_lookups: 0,
         }
     }
 
@@ -581,6 +589,7 @@ impl ConstraintSystem {
                 .collect(),
             range_tables: self.range_tables.clone(),
             lookups: Vec::new(),
+            num_lookups: 0,
         }
     }
 
@@ -638,6 +647,7 @@ impl ConstraintSystem {
                 .into_iter()
                 .map(|(t, tuple)| (t, tuple.into_iter().map(relocate).collect())),
         );
+        self.num_lookups += other.num_lookups;
         for (mine, theirs) in self.tables.iter_mut().zip(&mut other.tables) {
             for (m, o) in mine.mult.iter_mut().zip(&theirs.mult) {
                 *m += o;
@@ -770,7 +780,7 @@ impl ConstraintSystem {
 
     /// Register a public table of `rows.len() / width` distinct rows of `width` columns
     /// (row-major). Tables are part of the relation: register them in a fixed order.
-    pub fn add_table(&mut self, width: usize, rows: &[F]) -> TableId {
+    pub fn table(&mut self, width: usize, rows: Vec<F>) -> TableId {
         assert!(
             !self.hologram_aligned,
             "lookups are not supported in hologram-aligned relations"
@@ -795,7 +805,7 @@ impl ConstraintSystem {
         }
         assert!((1..=16).contains(&bits), "range table of 1 to 16 bits");
         let rows: Vec<F> = (0..1u64 << bits).map(F::from_u64_reduced).collect();
-        let id = self.add_table(1, &rows);
+        let id = self.table(1, rows);
         self.range_tables.push((bits, id));
         id
     }
@@ -804,7 +814,7 @@ impl ConstraintSystem {
     /// table's multiplicity variables are allocated by [`Self::finish`].
     ///
     /// The multiplicity count scans the whole table with a fixed access pattern.
-    pub fn enforce_lookup(&mut self, table: TableId, values: &[Lc]) {
+    pub fn enforce_in_table(&mut self, table: TableId, values: &[Lc]) {
         let mut tuple: Vec<u64> = values
             .iter()
             .map(|lc| self.eval(lc).to_canonical_u64())
@@ -816,15 +826,23 @@ impl ConstraintSystem {
             *count += ((diff | diff.wrapping_neg()) >> 63) ^ 1;
         }
         dregg_sig_asm::volatile_fill(&mut tuple, 0u64);
+        self.num_lookups += 1;
         if self.record_rows {
             self.lookups.push((table.0, values.to_vec()));
         }
     }
 
-    /// `lc` takes a value in `[0, 2^8)`: a lookup into [`Self::range_table`]`(8)`.
-    pub fn enforce_range8(&mut self, lc: &Lc) {
+    /// `0 <= value < 256` for the field element `value` itself: a lookup into
+    /// [`Self::range_table`]`(8)`.
+    pub fn enforce_byte(&mut self, value: &Lc) {
         let table = self.range_table(8);
-        self.enforce_lookup(table, core::slice::from_ref(lc));
+        self.enforce_in_table(table, core::slice::from_ref(value));
+    }
+
+    /// How many lookups the relation holds (the cost metric beside [`Self::num_rows`]).
+    #[inline]
+    pub fn num_lookups(&self) -> usize {
+        self.num_lookups
     }
 
     /// Allocate one variable per table row holding its multiplicity; returns the first.
@@ -1365,14 +1383,14 @@ mod tests {
         let build = |x: [u64; 3]| {
             let mut cs = ConstraintSystem::new();
             let pairs: Vec<F> = (0..5u64).flat_map(|t| [f(t), f(10 * t)]).collect();
-            let table = cs.add_table(2, &pairs);
+            let table = cs.table(2, pairs);
             let a: Lc = cs.alloc(f(x[0])).into();
             let b: Lc = cs.alloc(f(x[1])).into();
             let c: Lc = cs.alloc(f(x[2])).into();
-            cs.enforce_range8(&a);
-            cs.enforce_range8(&a.plus(&b));
-            cs.enforce_lookup(table, &[b.clone(), c]);
-            assert_eq!(cs.num_rows(), 0);
+            cs.enforce_byte(&a);
+            cs.enforce_byte(&a.plus(&b));
+            cs.enforce_in_table(table, &[b.clone(), c]);
+            assert_eq!((cs.num_rows(), cs.num_lookups()), (0, 3));
             cs.finish()
         };
         let (shape, z) = build([200, 3, 30]);
@@ -1417,7 +1435,7 @@ mod tests {
             let b: Lc = cs.alloc(f(second)).into();
             cs.enforce_boolean(&b);
             if range {
-                cs.enforce_range8(&a);
+                cs.enforce_byte(&a);
             }
             cs.finish().0
         };
@@ -1437,7 +1455,7 @@ mod tests {
             let _a: Lc = cs.alloc(f(7)).into();
             let b: Lc = cs.alloc(f(1)).into();
             cs.enforce_boolean(&b);
-            cs.enforce_range8(&b);
+            cs.enforce_byte(&b);
             cs.finish().0
         };
         assert_eq!((other.a.clone(), other.num_vars), (with.a.clone(), with.num_vars));
@@ -1448,8 +1466,8 @@ mod tests {
     fn witness_only_and_forked_synthesis_reproduce_the_multiplicities() {
         let synth = |cs: &mut ConstraintSystem, x: u64| {
             let v: Lc = cs.alloc(f(x)).into();
-            cs.enforce_range8(&v);
-            cs.enforce_range8(&v.plus_const(f(1)));
+            cs.enforce_byte(&v);
+            cs.enforce_byte(&v.plus_const(f(1)));
         };
         let serial = {
             let mut cs = ConstraintSystem::new();

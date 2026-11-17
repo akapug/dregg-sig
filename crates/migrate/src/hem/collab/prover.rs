@@ -1296,14 +1296,14 @@ pub(super) mod tests {
         let mut cs = ConstraintSystem::new();
         let p = cs.public_input(f(35));
         let squares: Vec<F> = (0..8u64).flat_map(|t| [f(t), f(t * t)]).collect();
-        let table = cs.add_table(2, &squares);
+        let table = cs.table(2, squares);
         let vars: Vec<Lc> = x.iter().map(|&v| cs.alloc(f(v)).into()).collect();
         for v in &vars {
-            cs.enforce_range8(v);
+            cs.enforce_byte(v);
         }
-        cs.enforce_range8(&vars[0].plus(&vars[2]));
+        cs.enforce_byte(&vars[0].plus(&vars[2]));
         let sq: Lc = cs.alloc(f(square)).into();
-        cs.enforce_lookup(table, &[vars[0].clone(), sq]);
+        cs.enforce_in_table(table, &[vars[0].clone(), sq]);
         let prod = cs.mul(&vars[0], &vars[1]);
         cs.enforce_equal(&prod.into(), &p.into());
         cs.finish()
