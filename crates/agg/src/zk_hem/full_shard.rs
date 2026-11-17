@@ -1439,7 +1439,9 @@ pub fn prove_full_shard_merge(
     let map_err = |e: protocol::ZkHemError| match e {
         protocol::ZkHemError::Unsatisfied => FullShardError::InvalidChild,
         protocol::ZkHemError::MaskRankDeficient => FullShardError::MaskRankDeficient,
-        protocol::ZkHemError::RelationTooLarge => FullShardError::InvalidParameters,
+        protocol::ZkHemError::RelationTooLarge | protocol::ZkHemError::LookupsUnsupported => {
+            FullShardError::InvalidParameters
+        }
     };
     let proof = protocol::prove(&relation.shape, z, PROOF_LABEL, regime, seed).map_err(map_err)?;
     Ok(FullShardMergeProof { proof })

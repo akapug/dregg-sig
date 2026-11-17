@@ -42,6 +42,82 @@
 //! The uniformity statements above describe the masking ingredients under ideal independent
 //! sampling, not a simulator for this complete seeded transcript. What this file does not
 //! establish is listed on [`prove`].
+//!
+//! # Lookups
+//!
+//! A relation with lookups ([`super::relation::Lookups`]) is a list of `2^d` fractions:
+//! entry `i` has the numerator `n_i = <N_i, z>` and the value tuple `(<D_(c,i), z>)_c`, and
+//! the fractions of the constrained entries (all but the last four) must cancel. The
+//! protocol is logUp with committed helpers; a proof for a relation without lookups has
+//! none of the steps below and is byte for byte what it was.
+//!
+//! * L1. After the assignment commitment the verifier draws `gamma` and `alpha`. With
+//!   `v_i = sum_c gamma^c <D_(c,i), z>` the prover sets `h_i = n_i / (alpha - v_i)` on the
+//!   constrained entries and commits a second batch: the helper table `H` and four uniform
+//!   companions. `H` holds the four base-field limb tables of `h`, the mask `g3` of the
+//!   lookup sumcheck and opening blinders ([`LookupLayout`]).
+//! * L2. Masked sumcheck over `d` variables, with claimed sum `0`, of
+//!   `sel(x) (h(x) + lambda eq(tau', x) (h(x) (alpha - v(x)) - n(x)))`, where `sel` is the
+//!   indicator of the constrained entries. The part without `lambda` says the helpers sum
+//!   to zero, the part with it that every helper is its fraction.
+//! * L3. The prover reveals `(n, v, h)(rl)`. The four masking entries (free numerator and
+//!   value variables in `Z`, free helper cells in `H`, `sel = 0`) make the three values
+//!   uniform, as the masking rows do for `(Az, Bz, Cz)(rx)`
+//!   (`masking_entries_make_the_revealed_lookup_values_witness_independent`). `n(rl)` and
+//!   `v(rl)` are linear in `Z` and join the column sumcheck of step 3 with two more
+//!   weights: `M = .. + c_3 N(rl, .) + c_4 sum_c gamma^c D_c(rl, .)`.
+//! * L4. What remains is linear in `H`: the mask sum, `g3(rl)` and `h(rl)`. It is batched
+//!   with its own `lambda`, and after step 5 the prover sends the four companion claims of
+//!   the helper batch, a second blend challenge is drawn and WHIR opens the blended helper
+//!   word.
+//!
+//! Cost. In `Z`: one variable per table row (the multiplicities) and eight masking
+//! variables; no row. In `H`: four cells per fraction, `4 * 2^d` in all, plus the mask and
+//! the blinders, times five for the companions. The proof gains a root, `5 d + 8` extension
+//! elements and a second WHIR opening. Batching `k` fractions per helper (`logup-2022-1530`
+//! Section 3.4, Protocol 2) would divide the helper cells by `k` and raise the degree of L2
+//! to `k + 3`; it is not implemented.
+//!
+//! Why helpers are committed and not replaced by a GKR fractional sumcheck as in the
+//! hologram's `prove_logup_gkr` (`logup-gkr-2023-1284`): that protocol sends the two-way
+//! split of every layer's numerator and denominator at a random point. Here those are
+//! functions of the witness, the layers are not committed, and masking them needs a hiding
+//! GKR, which this crate does not have. A one-hot (Shout, `twist-and-shout-2025-105`)
+//! argument commits `2 * 16` cells per byte in the assignment, more than the eight bits it
+//! would replace.
+//!
+//! Soundness (this module's accounting, per list member of the commitments, in the form
+//! of `bounds.rs`; `|E| = p^4`, `L` lookups, `T` table rows over all tables, `w` the widest
+//! tuple, table tag included, `l_0` and `l_0'` the Stage-0 list sizes of the two batches):
+//!
+//! * `gamma`: two different tuples collide with probability at most `(w - 1) / |E|` each;
+//!   over lookups against table rows, `(w - 1) L T l_0 / |E|`.
+//! * `alpha`: the fractions cancel as rational functions exactly when the statement
+//!   holds (`logup-2022-1530` Lemma 5, which needs `L < p`; the builder cannot exceed it).
+//!   Otherwise their sum has a numerator of degree below `L + T` and `alpha` must be a
+//!   root of it or one of the at most `T + 1` values that a zero numerator leaves
+//!   unconstrained: `(L + 2 T + 1) l_0 / |E|`.
+//! * `tau'`, `lambda`, `rho3` and the `d` rounds of L2: `max(d, LOOKUP_DEGREE + 1) l_0 l_0'
+//!   / |E|` each, Schwartz-Zippel per pair of list members. `H` is committed before them.
+//! * the column weights (now five) and the batching of the three helper claims are covered
+//!   by the existing `d l_0 / |E|` row with `l_0 l_0'` in place of `l_0`.
+//! * the helper batch's blend challenge and WHIR opening: the rows of the table for the
+//!   assignment batch, evaluated at `LookupLayout::log_cells`.
+//!
+//! Lemma 5 and the sumcheck bound are the papers'; the tuple form with a table tag, the
+//! selector and the masking entries, and the composition with the two commitments are this
+//! module's. The Lean file covers none of the lookup steps; its theorems are used for the
+//! mask of L2 (`libra_sumcheck_perfectly_simulated`), the helper companions
+//! (`batched_base_companion_perfectly_simulated`) and the helper blinders
+//! (`opened_symbols_perfectly_simulated`), each applied to the second batch.
+//!
+//! Zero knowledge, message by message: the helper root (salted leaves over a table whose
+//! opened symbols are blinded); the L2 rounds (masked by `g3`, committed in `H`); the three
+//! values of L3 (uniform by the masking entries, or the prover refuses with
+//! [`ZkHemError::MaskRankDeficient`]); the helper companion claims and the blended helper
+//! word (uniform given the claim); the opened Stage-0 symbols of `H` (as many blinders as
+//! opened symbols). The multiplicities are assignment variables and are hidden like every
+//! other variable. No message is a function of the witness alone.
 
 use alloc::sync::Arc;
 use alloc::vec;
@@ -54,7 +130,9 @@ use super::recursive_whir::{
     commit_levels_for_recursion, f as rec_f, open_correlated3_for_recursion,
     prove_folded_level_for_recursion, verify_correlated3_gadget, verify_folded_level,
 };
-use super::relation::{HologramMeta, Poseidon2InteriorTemplate, Shape};
+use super::relation::{
+    HologramMeta, Lookups, Poseidon2InteriorTemplate, Shape,
+};
 use super::{CornerPadBasis, LibraMask, NonzeroChallenge, PrimitiveChallenge, SeedStream, interp};
 use crate::field::{Goldilocks, GoldilocksExt4, build_eq_table_ext4};
 use crate::pcs::{
@@ -78,7 +156,15 @@ pub const ROW_MASK_BITS: usize = 4;
 pub const COL_MASK_BITS: usize = 2;
 /// Companion tables committed beside the assignment table.
 pub const COMPANIONS: usize = 4;
-const _: () = assert!(ROW_DEGREE < 1 << ROW_MASK_BITS && COL_DEGREE < 1 << COL_MASK_BITS);
+/// Individual degree of the lookup sumcheck: `selector * eq * h * v`.
+pub const LOOKUP_DEGREE: usize = 4;
+/// `log2` of the cells holding one limb of one lookup-mask round.
+pub const LOOKUP_MASK_BITS: usize = 3;
+const _: () = assert!(
+    ROW_DEGREE < 1 << ROW_MASK_BITS
+        && COL_DEGREE < 1 << COL_MASK_BITS
+        && LOOKUP_DEGREE < 1 << LOOKUP_MASK_BITS
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkHemError {
@@ -88,8 +174,13 @@ pub enum ZkHemError {
     RelationTooLarge,
     /// The row challenge left the masking rows without full rank. This happens with
     /// negligible probability; the prover refuses instead of emitting a proof whose
-    /// revealed row values are not uniform. Retry with a different `seed`.
+    /// revealed row values are not uniform. Retry with a different `seed`. Also returned
+    /// when the lookup point leaves the masking entries without full rank, or the lookup
+    /// challenge `alpha` equals a looked-up or table value.
     MaskRankDeficient,
+    /// The relation has lookups and this proof mode does not prove them (the non-hiding
+    /// modes, the hologram and the recursion).
+    LookupsUnsupported,
 }
 
 /// Cell layout of the assignment table for one relation and regime.
@@ -102,6 +193,55 @@ pub struct Layout {
     /// Uniform cells at the top of the table, one per opened Stage-0 symbol.
     pub blind_cells: usize,
     pub schedule: WhirSchedule,
+    /// Layout of the helper table of a relation with lookups.
+    pub lookup: Option<LookupLayout>,
+}
+
+/// Cell layout of the helper table `H` of a relation with lookups (second commitment):
+///
+/// ```text
+/// [ limb 0 of h | limb 1 | limb 2 | limb 3 | lookup sumcheck mask | zeros | opening blinders ]
+///   `2^d` cells each, `d = log_entries`
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupLayout {
+    pub log_cells: usize,
+    pub log_entries: usize,
+    pub blind_cells: usize,
+    pub schedule: WhirSchedule,
+}
+
+impl LookupLayout {
+    pub fn new(lookups: &Lookups, regime: WhirSecurityRegime) -> Option<Self> {
+        let d = lookups.log_entries;
+        let used = (4usize << d) + ((d * 4) << LOOKUP_MASK_BITS);
+        (d + 3..=MAX_PCS_NUM_VARS).find_map(|log_cells| {
+            let cells = 1usize << log_cells;
+            let schedule = regime.schedule(log_cells);
+            let st0 = schedule.stages[0];
+            let arity = 1usize << st0.step_vars;
+            let fibers = cells * st0.blowup / arity;
+            let blind_cells = st0.num_queries.min(fibers) * arity;
+            (used + blind_cells <= cells).then_some(Self {
+                log_cells,
+                log_entries: d,
+                blind_cells,
+                schedule,
+            })
+        })
+    }
+
+    /// First cell of limb `limb` of the helper values.
+    #[inline]
+    pub fn limb_block(&self, limb: usize) -> usize {
+        limb << self.log_entries
+    }
+
+    /// First cell of the block holding limb `limb` of lookup-mask round `round`.
+    #[inline]
+    pub fn mask_block(&self, round: usize, limb: usize) -> usize {
+        (4usize << self.log_entries) + ((round * 4 + limb) << LOOKUP_MASK_BITS)
+    }
 }
 
 impl Layout {
@@ -112,6 +252,10 @@ impl Layout {
         }
         let var_bits = shape.num_vars.next_power_of_two().trailing_zeros().max(1) as usize;
         let masks = ((shape.log_rows * 4) << ROW_MASK_BITS) + ((var_bits * 4) << COL_MASK_BITS);
+        let lookup = match shape.lookups() {
+            Some(lookups) => Some(LookupLayout::new(lookups, regime)?),
+            None => None,
+        };
         (var_bits + 1..=MAX_PCS_NUM_VARS).find_map(|log_cells| {
             let cells = 1usize << log_cells;
             let schedule = regime.schedule(log_cells);
@@ -119,11 +263,12 @@ impl Layout {
             let arity = 1usize << st0.step_vars;
             let fibers = cells * st0.blowup / arity;
             let blind_cells = st0.num_queries.min(fibers) * arity;
-            ((1usize << var_bits) + masks + blind_cells <= cells).then_some(Self {
+            ((1usize << var_bits) + masks + blind_cells <= cells).then(|| Self {
                 log_cells,
                 var_bits,
                 blind_cells,
                 schedule,
+                lookup: lookup.clone(),
             })
         })
     }
@@ -161,6 +306,25 @@ pub struct ZkHemProof {
     /// `<C_j, K>`, sent before `beta`.
     pub companion_claims: [E; COMPANIONS],
     pub opening: HemWhirOpeningProof,
+    /// Present exactly when the relation has lookups.
+    pub lookup: Option<LookupProof>,
+}
+
+/// The lookup part of a [`ZkHemProof`]: the helper commitment, the lookup sumcheck and the
+/// opening of the helper table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupProof {
+    /// Commitment to the helper table and its four companions, made after `alpha`.
+    pub commitment: CanopyCommitment,
+    /// `sum_x g3(x)`, sent before `rho3`.
+    pub mask_sum: E,
+    /// Coefficients of the masked lookup-sumcheck rounds.
+    pub rounds: Vec<Vec<E>>,
+    /// `(n, v, h)(rl)`: numerator, value and helper at the lookup point.
+    pub values: [E; 3],
+    /// `<C'_j, K'>`, sent before the helper table's blend challenge.
+    pub companion_claims: [E; COMPANIONS],
+    pub opening: HemWhirOpeningProof,
 }
 
 impl ZkHemProof {
@@ -171,6 +335,12 @@ impl ZkHemProof {
             row_values: self.row_values,
             col_mask_sum: self.col_mask_sum,
             col_rounds: &self.col_rounds,
+            lookup: self.lookup.as_ref().map(|l| LookupMessages {
+                roots: LookupRoots::Single(&l.commitment),
+                mask_sum: l.mask_sum,
+                rounds: &l.rounds,
+                values: l.values,
+            }),
         }
     }
 
@@ -191,6 +361,16 @@ impl ZkHemProof {
             .for_each(|v| push(&mut out, v));
         self.companion_claims.iter().for_each(|v| push(&mut out, v));
         self.opening.push_bytes(&mut out);
+        // A relation with lookups appends: helper commitment, mask sum, rounds, values,
+        // companion claims, helper opening.
+        if let Some(l) = &self.lookup {
+            out.extend_from_slice(&l.commitment.to_bytes());
+            push(&mut out, &l.mask_sum);
+            l.rounds.iter().flatten().for_each(|v| push(&mut out, v));
+            l.values.iter().for_each(|v| push(&mut out, v));
+            l.companion_claims.iter().for_each(|v| push(&mut out, v));
+            l.opening.push_bytes(&mut out);
+        }
         out
     }
 
@@ -220,7 +400,34 @@ impl ZkHemProof {
             take(&mut pos)?,
         ];
         let (opening, used) = HemWhirOpeningProof::from_bytes_canonical(&bytes[pos..])?;
-        (pos + used == bytes.len()).then_some(Self {
+        pos += used;
+        let lookup = match &layout.lookup {
+            None => None,
+            Some(ll) => {
+                let (commitment, used) = CanopyCommitment::from_bytes_canonical(&bytes[pos..])?;
+                pos += used;
+                let mask_sum = take(&mut pos)?;
+                let rounds = rounds(&mut pos, ll.log_entries, LOOKUP_DEGREE)?;
+                let values = [take(&mut pos)?, take(&mut pos)?, take(&mut pos)?];
+                let companion_claims = [
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                ];
+                let (opening, used) = HemWhirOpeningProof::from_bytes_canonical(&bytes[pos..])?;
+                pos += used;
+                Some(LookupProof {
+                    commitment,
+                    mask_sum,
+                    rounds,
+                    values,
+                    companion_claims,
+                    opening,
+                })
+            }
+        };
+        (pos == bytes.len()).then_some(Self {
             commitment,
             row_mask_sum,
             row_rounds,
@@ -229,6 +436,7 @@ impl ZkHemProof {
             col_rounds,
             companion_claims,
             opening,
+            lookup,
         })
     }
 }
@@ -510,6 +718,11 @@ fn start_transcript(
     let mut params = shape.digest().to_vec();
     for n in [layout.log_cells, layout.var_bits, layout.blind_cells] {
         params.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    if let Some(ll) = &layout.lookup {
+        for n in [ll.log_cells, ll.log_entries, ll.blind_cells] {
+            params.extend_from_slice(&(n as u64).to_le_bytes());
+        }
     }
     FiatShamirTranscript::new()
         .bind_relation(b"QSAG.ZKHEM.COMMITTED/v1", &params, &layout.schedule)
@@ -1251,6 +1464,23 @@ fn prove_with_claimed_publics(
 
     let mut tr = start_transcript(shape, &layout, statement, &public_inputs, &commitment);
 
+    // L1 to L3. Lookups: the helper commitment and the lookup sumcheck.
+    let lookup = match (shape.lookups(), &layout.lookup) {
+        (Some(lookups), Some(ll)) => Some((
+            lookups,
+            ll,
+            lookup_prove_front(
+                lookups,
+                ll,
+                &state.hypercube_evals[0][..shape.num_vars],
+                &mut tr,
+                &mut stream,
+                check,
+            )?,
+        )),
+        _ => None,
+    };
+
     // 1. Masked row sumcheck.
     let tau = squeeze_point(&mut tr, b"ZKHEM_TAU", shape.log_rows);
     let row_libra = row_mask.libra();
@@ -1272,12 +1502,25 @@ fn prove_with_claimed_publics(
     tr.absorb_ext4_slice(b"ZKHEM_ROW_VALUES", &row_values);
 
     // 3. Masked column sumcheck of `M(rx, y) Z(y)`.
-    let combine = squeeze_point(&mut tr, b"ZKHEM_COMBINE", 3);
+    let combine = squeeze_point(
+        &mut tr,
+        b"ZKHEM_COMBINE",
+        if lookup.is_some() { 5 } else { 3 },
+    );
     let col_libra = col_mask.libra();
     let col_mask_sum = col_libra.sum();
     tr.absorb_ext4(b"ZKHEM_COL_MASK_SUM", col_mask_sum);
     let rho2 = NonzeroChallenge::squeeze(&mut tr, b"ZKHEM_RHO2").get();
-    let tm = column_table(shape, &eq_table(&rx), &combine, 1 << layout.var_bits);
+    let mut tm = column_table(shape, &eq_table(&rx), &combine, 1 << layout.var_bits);
+    if let Some((lookups, _, front)) = &lookup {
+        lookup_column_add(
+            &mut tm,
+            lookups,
+            &eq_table(&front.point),
+            [combine[3], combine[4]],
+            front.gamma,
+        );
+    }
     // Neither `Z(ry)` nor the mask value there is sent.
     let (col_rounds, ry, matrix_at_point, _) = column_sumcheck(
         &mut tr,
@@ -1300,6 +1543,9 @@ fn prove_with_claimed_publics(
     });
     let kernel = claim_kernel(&terms, cells);
     drop(terms);
+    let lookup_lambda = lookup
+        .as_ref()
+        .map(|_| tr.squeeze_ext4(b"ZKHEM_LK_LAMBDA"));
 
     // 5. Companion claims, then the blend challenge.
     let monos: Vec<Vec<F>> = state
@@ -1329,6 +1575,39 @@ fn prove_with_claimed_publics(
         dregg_sig_asm::volatile_fill(secret, F::ZERO);
     }
 
+    // L4. The helper table's linear claim, opened like the assignment table's.
+    let lookup = lookup.zip(lookup_lambda).map(|((_, ll, front), lambda)| {
+        let terms = lookup_claim_terms(ll, &front.point, lambda);
+        let kernel = claim_kernel(&terms, 1 << ll.log_cells);
+        let mut monos: Vec<Vec<F>> = front
+            .state
+            .hypercube_evals
+            .iter()
+            .map(|t| hypercube_to_monomial_coeffs(t))
+            .collect();
+        let functional = |mono: &[F]| {
+            mono.iter()
+                .zip(&kernel)
+                .fold(E::ZERO, |acc, (&c, &k)| acc + k.mul_base(c))
+        };
+        let value = functional(&monos[0]);
+        let companion_claims: [E; COMPANIONS] =
+            core::array::from_fn(|j| functional(&monos[1 + j]));
+        let (scalars, claim) = blend_claim(&mut tr, value, &companion_claims);
+        let opening = whir_open_blend(&front.state, &scalars, &monos, kernel, claim, &mut tr);
+        for secret in &mut monos {
+            dregg_sig_asm::volatile_fill(secret, F::ZERO);
+        }
+        LookupProof {
+            commitment: front.commitment,
+            mask_sum: front.mask_sum,
+            rounds: front.rounds,
+            values: front.values,
+            companion_claims,
+            opening,
+        }
+    });
+
     Ok(ZkHemProof {
         commitment,
         row_mask_sum,
@@ -1338,6 +1617,7 @@ fn prove_with_claimed_publics(
         col_rounds,
         companion_claims,
         opening,
+        lookup,
     })
 }
 
@@ -1364,6 +1644,21 @@ pub struct ZkHemSplitProof {
     pub col_rounds: Vec<Vec<E>>,
     pub companion_claims: [E; COMPANIONS],
     pub opening: HemWhirSplitOpeningProof,
+    /// Present exactly when the relation has lookups.
+    pub lookup: Option<SplitLookupProof>,
+}
+
+/// [`LookupProof`] for a split proof: committer `i` commits to its additive share of the
+/// helper table and of four companions under `roots[i]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitLookupProof {
+    /// One root per committer, in the order of [`ZkHemSplitProof::roots`].
+    pub roots: Vec<CanopyCommitment>,
+    pub mask_sum: E,
+    pub rounds: Vec<Vec<E>>,
+    pub values: [E; 3],
+    pub companion_claims: [E; COMPANIONS],
+    pub opening: HemWhirSplitOpeningProof,
 }
 
 impl ZkHemSplitProof {
@@ -1374,6 +1669,12 @@ impl ZkHemSplitProof {
             row_values: self.row_values,
             col_mask_sum: self.col_mask_sum,
             col_rounds: &self.col_rounds,
+            lookup: self.lookup.as_ref().map(|l| LookupMessages {
+                roots: LookupRoots::Split(&l.roots),
+                mask_sum: l.mask_sum,
+                rounds: &l.rounds,
+                values: l.values,
+            }),
         }
     }
 
@@ -1398,6 +1699,18 @@ impl ZkHemSplitProof {
             .for_each(|v| push(&mut out, v));
         self.companion_claims.iter().for_each(|v| push(&mut out, v));
         self.opening.push_bytes(&mut out);
+        // A relation with lookups appends: one helper root per committer, mask sum, rounds,
+        // values, companion claims, helper opening.
+        if let Some(l) = &self.lookup {
+            for root in &l.roots {
+                out.extend_from_slice(&root.to_bytes());
+            }
+            push(&mut out, &l.mask_sum);
+            l.rounds.iter().flatten().for_each(|v| push(&mut out, v));
+            l.values.iter().for_each(|v| push(&mut out, v));
+            l.companion_claims.iter().for_each(|v| push(&mut out, v));
+            l.opening.push_bytes(&mut out);
+        }
         out
     }
 
@@ -1440,7 +1753,39 @@ impl ZkHemSplitProof {
             take(&mut pos)?,
         ];
         let (opening, used) = HemWhirSplitOpeningProof::from_bytes_canonical(bytes.get(pos..)?)?;
-        (pos + used == bytes.len()).then_some(Self {
+        pos += used;
+        let lookup = match &layout.lookup {
+            None => None,
+            Some(ll) => {
+                let mut helper_roots = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (root, used) = CanopyCommitment::from_bytes_canonical(bytes.get(pos..)?)?;
+                    pos += used;
+                    helper_roots.push(root);
+                }
+                let mask_sum = take(&mut pos)?;
+                let rounds = rounds(&mut pos, ll.log_entries, LOOKUP_DEGREE)?;
+                let values = [take(&mut pos)?, take(&mut pos)?, take(&mut pos)?];
+                let companion_claims = [
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                    take(&mut pos)?,
+                ];
+                let (opening, used) =
+                    HemWhirSplitOpeningProof::from_bytes_canonical(bytes.get(pos..)?)?;
+                pos += used;
+                Some(SplitLookupProof {
+                    roots: helper_roots,
+                    mask_sum,
+                    rounds,
+                    values,
+                    companion_claims,
+                    opening,
+                })
+            }
+        };
+        (pos == bytes.len()).then_some(Self {
             roots,
             row_mask_sum,
             row_rounds,
@@ -1449,6 +1794,7 @@ impl ZkHemSplitProof {
             col_rounds,
             companion_claims,
             opening,
+            lookup,
         })
     }
 }
@@ -1467,6 +1813,11 @@ pub fn split_transcript(
     let mut params = shape.digest().to_vec();
     for n in [layout.log_cells, layout.var_bits, layout.blind_cells] {
         params.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    if let Some(ll) = &layout.lookup {
+        for n in [ll.log_cells, ll.log_entries, ll.blind_cells] {
+            params.extend_from_slice(&(n as u64).to_le_bytes());
+        }
     }
     let mut root_bytes = vec![roots.len() as u8];
     for root in roots {
@@ -1497,7 +1848,7 @@ pub fn verify_split(
         return false;
     };
     let (scalars, claim) = blend_claim(&mut tr, front.value, &proof.companion_claims);
-    whir_verify_blend_split(
+    if !whir_verify_blend_split(
         &proof.roots,
         layout.log_cells,
         &scalars,
@@ -1506,7 +1857,29 @@ pub fn verify_split(
         &proof.opening,
         &mut tr,
         &layout.schedule,
-    )
+    ) {
+        return false;
+    }
+    match (&front.lookup, &proof.lookup, &layout.lookup) {
+        (None, None, None) => true,
+        (Some(table), Some(lp), Some(ll)) => {
+            if lp.roots.len() != proof.roots.len() {
+                return false;
+            }
+            let (scalars, claim) = blend_claim(&mut tr, table.value, &lp.companion_claims);
+            whir_verify_blend_split(
+                &lp.roots,
+                ll.log_cells,
+                &scalars,
+                &table.terms,
+                claim,
+                &lp.opening,
+                &mut tr,
+                &ll.schedule,
+            )
+        }
+        _ => false,
+    }
 }
 
 // ============================================================================
@@ -1521,13 +1894,58 @@ pub struct FrontMessages<'a> {
     pub row_values: [E; 3],
     pub col_mask_sum: E,
     pub col_rounds: &'a [Vec<E>],
+    /// The lookup messages; required exactly when the relation has lookups.
+    pub lookup: Option<LookupMessages<'a>>,
 }
 
-/// What steps 1 to 4 leave to the commitment: `sum_t weight_t Z(point_t) = value`.
+/// The prover messages of the lookup steps L1 to L3.
+#[derive(Clone, Copy, Debug)]
+pub struct LookupMessages<'a> {
+    pub roots: LookupRoots<'a>,
+    pub mask_sum: E,
+    pub rounds: &'a [Vec<E>],
+    pub values: [E; 3],
+}
+
+/// The helper commitment as the transcript binds it.
+#[derive(Clone, Copy, Debug)]
+pub enum LookupRoots<'a> {
+    /// One prover's commitment.
+    Single(&'a CanopyCommitment),
+    /// One root per committer of a split proof, in committer order.
+    Split(&'a [CanopyCommitment]),
+}
+
+impl LookupRoots<'_> {
+    /// The bytes absorbed under `ZKHEM_LK_ROOT`.
+    pub fn transcript_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Single(root) => root.to_bytes().to_vec(),
+            Self::Split(roots) => {
+                let mut out = vec![roots.len() as u8];
+                for root in *roots {
+                    out.extend_from_slice(&root.to_bytes());
+                }
+                out
+            }
+        }
+    }
+}
+
+/// A linear claim on one committed table: `sum_t weight_t W(point_t) = value`.
+#[derive(Clone, Debug)]
+pub struct TableClaim {
+    pub terms: Vec<WeightedPoint>,
+    pub value: E,
+}
+
+/// What steps 1 to 4 leave to the commitment: `sum_t weight_t Z(point_t) = value`, and for
+/// a relation with lookups the claim on the helper table.
 #[derive(Clone, Debug)]
 pub struct FrontClaim {
     pub terms: Vec<WeightedPoint>,
     pub value: E,
+    pub lookup: Option<TableClaim>,
 }
 
 /// The verifier's steps 1 to 4 on a transcript that has bound the commitment: replays both
@@ -1547,6 +1965,11 @@ pub fn replay_front(
     {
         return None;
     }
+    let lookup = match (shape.lookups(), &layout.lookup, &msgs.lookup) {
+        (None, None, None) => None,
+        (Some(lookups), Some(ll), Some(lm)) => Some((lookups, ll, lookup_replay(lookups, tr, lm)?)),
+        _ => return None,
+    };
     let tau = squeeze_point(tr, b"ZKHEM_TAU", shape.log_rows);
     tr.absorb_ext4(b"ZKHEM_ROW_MASK_SUM", msgs.row_mask_sum);
     let rho1 = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO1").get();
@@ -1563,10 +1986,13 @@ pub fn replay_front(
     // The value the committed row mask must take at `rx`.
     let row_mask_at_point = (row_final - gate) * rho1.inv();
 
-    let combine = squeeze_point(tr, b"ZKHEM_COMBINE", 3);
+    let combine = squeeze_point(tr, b"ZKHEM_COMBINE", if lookup.is_some() { 5 } else { 3 });
     tr.absorb_ext4(b"ZKHEM_COL_MASK_SUM", msgs.col_mask_sum);
     let rho2 = NonzeroChallenge::squeeze(tr, b"ZKHEM_RHO2").get();
-    let col_claim = combine[0] * va + combine[1] * vb + combine[2] * vc;
+    let mut col_claim = combine[0] * va + combine[1] * vb + combine[2] * vc;
+    if let Some((_, _, replay)) = &lookup {
+        col_claim += combine[3] * replay.values[0] + combine[4] * replay.values[1];
+    }
     let (col_final, ry) = verify_sumcheck(
         tr,
         b"ZKHEM_COL_ROUND",
@@ -1584,7 +2010,23 @@ pub fn replay_front(
         ry: &ry,
         lambda,
         rho2,
-        matrix_at_point: matrix_at(shape, &rx, &ry, &combine),
+        matrix_at_point: matrix_at(
+            shape,
+            &rx,
+            &ry,
+            &combine,
+            lookup.as_ref().map(|(l, _, r)| (*l, r.point.as_slice(), r.gamma)),
+        ),
+    });
+    let lookup = lookup.map(|(_, ll, replay)| {
+        let lambda = tr.squeeze_ext4(b"ZKHEM_LK_LAMBDA");
+        TableClaim {
+            terms: lookup_claim_terms(ll, &replay.point, lambda),
+            value: batched_value(
+                lambda,
+                &[replay.mask_sum, replay.mask_at_point, replay.values[2]],
+            ),
+        }
     });
     let mut values = vec![
         msgs.row_mask_sum,
@@ -1596,7 +2038,11 @@ pub fn replay_front(
     values.extend(public_inputs.iter().map(|&v| E::from_base(v)));
     let value = batched_value(lambda, &values);
 
-    Some(FrontClaim { terms, value })
+    Some(FrontClaim {
+        terms,
+        value,
+        lookup,
+    })
 }
 
 /// Step 5 after the companion claims: binds them, draws `beta`, and returns the blend
@@ -1644,10 +2090,34 @@ fn verify_sumcheck(
 }
 
 /// `sum_i eq(rx, i) (r_a A + r_b B + r_c C)[i, .]` evaluated at `ry` on the variable cells.
-fn matrix_at(shape: &Shape, rx: &[E], ry: &[E], combine: &[E]) -> E {
+///
+/// With `lookup = (lookups, rl, gamma)` it adds
+/// `sum_i eq(rl, i) (combine[3] N + combine[4] sum_c gamma^c D_c)[i, .]`.
+fn matrix_at(
+    shape: &Shape,
+    rx: &[E],
+    ry: &[E],
+    combine: &[E],
+    lookup: Option<(&Lookups, &[E], E)>,
+) -> E {
     let eq_rx = eq_table(rx);
     let eq_ry = eq_table(ry);
     let cols = &eq_ry[..shape.num_vars];
+    let lookup_part = lookup.map_or(E::ZERO, |(lookups, rl, gamma)| {
+        let eq_rl = eq_table(rl);
+        let dot = |m: &super::relation::Csr, i: usize| {
+            m.row(i)
+                .fold(E::ZERO, |acc, (col, val)| acc + cols[col].mul_base(val))
+        };
+        (0..eq_rl.len()).fold(E::ZERO, |acc, i| {
+            let value = lookups
+                .den
+                .iter()
+                .rev()
+                .fold(E::ZERO, |v, m| v * gamma + dot(m, i));
+            acc + eq_rl[i] * (combine[3] * dot(&lookups.num, i) + combine[4] * value)
+        })
+    });
     let row_term = |i: usize| {
         let mut row = E::ZERO;
         for (m, &r) in [&shape.a, &shape.b, &shape.c].into_iter().zip(combine) {
@@ -1665,9 +2135,9 @@ fn matrix_at(shape: &Shape, rx: &[E], ry: &[E], combine: &[E]) -> E {
             chunk.iter().fold(E::ZERO, |acc, &i| acc + row_term(i))
         })
         .into_iter()
-        .fold(E::ZERO, |acc, part| acc + part);
+        .fold(lookup_part, |acc, part| acc + part);
     }
-    (0..eq_rx.len()).fold(E::ZERO, |acc, i| acc + row_term(i))
+    (0..eq_rx.len()).fold(lookup_part, |acc, i| acc + row_term(i))
 }
 
 /// Verify a zk-Hem proof for `shape` with the given public inputs, bound to `statement`.
@@ -1693,7 +2163,7 @@ pub fn verify(
     };
     let (scalars, claim) = blend_claim(&mut tr, front.value, &proof.companion_claims);
     let terms = front.terms;
-    whir_verify_blend(
+    if !whir_verify_blend(
         &proof.commitment,
         layout.log_cells,
         &scalars,
@@ -1702,7 +2172,346 @@ pub fn verify(
         &proof.opening,
         &mut tr,
         &layout.schedule,
-    )
+    ) {
+        return false;
+    }
+    // Step L4: the helper table's claim, opened like the assignment table's.
+    match (&front.lookup, &proof.lookup, &layout.lookup) {
+        (None, None, None) => true,
+        (Some(table), Some(lp), Some(ll)) => {
+            let (scalars, claim) = blend_claim(&mut tr, table.value, &lp.companion_claims);
+            whir_verify_blend(
+                &lp.commitment,
+                ll.log_cells,
+                &scalars,
+                &table.terms,
+                claim,
+                &lp.opening,
+                &mut tr,
+                &ll.schedule,
+            )
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Lookups
+// ============================================================================
+
+/// The summand of the lookup sumcheck at one point, without the mask:
+/// `sel (h + lambda eq (h (alpha - v) - n))`.
+#[inline]
+fn lookup_gate(sel: E, eq: E, alpha: E, lambda: E, [n, v, h]: [E; 3]) -> E {
+    sel * (h + lambda * eq * (h * (alpha - v) - n))
+}
+
+/// Whether the masking entries make `(n, v, h)(rl)` uniform.
+pub fn lookup_masks_full_rank(lookups: &Lookups, rl: &[E]) -> bool {
+    CornerPadBasis::new(rl[0], rl[1]).is_some()
+        && !corner_factor(rl, lookups.num_checked()).is_zero()
+}
+
+/// The batched linear functional on the helper table: the lookup-mask sum, the mask at
+/// `rl` and the helper value at `rl`, with weights `1, lambda, lambda^2`.
+fn lookup_claim_terms(ll: &LookupLayout, rl: &[E], lambda: E) -> Vec<WeightedPoint> {
+    let (l, d) = (ll.log_cells, ll.log_entries);
+    let lam = [E::ONE, lambda, lambda * lambda];
+    let half = pow2(d - 1);
+    let mut terms = Vec::with_capacity(4 * (3 * d + 1));
+    let mut push = |weight: E, point: Vec<E>| terms.push(WeightedPoint { weight, point });
+    for (j, &limb) in limb_basis().iter().enumerate() {
+        for (i, &r) in rl.iter().enumerate() {
+            let block = ll.mask_block(i, j);
+            push(
+                lam[0] * half * limb,
+                block_point(l, block, &[E::ZERO; LOOKUP_MASK_BITS]),
+            );
+            push(
+                lam[0] * half * limb,
+                block_point(l, block, &[E::ONE; LOOKUP_MASK_BITS]),
+            );
+            push(
+                lam[1] * limb,
+                block_point(l, block, &pow2_coords(r, LOOKUP_MASK_BITS)),
+            );
+        }
+        push(lam[2] * limb, block_point(l, ll.limb_block(j), rl));
+    }
+    terms
+}
+
+/// What the verifier keeps of the lookup steps L1 to L3.
+struct LookupReplay {
+    gamma: E,
+    point: Vec<E>,
+    values: [E; 3],
+    mask_sum: E,
+    /// The value the committed lookup mask must take at `point`.
+    mask_at_point: E,
+}
+
+/// The verifier's lookup steps L1 to L3 on a transcript that has bound the assignment
+/// commitment.
+fn lookup_replay(
+    lookups: &Lookups,
+    tr: &mut FiatShamirTranscript<InstanceBound>,
+    msgs: &LookupMessages<'_>,
+) -> Option<LookupReplay> {
+    if msgs.rounds.len() != lookups.log_entries {
+        return None;
+    }
+    let gamma = tr.squeeze_ext4(b"ZKHEM_LK_GAMMA");
+    let alpha = tr.squeeze_ext4(b"ZKHEM_LK_ALPHA");
+    tr.absorb(b"ZKHEM_LK_ROOT", &msgs.roots.transcript_bytes());
+    let tau = squeeze_point(tr, b"ZKHEM_LK_TAU", lookups.log_entries);
+    let lambda = tr.squeeze_ext4(b"ZKHEM_LK_BATCH");
+    tr.absorb_ext4(b"ZKHEM_LK_MASK_SUM", msgs.mask_sum);
+    let rho = NonzeroChallenge::squeeze(tr, b"ZKHEM_LK_RHO").get();
+    let (last, point) = verify_sumcheck(
+        tr,
+        b"ZKHEM_LK_ROUND",
+        msgs.rounds,
+        LOOKUP_DEGREE,
+        rho * msgs.mask_sum,
+    )?;
+    tr.absorb_ext4_slice(b"ZKHEM_LK_VALUES", &msgs.values);
+    let gate = lookup_gate(
+        prefix_indicator(&point, lookups.num_checked()),
+        eq_eval(&tau, &point),
+        alpha,
+        lambda,
+        msgs.values,
+    );
+    Some(LookupReplay {
+        gamma,
+        mask_at_point: (last - gate) * rho.inv(),
+        point,
+        values: msgs.values,
+        mask_sum: msgs.mask_sum,
+    })
+}
+
+/// Invert every entry in place; `false` (entries unspecified) if one is zero.
+fn batch_invert(values: &mut [E]) -> bool {
+    let mut prefix = Vec::with_capacity(values.len());
+    let mut acc = E::ONE;
+    for &v in values.iter() {
+        prefix.push(acc);
+        acc *= v;
+    }
+    if acc.is_zero() {
+        return false;
+    }
+    let mut inv = acc.inv();
+    for (v, p) in values.iter_mut().zip(prefix).rev() {
+        let next = inv * *v;
+        *v = inv * p;
+        inv = next;
+    }
+    true
+}
+
+/// One round of the lookup sumcheck as `LOOKUP_DEGREE + 1` coefficients.
+fn lookup_round(
+    [eq, n, v, h]: [&[E]; 4],
+    selector: &PrefixSelector,
+    alpha: E,
+    lambda: E,
+) -> Vec<E> {
+    // Pairs above the selector boundary are masking entries: their summand is zero.
+    let live = (selector.count / 2 + 1).min(eq.len() / 2);
+    let mut evals = round_evals::<{ LOOKUP_DEGREE + 1 }>(0..live, |i| {
+        let line = |t: &[E]| (t[2 * i], t[2 * i + 1] - t[2 * i]);
+        let (mut e, de) = line(eq);
+        let (mut nn, dn) = line(n);
+        let (mut vv, dv) = line(v);
+        let (mut hh, dh) = line(h);
+        let mut s = selector.at(2 * i);
+        let ds = selector.at(2 * i + 1) - s;
+        core::array::from_fn(|_| {
+            let value = lookup_gate(s, e, alpha, lambda, [nn, vv, hh]);
+            e += de;
+            nn += dn;
+            vv += dv;
+            hh += dh;
+            s += ds;
+            value
+        })
+    });
+    let coeffs = evals_to_coeffs(&evals);
+    dregg_sig_asm::volatile_fill(&mut evals, E::ZERO);
+    coeffs
+}
+
+/// The prover's state after the lookup steps L1 to L3.
+struct LookupFront {
+    commitment: CanopyCommitment,
+    state: crate::pcs::HemWhirProverState,
+    gamma: E,
+    mask_sum: E,
+    rounds: Vec<Vec<E>>,
+    point: Vec<E>,
+    values: [E; 3],
+}
+
+/// Lookup steps L1 to L3 for the prover: draws `gamma` and `alpha`, commits the helper
+/// table, runs the masked lookup sumcheck and reveals `(n, v, h)(rl)`.
+fn lookup_prove_front(
+    lookups: &Lookups,
+    ll: &LookupLayout,
+    z: &[F],
+    tr: &mut FiatShamirTranscript<InstanceBound>,
+    stream: &mut SeedStream,
+    check: bool,
+) -> Result<LookupFront, ZkHemError> {
+    let _phase = crate::profile::span("hem_lookup");
+    let d = lookups.log_entries;
+    let (entries, checked) = (lookups.num_entries(), lookups.num_checked());
+    let gamma = tr.squeeze_ext4(b"ZKHEM_LK_GAMMA");
+    let alpha = tr.squeeze_ext4(b"ZKHEM_LK_ALPHA");
+
+    // Numerators, values and helpers of every entry.
+    let mut n = vec![E::ZERO; entries];
+    let mut v = vec![E::ZERO; entries];
+    let chunk = par_chunk(entries);
+    for_each_chunk_mut(&mut n, chunk, |k, part| {
+        for (j, slot) in part.iter_mut().enumerate() {
+            *slot = E::from_base(lookups.num.row_dot(k * chunk + j, z));
+        }
+    });
+    for_each_chunk_mut(&mut v, chunk, |k, part| {
+        for (j, slot) in part.iter_mut().enumerate() {
+            let i = k * chunk + j;
+            *slot = lookups
+                .den
+                .iter()
+                .rev()
+                .fold(E::ZERO, |acc, m| acc * gamma + E::from_base(m.row_dot(i, z)));
+        }
+    });
+    let mut h: Vec<E> = v.iter().map(|&v| alpha - v).collect();
+    let wipe = |tables: [&mut Vec<E>; 3]| {
+        for t in tables {
+            dregg_sig_asm::volatile_fill(t, E::ZERO);
+        }
+    };
+    if !batch_invert(&mut h[..checked]) {
+        wipe([&mut n, &mut v, &mut h]);
+        return Err(ZkHemError::MaskRankDeficient);
+    }
+    let mut total = E::ZERO;
+    for (slot, &num) in h[..checked].iter_mut().zip(&n) {
+        *slot *= num;
+        total += *slot;
+    }
+    // A nonzero sum means a looked-up tuple is not a table row or a multiplicity is wrong
+    // (up to the soundness error of `alpha`).
+    if check && !total.is_zero() {
+        wipe([&mut n, &mut v, &mut h]);
+        return Err(ZkHemError::Unsatisfied);
+    }
+    for slot in &mut h[checked..] {
+        *slot = stream.next_ext4();
+    }
+
+    // The helper table and its commitment.
+    let cells = 1usize << ll.log_cells;
+    let mask = Mask::sample(stream, d, LOOKUP_DEGREE);
+    let mut table = vec![F::ZERO; cells];
+    for (i, value) in h.iter().enumerate() {
+        for (j, limb) in value.to_limbs().into_iter().enumerate() {
+            table[ll.limb_block(j) + i] = limb;
+        }
+    }
+    mask.write(&mut table, LOOKUP_MASK_BITS, |i, j| ll.mask_block(i, j));
+    for slot in &mut table[cells - ll.blind_cells..] {
+        *slot = stream.next_base();
+    }
+    let mut polys = Vec::with_capacity(1 + COMPANIONS);
+    polys.push(table);
+    for _ in 0..COMPANIONS {
+        polys.push((0..cells).map(|_| stream.next_base()).collect());
+    }
+    let mut salt_seed = [0u8; 32];
+    for chunk in salt_seed.chunks_mut(8) {
+        chunk.copy_from_slice(&stream.next_base().to_le_bytes());
+    }
+    let (commitment, state) =
+        whir_commit_batch_secret_with_schedule(polys, &salt_seed, &ll.schedule);
+    dregg_sig_asm::volatile_fill(&mut salt_seed, 0u8);
+    tr.absorb(
+        b"ZKHEM_LK_ROOT",
+        &LookupRoots::Single(&commitment).transcript_bytes(),
+    );
+
+    // The masked sumcheck of `sel (h + lambda eq (h (alpha - v) - n))`, whose sum is zero.
+    let tau = squeeze_point(tr, b"ZKHEM_LK_TAU", d);
+    let lambda = tr.squeeze_ext4(b"ZKHEM_LK_BATCH");
+    let libra = mask.libra();
+    let mask_sum = libra.sum();
+    tr.absorb_ext4(b"ZKHEM_LK_MASK_SUM", mask_sum);
+    let rho = NonzeroChallenge::squeeze(tr, b"ZKHEM_LK_RHO").get();
+    let mut eq = eq_table(&tau);
+    let mut selector = PrefixSelector::new(checked);
+    let bind = |c: E, tables: [&mut Vec<E>; 4], selector: &mut PrefixSelector| {
+        let [eq, n, v, h] = tables;
+        fold_in_place(eq, c, false);
+        for t in [n, v, h] {
+            fold_in_place(t, c, true);
+        }
+        selector.fold(c);
+    };
+    let (rounds, point) = sumcheck(tr, b"ZKHEM_LK_ROUND", d, Some((&libra, rho)), |c| {
+        if let Some(c) = c {
+            bind(c, [&mut eq, &mut n, &mut v, &mut h], &mut selector);
+        }
+        lookup_round([&eq, &n, &v, &h], &selector, alpha, lambda)
+    });
+    bind(
+        point[d - 1],
+        [&mut eq, &mut n, &mut v, &mut h],
+        &mut selector,
+    );
+    let values = [n[0], v[0], h[0]];
+    wipe([&mut n, &mut v, &mut h]);
+    if !lookup_masks_full_rank(lookups, &point) {
+        return Err(ZkHemError::MaskRankDeficient);
+    }
+    tr.absorb_ext4_slice(b"ZKHEM_LK_VALUES", &values);
+    Ok(LookupFront {
+        commitment,
+        state,
+        gamma,
+        mask_sum,
+        rounds,
+        point,
+        values,
+    })
+}
+
+/// Adds `sum_i eq_rl[i] (weights[0] N + weights[1] sum_c gamma^c D_c)[i, .]` to the column
+/// table.
+pub fn lookup_column_add(
+    table: &mut [E],
+    lookups: &Lookups,
+    eq_rl: &[E],
+    weights: [E; 2],
+    gamma: E,
+) {
+    for (i, &eq) in eq_rl.iter().enumerate() {
+        let weight = weights[0] * eq;
+        for (col, val) in lookups.num.row(i) {
+            table[col] += weight.mul_base(val);
+        }
+        let mut weight = weights[1] * eq;
+        for m in &lookups.den {
+            for (col, val) in m.row(i) {
+                table[col] += weight.mul_base(val);
+            }
+            weight *= gamma;
+        }
+    }
 }
 
 /// Non-hiding Hem proof. Use only when revealing the assignment is acceptable.
@@ -1717,7 +2526,12 @@ pub struct PublicHemProof {
     pub opening: HemWhirOpeningProof,
 }
 
+/// Layout of the non-hiding modes. They do not prove lookups: `None` for a relation that
+/// has any.
 fn public_layout(shape: &Shape, regime: WhirSecurityRegime) -> Option<Layout> {
+    if shape.lookups().is_some() {
+        return None;
+    }
     let var_bits = shape
         .num_vars
         .checked_next_power_of_two()?
@@ -1728,6 +2542,15 @@ fn public_layout(shape: &Shape, regime: WhirSecurityRegime) -> Option<Layout> {
         var_bits,
         blind_cells: 0,
         schedule: regime.schedule(var_bits),
+        lookup: None,
+    })
+}
+
+fn public_layout_checked(shape: &Shape, regime: WhirSecurityRegime) -> Result<Layout, ZkHemError> {
+    public_layout(shape, regime).ok_or(if shape.lookups().is_some() {
+        ZkHemError::LookupsUnsupported
+    } else {
+        ZkHemError::RelationTooLarge
     })
 }
 
@@ -1811,7 +2634,7 @@ fn prove_public_inner(
     check: bool,
     claimed: Option<&[F]>,
 ) -> Result<PublicHemProof, ZkHemError> {
-    let layout = public_layout(shape, regime).ok_or(ZkHemError::RelationTooLarge)?;
+    let layout = public_layout_checked(shape, regime)?;
     if assignment.len() != shape.num_vars || (check && assignment.first() != Some(&F::ONE)) {
         return Err(ZkHemError::Unsatisfied);
     }
@@ -1897,7 +2720,7 @@ pub fn verify_public(
     ) else {
         return false;
     };
-    let mut matrix = matrix_at(shape, &rx, &ry, &combine);
+    let mut matrix = matrix_at(shape, &rx, &ry, &combine, None);
     let mut weight = lambda;
     for cell in 0..=shape.num_public {
         // `eq(ry, cell)`: the constant and public-input cells of the column sumcheck.
@@ -2168,7 +2991,7 @@ impl ShapeHologram {
         regime: WhirSecurityRegime,
         include_recursive: bool,
     ) -> Result<Self, ZkHemError> {
-        let layout = public_layout(shape, regime).ok_or(ZkHemError::RelationTooLarge)?;
+        let layout = public_layout_checked(shape, regime)?;
         let var_bits = layout.var_bits;
         let num_rows = shape.num_rows();
 
@@ -3410,7 +4233,7 @@ pub(super) fn candidate_matches_masked_evaluation(
         .iter()
         .zip(weights)
         .fold(E::ZERO, |v, (&z, w)| v + w.mul_base(z));
-    matrix_at(shape, &rx, &ry, &combine) * evaluation == terminal
+    matrix_at(shape, &rx, &ry, &combine, None) * evaluation == terminal
 }
 
 // Test-only observer: uses only the wire proof, statement and public verifier key.
@@ -4932,6 +5755,8 @@ mod tests {
     use super::super::relation::{ConstraintSystem, Lc, MASK_ROWS, sponge12, sponge12_native};
     use super::super::{Pad, pad_map};
     use super::*;
+    use std::string::String;
+    use std::{format, println};
 
     const REGIMES: [WhirSecurityRegime; 2] = [
         WhirSecurityRegime::BciksJohnsonQrom128,
@@ -5375,6 +6200,312 @@ mod tests {
         assert!(!verify(&shape, &[], b"s", regime, &bad));
     }
 
+    /// Bytes `x` range-checked, one of them also looked up with its square in a two-column
+    /// table, and one multiplication row.
+    fn lookup_relation(x: &[u64], square_of_first: u64) -> (Shape, Vec<F>) {
+        let mut cs = ConstraintSystem::new();
+        let squares: Vec<F> = (0..20u64).flat_map(|t| [f(t), f(t * t)]).collect();
+        let table = cs.add_table(2, &squares);
+        let vars: Vec<Lc> = x.iter().map(|&v| cs.alloc(f(v)).into()).collect();
+        for v in &vars {
+            cs.enforce_range8(v);
+        }
+        let sq: Lc = cs.alloc(f(square_of_first)).into();
+        cs.enforce_lookup(table, &[vars[0].clone(), sq.clone()]);
+        let prod = cs.mul(&vars[0], &vars[1]);
+        cs.enforce_zero(Lc::from(prod).plus_const(F::ZERO - f(x[0] * x[1])));
+        cs.finish()
+    }
+
+    const LOOKUP_BYTES: [u64; 7] = [3, 255, 0, 3, 17, 200, 3];
+
+    #[test]
+    fn lookup_proofs_verify_and_roundtrip_in_both_hash_regimes() {
+        let (shape, z) = lookup_relation(&LOOKUP_BYTES, 9);
+        assert!(shape.is_satisfied(&z));
+        let lookups = shape.lookups().unwrap();
+        assert_eq!((lookups.num_lookups, lookups.num_table_rows), (8, 276));
+        for regime in REGIMES {
+            let proof = prove(&shape, z.clone(), b"stmt", regime, &[7; 32]).unwrap();
+            assert!(proof.lookup.is_some());
+            assert!(verify(&shape, &[], b"stmt", regime, &proof));
+            let bytes = proof.to_bytes();
+            let decoded = ZkHemProof::from_bytes(&bytes, &shape, regime).unwrap();
+            assert_eq!(decoded, proof);
+            assert!(ZkHemProof::from_bytes(&bytes[..bytes.len() - 1], &shape, regime).is_none());
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(ZkHemProof::from_bytes(&longer, &shape, regime).is_none());
+            assert!(!verify(&shape, &[], b"other", regime, &proof));
+            // The lookup part cannot be dropped, nor moved to a relation without lookups.
+            let mut stripped = proof.clone();
+            stripped.lookup = None;
+            assert!(!verify(&shape, &[], b"stmt", regime, &stripped));
+            let (plain, plain_z) = preimage_relation([1, 77]);
+            let mut grafted = prove(&plain, plain_z, b"stmt", regime, &[7; 32]).unwrap();
+            grafted.lookup = proof.lookup.clone();
+            assert!(!verify(&plain, &[], b"stmt", regime, &grafted));
+        }
+    }
+
+    #[test]
+    fn a_failed_lookup_is_unsatisfied_refused_and_rejected() {
+        let regime = REGIMES[0];
+        let mut out_of_range = LOOKUP_BYTES;
+        out_of_range[4] = 256;
+        let mut wrong_square = lookup_relation(&LOOKUP_BYTES, 10);
+        let (good_shape, good_z) = lookup_relation(&LOOKUP_BYTES, 9);
+        // A multiplicity that is not the count: the fractions no longer cancel.
+        let mut wrong_count = good_z.clone();
+        wrong_count[good_shape.lookups().unwrap().mult_var_base + 17] += F::ONE;
+        let cases = [
+            lookup_relation(&out_of_range, 9),
+            core::mem::replace(&mut wrong_square, (good_shape.clone(), wrong_count)),
+            wrong_square,
+        ];
+        for (k, (shape, bad)) in cases.into_iter().enumerate() {
+            assert_eq!(shape.digest(), good_shape.digest());
+            assert!(!shape.is_satisfied(&bad), "case {k}");
+            // Only the lookups fail: the rows hold.
+            assert!(row_tables(&shape, &bad, true).is_some());
+            assert_eq!(
+                prove(&shape, bad.clone(), b"s", regime, &[1; 32]),
+                Err(ZkHemError::Unsatisfied),
+                "case {k}"
+            );
+            let forged = prove_inner(&shape, bad, b"s", regime, &[1; 32], false).unwrap();
+            assert!(!verify(&shape, &[], b"s", regime, &forged), "case {k}");
+        }
+    }
+
+    #[test]
+    fn every_lookup_proof_field_is_bound() {
+        let (shape, z) = lookup_relation(&LOOKUP_BYTES, 9);
+        let regime = REGIMES[0];
+        let proof = prove(&shape, z, b"s", regime, &[3; 32]).unwrap();
+        assert!(verify(&shape, &[], b"s", regime, &proof));
+        type Mutation = fn(&mut LookupProof, &dyn Fn(&mut E));
+        let bump = |x: &mut E| *x += E::ONE;
+        let mutations: Vec<Mutation> = vec![
+            |p, b| b(&mut p.mask_sum),
+            |p, b| b(&mut p.rounds[0][0]),
+            |p, b| b(&mut p.rounds[1][4]),
+            |p, b| b(&mut p.rounds.last_mut().unwrap()[2]),
+            |p, b| b(&mut p.values[0]),
+            |p, b| b(&mut p.values[1]),
+            |p, b| b(&mut p.values[2]),
+            |p, b| b(&mut p.companion_claims[0]),
+            |p, b| b(&mut p.companion_claims[3]),
+            |p, b| b(&mut p.opening.stage0_ood_evals[0]),
+            |p, b| b(p.opening.final_coeffs.last_mut().unwrap()),
+            |p, _| p.opening.round0_vals[0] += F::ONE,
+            |p, _| p.opening.round0_salts[0][0] ^= 1,
+            |p, _| p.commitment.root[0] ^= 1,
+        ];
+        for (k, mutate) in mutations.iter().enumerate() {
+            let mut bad = proof.clone();
+            mutate(bad.lookup.as_mut().unwrap(), &bump);
+            assert!(
+                !verify(&shape, &[], b"s", regime, &bad),
+                "mutation {k} accepted"
+            );
+        }
+        // A balanced change of a round polynomial keeps `p(0) + p(1)` but moves `p(c)`.
+        let mut bad = proof.clone();
+        let rounds = &mut bad.lookup.as_mut().unwrap().rounds;
+        rounds[2][1] += E::ONE;
+        rounds[2][2] -= E::ONE;
+        assert!(!verify(&shape, &[], b"s", regime, &bad));
+        // The fields of the assignment part are still bound in a proof with lookups.
+        let mut bad = proof.clone();
+        bad.row_values[0] += E::ONE;
+        assert!(!verify(&shape, &[], b"s", regime, &bad));
+        let mut bad = proof.clone();
+        bad.col_rounds[1][2] += E::ONE;
+        assert!(!verify(&shape, &[], b"s", regime, &bad));
+        let mut bad = proof;
+        bad.opening.round0_vals[0] += F::ONE;
+        assert!(!verify(&shape, &[], b"s", regime, &bad));
+    }
+
+    /// Control for relations without lookups: the shape digest and the proof bytes of a
+    /// fixed relation, statement and seed are the ones computed before lookups existed
+    /// (commit bf3a1e9).
+    #[test]
+    fn lookup_free_shape_digest_and_proof_bytes_are_unchanged() {
+        let (shape, z) = preimage_relation([1, 77]);
+        assert!(shape.lookups().is_none());
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let mut got = vec![hex(&shape.digest())];
+        for regime in REGIMES {
+            let proof = prove(&shape, z.clone(), b"stmt", regime, &[7; 32]).unwrap();
+            assert!(proof.lookup.is_none());
+            let bytes = proof.to_bytes();
+            got.push(format!(
+                "{}:{}",
+                bytes.len(),
+                hex(&cshake256_32(b"QSAG.TEST.ZKHEM.PIN", &bytes))
+            ));
+        }
+        assert_eq!(
+            got,
+            [
+                "429e960689855d733fa92e5004d8874f2af5874f1be6be678e647920c314004f",
+                "255467:aa2e775d1c2e1ddf6830c40151761d2eec6ee68efcb0f16e91fc6efc410ebb6f",
+                "204939:d6d40306fc1fb9406adaebbf471a8dc418f3e791d3c4a07d02f812dcfa36e4bf",
+            ]
+        );
+    }
+
+    #[test]
+    fn lookup_layout_reserves_a_blinder_for_every_opened_stage0_symbol() {
+        let (shape, z) = lookup_relation(&LOOKUP_BYTES, 9);
+        for regime in REGIMES {
+            let layout = Layout::new(&shape, regime).unwrap();
+            let ll = layout.lookup.as_ref().unwrap();
+            let st0 = ll.schedule.stages[0];
+            let proof = prove(&shape, z.clone(), b"s", regime, &[5; 32]).unwrap();
+            let lookup = proof.lookup.as_ref().unwrap();
+            let opened_per_table = lookup.opening.round0_vals.len() / (1 + COMPANIONS);
+            assert!(opened_per_table <= ll.blind_cells);
+            assert_eq!(ll.blind_cells, st0.num_queries << st0.step_vars);
+            assert!(ll.mask_block(ll.log_entries, 0) + ll.blind_cells <= 1 << ll.log_cells);
+            assert_eq!(lookup.rounds.len(), ll.log_entries);
+        }
+    }
+
+    /// The masking entries are a bijection onto the revealed lookup values: for two
+    /// witnesses of one relation there are masking values giving the same `(n, v, h)(rl)`.
+    #[test]
+    fn masking_entries_make_the_revealed_lookup_values_witness_independent() {
+        let (shape, mut z1) = lookup_relation(&LOOKUP_BYTES, 9);
+        // The same product of the first two bytes: the relation carries it as a constant.
+        let (shape2, mut z2) = lookup_relation(&[15, 51, 250, 0, 1, 1, 77], 225);
+        assert_eq!(shape, shape2);
+        let lookups = shape.lookups().unwrap();
+        let mut s = SeedStream::new(b"QSAG.TEST.ZKHEM", &[12; 32]);
+        let (gamma, alpha) = (s.next_ext4(), s.next_ext4());
+        let rl: Vec<E> = (0..lookups.log_entries).map(|_| s.next_ext4()).collect();
+        assert!(lookup_masks_full_rank(lookups, &rl));
+        for slot in &mut z1[shape.mask_var_base..] {
+            *slot = s.next_base();
+        }
+        let eq = build_eq_table_ext4(&rl);
+        let checked = lookups.num_checked();
+        // `(n, v, h)(rl)` for an assignment and the four helper masking cells.
+        let triple = |z: &[F], h_mask: &[F; 4]| -> [E; 3] {
+            let n: Vec<E> = (0..eq.len())
+                .map(|i| E::from_base(lookups.num.row_dot(i, z)))
+                .collect();
+            let v: Vec<E> = (0..eq.len())
+                .map(|i| {
+                    lookups
+                        .den
+                        .iter()
+                        .rev()
+                        .fold(E::ZERO, |acc, m| acc * gamma + E::from_base(m.row_dot(i, z)))
+                })
+                .collect();
+            let h = |i: usize| {
+                if i < checked {
+                    n[i] * (alpha - v[i]).inv()
+                } else {
+                    E::from_base(h_mask[i - checked])
+                }
+            };
+            let at = |t: &dyn Fn(usize) -> E| {
+                (0..eq.len()).fold(E::ZERO, |acc, i| acc + eq[i] * t(i))
+            };
+            [at(&|i| n[i]), at(&|i| v[i]), at(&h)]
+        };
+        let h1: [F; 4] = core::array::from_fn(|_| s.next_base());
+        let want = triple(&z1, &h1);
+        let have = triple(&z2, &[F::ZERO; 4]);
+        let k = corner_factor(&rl, checked);
+        let basis = CornerPadBasis::new(rl[0], rl[1]).unwrap();
+        let base = shape.mask_var_base + MASK_ROWS;
+        let Pad(n_cells) = basis.invert((want[0] - have[0]) * k.inv());
+        z2[base..base + 4].copy_from_slice(&n_cells);
+        let Pad(v_cells) = basis.invert((want[1] - have[1]) * k.inv());
+        z2[base + 4..base + 8].copy_from_slice(&v_cells);
+        let Pad(h2) = basis.invert((want[2] - have[2]) * k.inv());
+        assert!(shape.is_satisfied(&z1) && shape.is_satisfied(&z2));
+        assert_ne!(z1[1], z2[1]);
+        assert_eq!(triple(&z2, &h2), want);
+    }
+
+    #[test]
+    fn modes_without_lookup_support_refuse_a_relation_with_lookups() {
+        let (shape, z) = lookup_relation(&LOOKUP_BYTES, 9);
+        let regime = REGIMES[0];
+        assert_eq!(
+            prove_public(&shape, z, b"s", regime, &[1; 32]),
+            Err(ZkHemError::LookupsUnsupported)
+        );
+        assert_eq!(
+            ShapeHologram::compile(&shape, regime).err(),
+            Some(ZkHemError::LookupsUnsupported)
+        );
+    }
+
+    /// Rows, variables, committed cells and proof bytes of `n` range-checked bytes: one row
+    /// and one variable per bit against one lookup per byte.
+    /// `cargo test --release -p dregg-sig-agg --lib -- --ignored --nocapture measure_range_checks`
+    #[test]
+    #[ignore = "measurement"]
+    fn measure_range_checks_by_bits_and_by_lookup() {
+        let regime = REGIMES[0];
+        for n in [1usize << 10, 1 << 12, 1 << 14, 1 << 16] {
+            let byte = |i: usize| (i * 131 + 7) as u64 & 0xFF;
+            let bits = {
+                let mut cs = ConstraintSystem::new();
+                for i in 0..n {
+                    for b in 0..8 {
+                        let bit: Lc = cs.alloc(f((byte(i) >> b) & 1)).into();
+                        cs.enforce_boolean(&bit);
+                    }
+                }
+                cs.finish()
+            };
+            let lookup = {
+                let mut cs = ConstraintSystem::new();
+                for i in 0..n {
+                    let v: Lc = cs.alloc(f(byte(i))).into();
+                    cs.enforce_range8(&v);
+                }
+                cs.finish()
+            };
+            for (name, (shape, z)) in [("bits", bits), ("lookup", lookup)] {
+                let layout = Layout::new(&shape, regime).unwrap();
+                let start = std::time::Instant::now();
+                let proof = prove(&shape, z, b"m", regime, &[9; 32]).unwrap();
+                let prove_ms = start.elapsed().as_millis();
+                let start = std::time::Instant::now();
+                assert!(verify(&shape, &[], b"m", regime, &proof));
+                let verify_ms = start.elapsed().as_millis();
+                println!(
+                    "bytes={n} {name}: rows=2^{} vars={} table=2^{} helper_table={} \
+                     proof={} B (lookup part {} B) prove={prove_ms} ms verify={verify_ms} ms",
+                    shape.log_rows,
+                    shape.num_vars,
+                    layout.log_cells,
+                    layout
+                        .lookup
+                        .as_ref()
+                        .map_or("-".into(), |l| format!("2^{}", l.log_cells)),
+                    proof.to_bytes().len(),
+                    proof.to_bytes().len()
+                        - ZkHemProof {
+                            lookup: None,
+                            ..proof.clone()
+                        }
+                        .to_bytes()
+                        .len(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn proofs_for_one_relation_do_not_verify_for_another() {
         let (shape, z) = preimage_relation([1, 77]);
@@ -5710,7 +6841,7 @@ mod tests {
         let rx: Vec<E> = (0..shape.log_rows).map(|_| stream.next_ext4()).collect();
         let ry: Vec<E> = (0..vk.var_bits).map(|_| stream.next_ext4()).collect();
         let combine: [E; 3] = core::array::from_fn(|_| stream.next_ext4());
-        let expected_m = matrix_at(&shape, &rx, &ry, &combine);
+        let expected_m = matrix_at(&shape, &rx, &ry, &combine, None);
         let p2_m = eval_poseidon2_interior_native(vk.hologram_meta, &rx, &ry, &combine);
         let eq_rx = eq_table(&rx);
         let eq_ry = eq_table(&ry);
