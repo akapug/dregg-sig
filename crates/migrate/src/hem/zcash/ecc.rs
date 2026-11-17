@@ -23,7 +23,6 @@
 //! assignment follows from evaluating the forms.
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use dregg_sig_agg::field::Goldilocks;
