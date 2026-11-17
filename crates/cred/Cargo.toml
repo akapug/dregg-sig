@@ -1,0 +1,18 @@
+[package]
+name = "dregg-sig-cred"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Threshold PQ Verifiable Credentials, 2-Round Lattice VOPRF, Unlinkable Selective Disclosure, & Dealerless Standard-Verifier FIPS 204 Threshold ML-DSA"
+
+[dependencies]
+dregg-sig-verified = { path = "../verified", default-features = false }
+dregg-sig-core = { path = "../core", default-features = false }
+dregg-sig-asm = { path = "../asm", default-features = false }
+dregg-sig-accel = { path = "../accel", default-features = false, features = ["alloc"] }
+dregg-sig-addr = { path = "../addr" }
+dregg-sig-policy = { path = "../policy" }
+
+[features]
+std = ["dregg-sig-asm/std", "dregg-sig-core/std"]

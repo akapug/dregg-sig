@@ -2,31 +2,31 @@
 #![no_main]
 
 //! Coverage-guided hostile wire-decoder & canonical roundtrip fuzzer across
-//! `qsag-core` (FIPS 205 `SLH-DSA` keys/signatures/SPKI/ADRS for all six SHAKE parameter
-//! sets), `qsag-fts` (`FrontierSumFts` signatures & `RotatedEpochVote` in both profiles, and
-//! the threshold `ParallelSeededSignature`), `qsag-cred` (FIPS 204 `ML-DSA-44/65/87`
-//! `pk_decode` and `sig_decode`), and `qsag-addr` (`Bech32m` `QsagAddress`,
+//! `dregg-sig-core` (FIPS 205 `SLH-DSA` keys/signatures/SPKI/ADRS for all six SHAKE parameter
+//! sets), `dregg-sig-fts` (`FrontierSumFts` signatures & `RotatedEpochVote` in both profiles, and
+//! the threshold `ParallelSeededSignature`), `dregg-sig-cred` (FIPS 204 `ML-DSA-44/65/87`
+//! `pk_decode` and `sig_decode`), and `dregg-sig-addr` (`Bech32m` `QsagAddress`,
 //! `HybridPinnedEnvelope`, and 128-byte `CanonicalIntent128`).
 //!
 //! Every fixture is built in `LLVMFuzzerInitialize` (the `init:` block), before libFuzzer
 //! arms its per-input watchdog.
 
 use libfuzzer_sys::fuzz_target;
-use qsag_accel::CpuReferenceBackend;
-use qsag_addr::{
+use dregg_sig_accel::CpuReferenceBackend;
+use dregg_sig_addr::{
     HybridPinnedEnvelope, QsagAddress, decode_intent_128, decode_verified_intent_128,
     encode_intent_128, try_encode_intent_128,
 };
-use qsag_core::fips205::{
+use dregg_sig_core::fips205::{
     Fips205Params, SlhPublicKey, decode_slh_sig, slh_verify,
 };
-use qsag_core::tsw_baggy::decode_adrs;
-use qsag_cred::{MlDsaLevel, ml_dsa_verify, pk_decode, pk_encode, sig_decode, sig_encode};
-use qsag_fts::parallel_mpc::{
+use dregg_sig_core::tsw_baggy::decode_adrs;
+use dregg_sig_cred::{MlDsaLevel, ml_dsa_verify, pk_decode, pk_encode, sig_decode, sig_encode};
+use dregg_sig_fts::parallel_mpc::{
     LeafBurnPersistence, ParallelSeededError, ParallelSeededParams, ParallelSeededPublicKey,
     ParallelSeededSignature, ParallelSeededThresholdSetup, verify_parallel_seeded_fts,
 };
-use qsag_fts::{
+use dregg_sig_fts::{
     FrontierDpTable, FrontierFtsProfile, FrontierFtsPublicKey, FrontierFtsSignature,
     RotatedEpochVote, verify_frontier_fts,
 };
@@ -114,7 +114,7 @@ fuzz_target!(init: {
 }, |data: &[u8]| {
     let fx = fixtures();
 
-    // 1. `qsag-addr`: Bech32m address codec, HybridPinnedEnvelope, and CanonicalIntent128
+    // 1. `dregg-sig-addr`: Bech32m address codec, HybridPinnedEnvelope, and CanonicalIntent128
     if let Ok(s) = core::str::from_utf8(data) {
         if let Ok(addr) = QsagAddress::decode(s) {
             let reencoded = addr.encode().expect("decoded QsagAddress must re-encode");
@@ -145,7 +145,7 @@ fuzz_target!(init: {
         }
     }
 
-    // 2. `qsag-core`: FIPS 205 SLH-DSA public keys, SPKI DER, ADRS, and signature verification
+    // 2. `dregg-sig-core`: FIPS 205 SLH-DSA public keys, SPKI DER, ADRS, and signature verification
     if let Ok(arr32) = <[u8; 32]>::try_from(data) {
         let _ = decode_adrs(&arr32);
     }
@@ -173,7 +173,7 @@ fuzz_target!(init: {
         let _ = slh_verify(&params, b"fuzz-slh-msg", data, b"ctx", &dummy_pk);
     }
 
-    // 3. `qsag-cred`: FIPS 204 ML-DSA-44 / 65 / 87 untrusted `pk_decode`, `sig_decode`, `ml_dsa_verify`
+    // 3. `dregg-sig-cred`: FIPS 204 ML-DSA-44 / 65 / 87 untrusted `pk_decode`, `sig_decode`, `ml_dsa_verify`
     for level in [MlDsaLevel::MlDsa44, MlDsaLevel::MlDsa65, MlDsaLevel::MlDsa87] {
         let p = &level.params();
         if let Some((rho, t1)) = pk_decode(p, data) {
@@ -186,7 +186,7 @@ fuzz_target!(init: {
         let _ = ml_dsa_verify(level, &dummy_pk, b"fuzz-mldsa", b"ctx", data);
     }
 
-    // 4. `qsag-fts`: FrontierSumFts signatures and `RotatedEpochVote`, decoded, re-encoded
+    // 4. `dregg-sig-fts`: FrontierSumFts signatures and `RotatedEpochVote`, decoded, re-encoded
     //    and verified in both profiles.
     for (profile, dp) in [
         (FrontierFtsProfile::Compact1122, &fx.dp_compact),
@@ -213,7 +213,7 @@ fuzz_target!(init: {
         }
     }
 
-    // 5. `qsag-fts`: threshold `ParallelSeededSignature` strict decoder, canonical
+    // 5. `dregg-sig-fts`: threshold `ParallelSeededSignature` strict decoder, canonical
     //    re-encoding and verification under a real public key, in two geometries.
     let accel = CpuReferenceBackend::new();
     for pk in [&fx.seeded_pk, &fx.custody_pk] {

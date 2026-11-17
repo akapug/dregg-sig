@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![no_main]
 
-//! Coverage-guided hostile wire-decoder & verifier fuzzer for `qsag-agg` (`Hem` WHIR
+//! Coverage-guided hostile wire-decoder & verifier fuzzer for `dregg-sig-agg` (`Hem` WHIR
 //! polynomial commitments and opening proofs, Steiner Merkle-Canopy multi-proofs,
 //! `HemAggregatedProof`, `HierarchicalHemAggregate`, `SuccinctHierarchicalHemAggregate`, and
 //! the `Jorts-Poseidon2` validator key and signature codecs).
@@ -13,7 +13,7 @@
 //! type. Real proofs built in `LLVMFuzzerInitialize` (the `init:` block) seed sparse-edit
 //! mutations, so the verifiers run on inputs that are one field away from valid.
 //!
-//! `qsag_cred::blind_vc::SelectiveDisclosurePresentation` gets its decoder's magic, bounds
+//! `dregg_sig_cred::blind_vc::SelectiveDisclosurePresentation` gets its decoder's magic, bounds
 //! and exact-length checks only. An encoding is at least 4.7 MiB, above the campaign's
 //! `-max_len`, so no input decodes; and a real presentation cannot seed this target either:
 //! measured under coverage instrumentation, building one takes about 200 s and verifying it
@@ -22,19 +22,19 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use qsag_agg::field::{Goldilocks, GoldilocksExt4, mle_eval_base_at_ext4};
-use qsag_agg::pcs::{
+use dregg_sig_agg::field::{Goldilocks, GoldilocksExt4, mle_eval_base_at_ext4};
+use dregg_sig_agg::pcs::{
     CanopyCommitment, CanopyMultiProof, HemWhirBatchOpeningProof, HemWhirOpeningProof,
     WhirSchedule, WhirSecurityRegime, whir_commit_batch_owned_with_schedule, whir_open,
     whir_open_batch, whir_verify_batch_with_schedule, whir_verify_with_schedule,
 };
-use qsag_agg::recursive::{
+use dregg_sig_agg::recursive::{
     ShardHemWitness, VerifiedHierarchicalHemEvidence, check_hierarchical_hem_commitment,
     compress_hierarchical_hem_evidence, hierarchical_hem_message, prove_hierarchical_hem,
     verify_hierarchical_hem, verify_hierarchical_hem_evidence, verify_succinct_hierarchical_hem,
 };
-use qsag_agg::sig::{EpochWalSink, WalEpochState};
-use qsag_agg::{
+use dregg_sig_agg::sig::{EpochWalSink, WalEpochState};
+use dregg_sig_agg::{
     AGG_WIRE_MAGIC, AggSigProfile, FiatShamirTranscript, HIERARCHICAL_HEM_WIRE_MAGIC,
     HemAggConfig, HemAggregatedProof, HemAggregator, HierarchicalHemAggregate, InstanceBound,
     SUCCINCT_HIERARCHICAL_HEM_WIRE_MAGIC, ShardHemPolicy, SigError, SignerBitmap, SigningMode,
@@ -344,7 +344,7 @@ fuzz_target!(init: {
     let fx = fixtures();
 
     if let Ok(presentation) =
-        qsag_cred::blind_vc::SelectiveDisclosurePresentation::from_compact_wire_bytes(data)
+        dregg_sig_cred::blind_vc::SelectiveDisclosurePresentation::from_compact_wire_bytes(data)
     {
         let reencoded = presentation
             .to_compact_wire_bytes()

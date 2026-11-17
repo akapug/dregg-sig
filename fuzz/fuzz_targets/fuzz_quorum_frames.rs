@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![no_main]
 
-//! Coverage-guided hostile wire-decoder and verifier fuzzer for `qsag-quorum`:
+//! Coverage-guided hostile wire-decoder and verifier fuzzer for `dregg-sig-quorum`:
 //!
 //! 1. `wire_channel` frame headers and frames (hostile framing, canonical re-encoding and
 //!    valid-frame payload coverage).
@@ -10,8 +10,8 @@
 //!    (+ `verify_consistency`), `HemShamirCustodianShare::from_vault_bytes`, and the quorum's
 //!    `HemJortsPublicKey` / `HemJortsSignature` codecs (+ `verify_hem_jorts_signature`).
 //! 4. `volatile_coupon::BaggySig::from_wire_bytes` (+ `baggy_verify`) and the root
-//!    certificate codec it embeds, `qsag_core::baggy::BaggySig::from_wire_bytes`
-//!    (+ `qsag_core::baggy::baggy_verify`). Linux only, as the module is.
+//!    certificate codec it embeds, `dregg_sig_core::baggy::BaggySig::from_wire_bytes`
+//!    (+ `dregg_sig_core::baggy::baggy_verify`). Linux only, as the module is.
 //!
 //! `HemSpdzSeedQuorum` has no byte decoder of its own: it publishes the same
 //! `HemJortsPublicKey` and `HemJortsSignature` covered here and exchanges its rounds in
@@ -23,13 +23,13 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use qsag_core::poseidon2_mpc::{
+use dregg_sig_core::poseidon2_mpc::{
     HEM_JORTS_PK_BYTES, HemJortsPublicKey, HemJortsSignature, verify_hem_jorts_signature,
 };
-use qsag_quorum::access::PersonalLatchAck;
-use qsag_quorum::dzk::{decode_elements, encode_elements};
-use qsag_quorum::wire_channel::{FrameHeader, decode_frame, decode_header, encode_frame};
-use qsag_quorum::{HemDynamicShamirQuorum, HemQuorumPublicDirectory, HemShamirCustodianShare};
+use dregg_sig_quorum::access::PersonalLatchAck;
+use dregg_sig_quorum::dzk::{decode_elements, encode_elements};
+use dregg_sig_quorum::wire_channel::{FrameHeader, decode_frame, decode_header, encode_frame};
+use dregg_sig_quorum::{HemDynamicShamirQuorum, HemQuorumPublicDirectory, HemShamirCustodianShare};
 
 const QUORUM_MESSAGE: &[u8] = b"fuzz-hem-quorum-message";
 
@@ -124,13 +124,13 @@ fn check_signature(fx: &Fixtures, bytes: &[u8]) {
 
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 mod coupon {
-    use qsag_core::baggy::{
+    use dregg_sig_core::baggy::{
         BaggyParams, BaggyPublicKey, BaggySig as RootSignature, baggy_reference_keygen,
         baggy_reference_sign, baggy_verify as verify_root,
     };
-    use qsag_core::tsw_baggy::PqSecretKey;
-    use qsag_quorum::quorum_jorts::WOTS_CHAINS;
-    use qsag_quorum::volatile_coupon::{BaggySig, CouponDescriptor, baggy_verify};
+    use dregg_sig_core::tsw_baggy::PqSecretKey;
+    use dregg_sig_quorum::quorum_jorts::WOTS_CHAINS;
+    use dregg_sig_quorum::volatile_coupon::{BaggySig, CouponDescriptor, baggy_verify};
 
     const PARAMS: BaggyParams = BaggyParams::TEST_SMALL;
     const COUPON_MESSAGE: &[u8] = b"fuzz-coupon-message";

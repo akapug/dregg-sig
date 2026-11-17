@@ -1,0 +1,20 @@
+[package]
+name = "dregg-sig-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Authenticated transaction-predicate guard evaluating recipient allowlists, amount velocity caps, anti-self-approval, and quorum-tier rules inside committed BDOZ GF(2^128) MAC barriers."
+
+[features]
+default = ["alloc"]
+alloc = ["dregg-sig-accel/alloc", "dregg-sig-addr/alloc"]
+test-dealer = []
+std = ["dregg-sig-asm/std", "alloc", "dregg-sig-accel/std", "dregg-sig-addr/std"]
+
+[dependencies]
+dregg-sig-verified = { path = "../verified", default-features = false }
+dregg-sig-fts = { path = "../fts", default-features = false }
+dregg-sig-asm = { path = "../asm", default-features = false, features = ["alloc"] }
+dregg-sig-accel = { path = "../accel", default-features = false }
+dregg-sig-addr = { path = "../addr", default-features = false }

@@ -3,7 +3,7 @@
 
 //! Coverage-guided hostile wire-decoder, canonical roundtrip, and adversarial verifier fuzzer
 //! across the `zk-Hem`, recursive shard/WHIR merge, `Corduroy-Poseidon2`, and height-20
-//! `Jorts-Poseidon2` wire codecs in `qsag-agg` (`[C2 P0-2]`, deduplicated from
+//! `Jorts-Poseidon2` wire codecs in `dregg-sig-agg` (`[C2 P0-2]`, deduplicated from
 //! `fuzz_blind_vc_and_agg_decode`):
 //!
 //! 1. `zk_hem::protocol::ZkHemProof::from_bytes` + `protocol::verify`
@@ -30,28 +30,28 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use qsag_agg::field::{Goldilocks, GoldilocksExt4};
-use qsag_agg::pcs::WhirSecurityRegime;
-use qsag_agg::zk_hem::blind_vc::{
+use dregg_sig_agg::field::{Goldilocks, GoldilocksExt4};
+use dregg_sig_agg::pcs::WhirSecurityRegime;
+use dregg_sig_agg::zk_hem::blind_vc::{
     BlindVcStatement, BlindVcWitness, VC_ACCUMULATOR_DEPTH, verify_presentation,
 };
-use qsag_agg::zk_hem::capability::{
+use dregg_sig_agg::zk_hem::capability::{
     BearerCapability, CAPABILITY_WIRE_MAGIC, CapCaveat, CapabilityBatchStatement,
     CapabilityIssuerDirectory, CapabilityParams, CapabilityPresentationInput, CapabilityRelation,
     CapabilityRequest, SortedRevocationTree, ZkCapabilityBatchProof,
 };
-use qsag_agg::zk_hem::full_shard::{
+use dregg_sig_agg::zk_hem::full_shard::{
     FullShardParams, RECURSIVE_SHARD_WIRE_MAGIC, RecursiveShardProof, RecursiveShardStatement,
     verify_recursive_shard,
 };
-use qsag_agg::zk_hem::multisig::{MultisigParams, MultisigRelation};
-use qsag_agg::zk_hem::protocol::{self, PublicHemProof, ZkHemProof};
-use qsag_agg::zk_hem::recursive_whir::{
+use dregg_sig_agg::zk_hem::multisig::{MultisigParams, MultisigRelation};
+use dregg_sig_agg::zk_hem::protocol::{self, PublicHemProof, ZkHemProof};
+use dregg_sig_agg::zk_hem::recursive_whir::{
     ChildWhirMergeRelation, ChildWhirStatement, FixedPathWhirParams, FixedPathWhirProof,
     SuccinctChildWhirMerge, verify_fixed_path, verify_succinct_children_whir_merge,
 };
-use qsag_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape, sponge12};
-use qsag_agg::{
+use dregg_sig_agg::zk_hem::relation::{ConstraintSystem, Lc, Shape, sponge12};
+use dregg_sig_agg::{
     AggSigProfile, SignerBitmap, ValidatorPublicKey, ValidatorSignature,
     verify_individual_signature,
 };

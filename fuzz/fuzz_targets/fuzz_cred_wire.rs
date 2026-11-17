@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![no_main]
 
-//! Coverage-guided hostile wire-decoder fuzzer for the `qsag-cred` protocol messages:
+//! Coverage-guided hostile wire-decoder fuzzer for the `dregg-sig-cred` protocol messages:
 //!
 //! 1. `voprf::Request::from_wire` (client to server) and `Server::evaluate` on the decoded
 //!    request with a peer transport that answers with the fuzzer's choice of garbage.
@@ -19,13 +19,13 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use qsag_cred::fips204_ntt::{MLDSA_Q, Poly256, power2round};
-use qsag_cred::threshold_mldsa::{ThresholdMlDsaSignerShare, ThresholdVerificationPack};
-use qsag_cred::voprf::{
+use dregg_sig_cred::fips204_ntt::{MLDSA_Q, Poly256, power2round};
+use dregg_sig_cred::threshold_mldsa::{ThresholdMlDsaSignerShare, ThresholdVerificationPack};
+use dregg_sig_cred::voprf::{
     Client, CounterStore, Error, Output, PublicKey, Request, Server, Transport, blind,
 };
-use qsag_cred::voprf_spdz::{SpdzPublic, SpdzServer};
-use qsag_cred::{MlDsaLevel, ml_dsa_verify, pk_encode};
+use dregg_sig_cred::voprf_spdz::{SpdzPublic, SpdzServer};
+use dregg_sig_cred::{MlDsaLevel, ml_dsa_verify, pk_encode};
 
 const KEY_COMMITMENT: [u8; 32] = [0x5C; 32];
 const SERVER_PARTY: usize = 2;

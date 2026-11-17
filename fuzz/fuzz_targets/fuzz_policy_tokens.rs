@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 #![no_main]
 
-//! Coverage-guided hostile wire-decoder and verifier fuzzer for the `qsag-policy` bearer
+//! Coverage-guided hostile wire-decoder and verifier fuzzer for the `dregg-sig-policy` bearer
 //! tokens: `SpongeMacaroon` (`QSMAC001`, primary tokens and third-party discharges),
 //! `PqBiscuit` (`QSBSC001`), `PqBiscuitAuthorityPublicKey` (`QSBSCPK1`) and the tagged
 //! secret-key containers `PqBiscuitAuthorityKey` (`QSBSCAK1`) and `PqBiscuitStepKey`
@@ -20,9 +20,9 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use qsag_accel::CpuReferenceBackend;
-use qsag_fts::{FrontierDpTable, FrontierFtsProfile};
-use qsag_policy::{
+use dregg_sig_accel::CpuReferenceBackend;
+use dregg_sig_fts::{FrontierDpTable, FrontierFtsProfile};
+use dregg_sig_policy::{
     CapabilityError, CapabilityRequest, Caveat, Discharge, MacaroonVerifier, PqBiscuit,
     PqBiscuitAuthorityKey, PqBiscuitAuthorityPublicKey, PqBiscuitStepKey, SpongeMacaroon,
 };

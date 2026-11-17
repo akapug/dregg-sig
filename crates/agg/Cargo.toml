@@ -1,0 +1,34 @@
+[package]
+name = "dregg-sig-agg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hem post-quantum K-to-1 hash signature aggregation over GoldilocksExt4: multilinear sumcheck with WHIR rate-escalated Steiner multiproofs"
+
+[features]
+default = ["std"]
+alloc = []
+std = ["alloc", "dregg-sig-asm/std", "dregg-sig-core/std"]
+vulkan = ["std", "dep:dregg-sig-accel", "dregg-sig-accel/vulkan"]
+
+[dependencies]
+dregg-sig-core = { path = "../core", default-features = false }
+dregg-sig-accel = { path = "../accel", optional = true, default-features = false }
+dregg-sig-whir-verified = { path = "../whir-verified", default-features = false }
+dregg-sig-asm = { path = "../asm", default-features = false }
+
+[dev-dependencies]
+# Reference implementation whose internal matrix is analysed by its own unit tests.
+dregg-sig-accel = { path = "../accel" }
+dregg-sig-core = { path = "../core", features = ["std"] }
+dregg-sig-fts = { path = "../fts", features = ["std"] }
+dregg-sig-quorum = { path = "../quorum", features = ["std"] }
+
+[[example]]
+name = "mock_solana_alpenglow"
+required-features = ["std"]
+
+[[example]]
+name = "mock_ethereum_beam"
+required-features = ["std"]

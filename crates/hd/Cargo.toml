@@ -1,0 +1,22 @@
+[package]
+name = "dregg-sig-hd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Signature-key inventory and dealerless linear-module HD custody."
+
+[features]
+default = ["alloc"]
+alloc = ["dregg-sig-accel/alloc", "dregg-sig-addr/alloc"]
+std = ["dregg-sig-core/std", "dregg-sig-asm/std", "alloc", "dregg-sig-accel/std", "dregg-sig-addr/std"]
+# Nonpersistent custody shortcuts (in-memory poison journal, unchecked child-seed
+# reconstruction) for protocol tests. Never enable in a custody build.
+testing-ephemeral = []
+
+[dependencies]
+dregg-sig-verified = { path = "../verified", default-features = false }
+dregg-sig-asm = { path = "../asm", default-features = false, features = ["alloc"] }
+dregg-sig-core = { path = "../core", default-features = false }
+dregg-sig-accel = { path = "../accel", default-features = false }
+dregg-sig-addr = { path = "../addr", default-features = false }
