@@ -14,8 +14,9 @@ use dregg_sig_accel::CpuReferenceBackend;
 use dregg_sig_accel::keccak::cshake256_framed_32;
 use dregg_sig_fts::{FrontierDpTable, FrontierFtsProfile};
 use dregg_sig_policy::{
-    CapabilityError, CapabilityRequest, Caveat, Discharge, MacaroonVerifier, PqBiscuit,
-    PqBiscuitAuthorityKey, PqBiscuitAuthorityPublicKey, PqBiscuitStepKey, SpongeMacaroon,
+    CapabilityError, CapabilityRequest, Caveat, Discharge, FsSealConsumptionStore,
+    MacaroonVerifier, PqBiscuit, PqBiscuitAuthorityKey, PqBiscuitAuthorityPublicKey,
+    PqBiscuitStepKey, SpongeMacaroon,
 };
 
 use crate::anchor::{
@@ -36,7 +37,7 @@ const MACAROON_TOKEN_FORMAT: &str = "qsag-macaroon-token-v1";
 const BISCUIT_AUTH_SK_FORMAT: &str = "qsag-biscuit-authority-secret-v1";
 const BISCUIT_AUTH_PK_FORMAT: &str = "qsag-biscuit-authority-public-v1";
 const BISCUIT_STEP_SK_FORMAT: &str = "qsag-biscuit-step-secret-v1";
-const BISCUIT_TOKEN_FORMAT: &str = "qsag-biscuit-token-v1";
+const BISCUIT_TOKEN_FORMAT: &str = "qsag-biscuit-token-v2";
 const BISCUIT_ANCHOR_DOMAIN: &str = "biscuit_authority";
 
 const MACAROON_HELP: &str = "\
@@ -76,10 +77,16 @@ Post-quantum public-key capability chains over one-time Compact1122 (FrontierSum
   attenuate  --in <biscuit.json> --step-key <step.sk> --token-out <next.json>
              --step-key-out <next.sk> [caveats]
   seal       --in <biscuit.json> --step-key <step.sk> --out <sealed.json>
-             [--bind-request --audience-hex <64-hex> --resource-hex <64-hex>
+             [--bind-request --intent-digest-hex <64-hex> --audience-hex <64-hex> --resource-hex <64-hex>
               [--actions <u64>] [--amount <u128>] [--now <secs>]]
   verify     --public <pk.json> --in <sealed.json> --audience-hex <64-hex>
+             --seal-store <ledger> [--create-seal-store] [--intent-digest-hex <64-hex>]
              --resource-hex <64-hex> [--actions <u64>] [--amount <u128>] [--now <secs>]
+
+Verification consumes each seal once, including bearer seals. Reuse the same trusted
+seal store across accepting processes; create it explicitly once. Request-bound seals
+require the complete canonical intent digest at sealing and verification. Store rollback
+is outside this local ledger's protection. A failed later operation does not refund a seal.
 
 First-party caveat flags:
   --expires-at <secs>  --not-before <secs>  --resource-hex <64-hex>
@@ -108,7 +115,9 @@ fn map_cap_err(err: CapabilityError) -> CliError {
         | CapabilityError::Denied
         | CapabilityError::MissingDischarge
         | CapabilityError::UnboundDischarge
-        | CapabilityError::UnusedDischarge => {
+        | CapabilityError::UnusedDischarge
+        | CapabilityError::Replay
+        | CapabilityError::ConsumptionFailed => {
             CliError::new(exit::POLICY_DENIED, format!("capability denied: {err:?}"))
         }
     }
@@ -177,12 +186,21 @@ fn parse_capability_request(args: &Args) -> Result<CapabilityRequest, CliError> 
         None => unix_now()?,
     };
     Ok(CapabilityRequest {
+        intent_digest: [0; 32],
         audience,
         resource,
         actions,
         amount,
         now,
     })
+}
+
+// Bind the application's canonical complete intent, not just predicate facts.
+fn parse_bound_capability_request(args: &Args) -> Result<CapabilityRequest, CliError> {
+    let mut request = parse_capability_request(args)?;
+    request.intent_digest =
+        from_hex_exact(args.require("intent-digest-hex")?, "--intent-digest-hex")?;
+    Ok(request)
 }
 
 fn load_macaroon_key(path: &str, pass: Option<&[u8]>) -> Result<Secret32, CliError> {
@@ -925,6 +943,7 @@ fn biscuit_seal(raw: &[String]) -> Result<(), CliError> {
             "actions",
             "amount",
             "now",
+            "intent-digest-hex",
         ],
         &["bind-request", "json", "help"],
     )?;
@@ -937,7 +956,7 @@ fn biscuit_seal(raw: &[String]) -> Result<(), CliError> {
     let out_path = args.require("out")?;
     ensure_absent(out_path)?;
     let bound_req = if args.flag("bind-request") {
-        Some(parse_capability_request(&args)?)
+        Some(parse_bound_capability_request(&args)?)
     } else {
         None
     };
@@ -971,14 +990,16 @@ fn biscuit_verify(raw: &[String]) -> Result<(), CliError> {
         raw,
         &[
             "public",
+            "seal-store",
             "in",
             "audience-hex",
             "resource-hex",
             "actions",
             "amount",
             "now",
+            "intent-digest-hex",
         ],
-        &["json", "help"],
+        &["json", "help", "create-seal-store"],
     )?;
     if args.flag("help") {
         print!("{BISCUIT_HELP}");
@@ -989,9 +1010,25 @@ fn biscuit_verify(raw: &[String]) -> Result<(), CliError> {
     let pk = PqBiscuitAuthorityPublicKey::from_bytes(&pk_doc.field_hex("public_key")?)
         .map_err(map_cap_err)?;
     let token = load_biscuit_token(args.require("in")?)?;
-    let req = parse_capability_request(&args)?;
+    let req = if token.is_request_bound() {
+        parse_bound_capability_request(&args)?
+    } else {
+        parse_capability_request(&args)?
+    };
+    let store_path = args.require("seal-store")?;
+    let mut consumption = if args.flag("create-seal-store") {
+        FsSealConsumptionStore::create_new(store_path, dregg_sig_policy::MAX_BURNED_INTENT_NONCES)
+    } else {
+        FsSealConsumptionStore::open_existing(
+            store_path,
+            dregg_sig_policy::MAX_BURNED_INTENT_NONCES,
+        )
+    }
+    .map_err(|e| CliError::io("opening Biscuit seal consumption store", e))?;
     let dp = FrontierDpTable::build(FrontierFtsProfile::Compact1122);
-    token.verify(&pk, &dp, &req).map_err(map_cap_err)?;
+    token
+        .verify(&pk, &dp, &req, &mut consumption)
+        .map_err(map_cap_err)?;
     let summary = Json::object(vec![
         ("valid", Json::Bool(true)),
         ("token_id", Json::hex(token.token_id())),
