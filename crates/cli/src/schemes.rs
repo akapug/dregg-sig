@@ -186,6 +186,7 @@ pub fn info_json() -> Json {
                 ("pow_bits", Json::num(dregg_sig_agg::PCS_POW_BITS)),
             ]),
         ),
+        ("migration", crate::migrate::info()),
         (
             "address",
             Json::object(vec![
@@ -235,6 +236,7 @@ pub fn info_text() -> String {
         dregg_sig_agg::RS_BLOWUP,
         dregg_sig_agg::PCS_POW_BITS
     ));
+    out.push_str(&crate::migrate::info_text());
     out
 }
 
