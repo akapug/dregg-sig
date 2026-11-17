@@ -544,7 +544,6 @@ pub fn prove_party_with_fault<T: Transport>(
         &table[..1 << layout.var_bits],
         &col_mask,
     )?;
-    drop(tr);
 
     // Step 4, by the verifier's own replay of the messages sent so far.
     let mut tr = split_transcript(shape, &layout, statement, public_inputs, &roots);
@@ -856,24 +855,24 @@ pub(super) mod tests {
         use super::super::engine::MpcError;
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Attack {
-            WrongTable,
-            WrongRoundShare,
-            WrongWord,
-            WrongLeaf,
-            WrongMacShare,
-            WrongValueShare,
+            Table,
+            RoundShare,
+            Word,
+            Leaf,
+            MacShare,
+            ValueShare,
         }
         let expected = |attack: Attack| match attack {
-            Attack::WrongTable | Attack::WrongWord | Attack::WrongLeaf => ProveError::Rejected,
+            Attack::Table | Attack::Word | Attack::Leaf => ProveError::Rejected,
             _ => ProveError::Mpc(MpcError::MacCheck),
         };
         for attack in [
-            Attack::WrongTable,
-            Attack::WrongRoundShare,
-            Attack::WrongWord,
-            Attack::WrongLeaf,
-            Attack::WrongMacShare,
-            Attack::WrongValueShare,
+            Attack::Table,
+            Attack::RoundShare,
+            Attack::Word,
+            Attack::Leaf,
+            Attack::MacShare,
+            Attack::ValueShare,
         ] {
             let mut traces = Vec::new();
             for bit in [0u64, 1] {
@@ -886,8 +885,8 @@ pub(super) mod tests {
                     3,
                     7,
                     |me, z| match attack {
-                        Attack::WrongMacShare if me == 2 => z[secret].m[0] += F::ONE,
-                        Attack::WrongValueShare if me == 2 => z[secret].v += F::ONE,
+                        Attack::MacShare if me == 2 => z[secret].m[0] += F::ONE,
+                        Attack::ValueShare if me == 2 => z[secret].v += F::ONE,
                         _ => {}
                     },
                     |me, point| {
@@ -895,12 +894,10 @@ pub(super) mod tests {
                             return;
                         }
                         match (attack, point) {
-                            (Attack::WrongTable, Fault::Table(table)) => table[secret] += F::ONE,
-                            (Attack::WrongRoundShare, Fault::RoundShare(share)) => {
-                                share[1].v += E::ONE
-                            }
-                            (Attack::WrongWord, Fault::Word(bytes)) => bytes[64] ^= 1,
-                            (Attack::WrongLeaf, Fault::Leaves(leaves)) => leaves.vals[0] += F::ONE,
+                            (Attack::Table, Fault::Table(table)) => table[secret] += F::ONE,
+                            (Attack::RoundShare, Fault::RoundShare(share)) => share[1].v += E::ONE,
+                            (Attack::Word, Fault::Word(bytes)) => bytes[64] ^= 1,
+                            (Attack::Leaf, Fault::Leaves(leaves)) => leaves.vals[0] += F::ONE,
                             _ => {}
                         }
                     },

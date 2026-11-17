@@ -12,7 +12,7 @@
 //! # Where this comes from
 //!
 //! This is the Goldilocks part of the ceremony of the earlier general-quorum engine,
-//! `threshold_prep/dealerless.rs`, carried over as self-contained code. Copied from that
+//! `threshold_prep/dealerless.rs` (removed; last present in commit 894d7dc), carried over as self-contained code. Copied from that
 //! file, specialised to Goldilocks and otherwise unchanged in what is sent, checked and
 //! erased: `xof`, `element_from`, `pad_element`, `Prg` (its field stream), `Challenges`,
 //! `commitment`, `Transcript`, `Pair`, `FieldQueue`, `Check`, `Fault`, and of `Ceremony`

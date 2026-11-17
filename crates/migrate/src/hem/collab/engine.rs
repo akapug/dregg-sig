@@ -3,8 +3,7 @@
 //! SPDZ over additive shares (Damgard, Pastro, Smart, Zakarias, CRYPTO 2012; the MAC check
 //! is the commit-then-open check of SPDZ-2, Damgard et al., ESORICS 2013). A shared value
 //! `x` is held as additive shares of `x` and of `alpha_0 x`, `alpha_1 x` for two
-//! Goldilocks keys that are themselves additively shared, the layout of
-//! `threshold_mpc::FieldShare` for Goldilocks. An extension-field value carries the same
+//! Goldilocks keys that are themselves additively shared. An extension-field value carries the same
 //! two base-field keys limb by limb, so multiplying a share by a public extension element
 //! is local.
 //!
@@ -21,6 +20,7 @@
 //! comment of [`super`]: a value masked by fresh preprocessing may be opened before the
 //! check, anything else only after it.
 
+#[cfg(any(test, feature = "test-dealer"))]
 use alloc::vec;
 use alloc::vec::Vec;
 

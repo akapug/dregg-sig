@@ -50,11 +50,15 @@ pub trait Transport {
     fn recv(&mut self, from: usize) -> Result<Vec<u8>, NetError>;
 }
 
+/// A [`Link`] can carry no more frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkClosed;
+
 /// A raw bidirectional pipe to one peer that carries whole frames.
 pub trait Link {
-    fn send_frame(&mut self, frame: &[u8]) -> Result<(), ()>;
+    fn send_frame(&mut self, frame: &[u8]) -> Result<(), LinkClosed>;
     /// The next frame: [`FRAME_HEADER_BYTES`] header bytes and the payload they declare.
-    fn recv_frame(&mut self) -> Result<Vec<u8>, ()>;
+    fn recv_frame(&mut self) -> Result<Vec<u8>, LinkClosed>;
 }
 
 pub fn encode_frame(session: &[u8; 32], from: u16, to: u16, seq: u64, payload: &[u8]) -> Vec<u8> {
@@ -147,7 +151,7 @@ impl<L: Link> Transport for Framed<L> {
         );
         self.sent[to] += 1;
         link.send_frame(&frame)
-            .map_err(|()| NetError::Closed { peer: to })
+            .map_err(|LinkClosed| NetError::Closed { peer: to })
     }
 
     fn recv(&mut self, from: usize) -> Result<Vec<u8>, NetError> {
@@ -158,7 +162,7 @@ impl<L: Link> Transport for Framed<L> {
             .ok_or(NetError::UnknownPeer { peer: from })?;
         let frame = link
             .recv_frame()
-            .map_err(|()| NetError::Closed { peer: from })?;
+            .map_err(|LinkClosed| NetError::Closed { peer: from })?;
         let payload = decode_frame(
             &frame,
             &self.session,
@@ -188,12 +192,12 @@ mod with_std {
     }
 
     impl Link for ChannelLink {
-        fn send_frame(&mut self, frame: &[u8]) -> Result<(), ()> {
-            self.tx.send(frame.to_vec()).map_err(|_| ())
+        fn send_frame(&mut self, frame: &[u8]) -> Result<(), LinkClosed> {
+            self.tx.send(frame.to_vec()).map_err(|_| LinkClosed)
         }
 
-        fn recv_frame(&mut self) -> Result<Vec<u8>, ()> {
-            self.rx.recv().map_err(|_| ())
+        fn recv_frame(&mut self) -> Result<Vec<u8>, LinkClosed> {
+            self.rx.recv().map_err(|_| LinkClosed)
         }
     }
 
@@ -201,24 +205,24 @@ mod with_std {
     pub struct StreamLink<S: Read + Write>(pub S);
 
     impl<S: Read + Write> Link for StreamLink<S> {
-        fn send_frame(&mut self, frame: &[u8]) -> Result<(), ()> {
+        fn send_frame(&mut self, frame: &[u8]) -> Result<(), LinkClosed> {
             self.0
                 .write_all(frame)
                 .and_then(|()| self.0.flush())
-                .map_err(|_| ())
+                .map_err(|_| LinkClosed)
         }
 
-        fn recv_frame(&mut self) -> Result<Vec<u8>, ()> {
+        fn recv_frame(&mut self) -> Result<Vec<u8>, LinkClosed> {
             let mut frame = alloc::vec![0u8; FRAME_HEADER_BYTES];
-            self.0.read_exact(&mut frame).map_err(|_| ())?;
+            self.0.read_exact(&mut frame).map_err(|_| LinkClosed)?;
             let len = u32::from_be_bytes([frame[48], frame[49], frame[50], frame[51]]) as usize;
             if len > MAX_FRAME_PAYLOAD {
-                return Err(());
+                return Err(LinkClosed);
             }
             frame.resize(FRAME_HEADER_BYTES + len, 0);
             self.0
                 .read_exact(&mut frame[FRAME_HEADER_BYTES..])
-                .map_err(|_| ())?;
+                .map_err(|_| LinkClosed)?;
             Ok(frame)
         }
     }
@@ -228,19 +232,23 @@ mod with_std {
         let mut links: Vec<Vec<Option<ChannelLink>>> = (0..parties)
             .map(|_| (0..parties).map(|_| None).collect())
             .collect();
-        for a in 0..parties {
-            for b in a + 1..parties {
+        let mut rows = links.as_mut_slice();
+        let mut a = 0;
+        while let Some((row_a, rest)) = rows.split_first_mut() {
+            for (offset, row_b) in rest.iter_mut().enumerate() {
                 let (tx_ab, rx_ab) = channel();
                 let (tx_ba, rx_ba) = channel();
-                links[a][b] = Some(ChannelLink {
+                row_a[a + 1 + offset] = Some(ChannelLink {
                     tx: tx_ab,
                     rx: rx_ba,
                 });
-                links[b][a] = Some(ChannelLink {
+                row_b[a] = Some(ChannelLink {
                     tx: tx_ba,
                     rx: rx_ab,
                 });
             }
+            rows = rest;
+            a += 1;
         }
         links
             .into_iter()
