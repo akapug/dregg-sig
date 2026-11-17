@@ -18,8 +18,11 @@
 //!   second and hundreds of megabytes, which the per-input watchdog does not allow.
 //!
 //! The fixtures (the `init:` block) are one single-key proof and one two-entry batch proof
-//! below an extended private key. Byte 0 of the input selects what the rest is used for,
-//! so the batch verifier, the slowest path, runs on one input class only.
+//! below an extended private key; building them takes about 50 s under coverage
+//! instrumentation. Byte 0 of the input selects what the rest is used for. A verifier run
+//! costs about a second instrumented, so half of the selector values go to the decoders,
+//! the batch verifier gets one eighth, and an input that leaves a fixture unedited is not
+//! verified again (the `init:` block already did).
 
 use std::sync::OnceLock;
 
@@ -144,14 +147,14 @@ fuzz_target!(init: {
         return;
     };
 
-    match mode % 6 {
+    match mode % 16 {
         // Raw bytes through the statement decoders.
-        0 => {
+        0..=5 => {
             check_statement(rest);
             check_batch(rest);
         }
         // Raw bytes as a proof of the fixture statements.
-        1 => {
+        6 | 7 => {
             if let Some(proof) = OwnershipProof::from_bytes(rest, &fx.statement) {
                 assert_eq!(proof.to_bytes(), rest, "proof encoding is not canonical");
                 let _ = verify_ownership(&fx.statement, REGIME, &proof);
@@ -161,41 +164,43 @@ fuzz_target!(init: {
             }
         }
         // The real proof, edited.
-        2 => {
+        8..=10 => {
             let wire = edited(&fx.proof_wire, rest);
+            if wire == fx.proof_wire {
+                return;
+            }
             if let Some(proof) = OwnershipProof::from_bytes(&wire, &fx.statement) {
                 assert_eq!(proof.to_bytes(), wire);
-                let accepted = verify_ownership(&fx.statement, REGIME, &proof);
-                if wire == fx.proof_wire {
-                    assert!(accepted, "the unedited proof must verify");
-                }
+                let _ = verify_ownership(&fx.statement, REGIME, &proof);
             }
         }
         // The real proof under an edited statement of the same relation.
-        3 => {
+        11..=13 => {
             let wire = edited(&fx.statement_wire, rest);
             check_statement(&wire);
             if let Some(statement) = OwnershipStatement::from_bytes(&wire) {
-                if statement.lock == fx.statement.lock && statement.source == fx.statement.source {
+                if statement.lock == fx.statement.lock
+                    && statement.source == fx.statement.source
+                    && statement != fx.statement
+                {
                     let proof = OwnershipProof::from_bytes(&fx.proof_wire, &statement)
                         .expect("same relation, same proof layout");
-                    assert_eq!(
-                        verify_ownership(&statement, REGIME, &proof),
-                        statement == fx.statement,
+                    assert!(
+                        !verify_ownership(&statement, REGIME, &proof),
                         "a proof verified under another statement"
                     );
                 }
             }
         }
         // The real batch proof, edited.
-        4 => {
+        14 => {
             let wire = edited(&fx.batch_proof_wire, rest);
+            if wire == fx.batch_proof_wire {
+                return;
+            }
             if let Some(proof) = OwnershipProof::from_bytes_batch(&wire, &fx.batch) {
                 assert_eq!(proof.to_bytes(), wire);
-                let accepted = verify_batch(&fx.batch, REGIME, &proof);
-                if wire == fx.batch_proof_wire {
-                    assert!(accepted, "the unedited batch proof must verify");
-                }
+                let _ = verify_batch(&fx.batch, REGIME, &proof);
             }
         }
         // The real batch proof under an edited batch of the same relation.
@@ -208,12 +213,11 @@ fuzz_target!(init: {
                     && batch.prefix == fx.batch.prefix
                     && batch.entries.len() == fx.batch.entries.len()
                     && batch.entries.iter().zip(&fx.batch.entries).all(|(a, b)| a.tail == b.tail);
-                if same_relation {
+                if same_relation && batch != fx.batch {
                     let proof = OwnershipProof::from_bytes_batch(&fx.batch_proof_wire, &batch)
                         .expect("same relation, same proof layout");
-                    assert_eq!(
-                        verify_batch(&batch, REGIME, &proof),
-                        batch == fx.batch,
+                    assert!(
+                        !verify_batch(&batch, REGIME, &proof),
                         "a batch proof verified under another batch"
                     );
                 }

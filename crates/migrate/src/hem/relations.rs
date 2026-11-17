@@ -3704,8 +3704,8 @@ mod tests {
             synthesize_batch(&foreign, &witness).err(),
             Some(OwnershipError::WitnessMismatch)
         );
-        assert_eq!(batch.chunks(5), [batch.clone()]);
-        assert_eq!(batch.chunks(100), [batch]);
+        assert_eq!(batch.chunks(5).as_slice(), core::slice::from_ref(&batch));
+        assert_eq!(batch.chunks(100).as_slice(), core::slice::from_ref(&batch));
     }
 
     #[test]
