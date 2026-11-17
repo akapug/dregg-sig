@@ -135,6 +135,12 @@ pub fn xor2(cs: &mut ConstraintSystem, a: &Lc, b: &Lc) -> Lc {
     a.plus(b).minus(&ab.scaled(F::TWO))
 }
 
+/// `if bit { on_one } else { on_zero }` for a Boolean `bit`: at most one row, none when
+/// `bit` or the difference of the branches is a constant.
+pub fn select(cs: &mut ConstraintSystem, bit: &Lc, on_one: &Lc, on_zero: &Lc) -> Lc {
+    on_zero.plus(&mul_fold(cs, bit, &on_one.minus(on_zero)))
+}
+
 /// A function `f` of three bits as the single row
 /// `(pk * p + a(x, y, z)) * b(x, y, z) = c(x, y, z)` over a fresh variable `p`, with `a`,
 /// `b`, `c` affine (coefficients of `1, x, y, z`).
@@ -503,8 +509,35 @@ pub fn add_mod(cs: &mut ConstraintSystem, plus: &[&Word], minus: &[&Word]) -> Wo
     Word::from_bits(out)
 }
 
-/// Words of `wbytes` big-endian bytes each.
-fn be_words(bits: &[Lc], wbytes: usize) -> Vec<Word> {
+/// `(a + b) mod 2^len` for two little-endian integers of the same length, in 32-bit limbs:
+/// one row per result bit and one carry row per limb.
+pub fn add_wide(cs: &mut ConstraintSystem, a: &[Lc], b: &[Lc]) -> Vec<Lc> {
+    assert_eq!(a.len(), b.len());
+    let mut out = Vec::with_capacity(a.len());
+    let mut carry = Lc::zero();
+    for (x, y) in a.chunks(32).zip(b.chunks(32)) {
+        let limb = x.len();
+        let sum = pack_bits(x).plus(&pack_bits(y)).plus(&carry);
+        let total = cs.eval(&sum).to_canonical_u64();
+        let result: Vec<Lc> = (0..limb)
+            .map(|i| {
+                let bit: Lc = cs.alloc(fu((total >> i) & 1)).into();
+                cs.enforce_boolean(&bit);
+                bit
+            })
+            .collect();
+        // Two limbs and a carry bit sum to less than `2^(limb + 1)`, so the carry is a bit.
+        carry = sum
+            .minus(&pack_bits(&result))
+            .scaled(fu(1u64 << limb).inv());
+        cs.enforce_boolean(&carry);
+        out.extend(result);
+    }
+    out
+}
+
+/// A byte string as words of `wbytes` big-endian bytes each.
+pub fn be_words(bits: &[Lc], wbytes: usize) -> Vec<Word> {
     bits.chunks(8 * wbytes)
         .map(|chunk| {
             Word::from_bits(
@@ -516,8 +549,8 @@ fn be_words(bits: &[Lc], wbytes: usize) -> Vec<Word> {
         .collect()
 }
 
-/// Inverse of [`be_words`].
-fn be_bits(words: &[Word]) -> Vec<Lc> {
+/// Inverse of [`be_words`]: the byte string of big-endian words.
+pub fn be_bits(words: &[Word]) -> Vec<Lc> {
     let mut out = Vec::new();
     for word in words {
         for byte in word.bits.chunks(8).rev() {
@@ -834,48 +867,96 @@ pub fn sha512(cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
 // HMAC and HKDF
 // ============================================================================
 
-fn hmac(
-    cs: &mut ConstraintSystem,
-    hash: fn(&mut ConstraintSystem, &[Lc]) -> Vec<Lc>,
-    block: usize,
-    key: &[Lc],
-    message: &[Lc],
-) -> Vec<Lc> {
-    assert!(key.len() % 8 == 0, "keys hold whole bytes");
-    let mut k0 = if key.len() > 8 * block {
-        hash(cs, key)
-    } else {
-        key.to_vec()
-    };
-    k0.resize(8 * block, Lc::zero());
-    let pad = |byte: u8| -> Vec<Lc> {
-        k0.iter()
-            .enumerate()
-            .map(|(i, bit)| {
-                if (byte >> (i % 8)) & 1 == 1 {
-                    not(bit)
-                } else {
-                    bit.clone()
-                }
-            })
-            .collect()
-    };
-    let mut inner = pad(0x36);
-    inner.extend_from_slice(message);
-    let inner = hash(cs, &inner);
-    let mut outer = pad(0x5c);
-    outer.extend(inner);
-    hash(cs, &outer)
+/// An HMAC key after its two pad blocks: the chaining values of `key ^ ipad` and
+/// `key ^ opad`. Every MAC under the key starts from them, so they are computed once
+/// (two compressions; none for a constant key, whose pad blocks fold).
+#[derive(Clone)]
+pub struct HmacKey {
+    variant: &'static Sha2,
+    inner: [Word; 8],
+    outer: [Word; 8],
+}
+
+impl HmacKey {
+    fn new(cs: &mut ConstraintSystem, variant: &'static Sha2, key: &[Lc]) -> Self {
+        assert!(key.len() % 8 == 0, "keys hold whole bytes");
+        let block = 2 * variant.width;
+        let mut k0 = if key.len() > 8 * block {
+            variant.hash(cs, key)
+        } else {
+            key.to_vec()
+        };
+        k0.resize(8 * block, Lc::zero());
+        let mut pad = |byte: u8| -> [Word; 8] {
+            let bits: Vec<Lc> = k0
+                .iter()
+                .enumerate()
+                .map(|(i, bit)| {
+                    if (byte >> (i % 8)) & 1 == 1 {
+                        not(bit)
+                    } else {
+                        bit.clone()
+                    }
+                })
+                .collect();
+            let words = be_words(&bits, variant.width / 8);
+            let words: &[Word; 16] = words.as_slice().try_into().expect("one block");
+            variant.compress(cs, &variant.iv(), words)
+        };
+        let inner = pad(0x36);
+        let outer = pad(0x5c);
+        Self {
+            variant,
+            inner,
+            outer,
+        }
+    }
+
+    /// Key for HMAC-SHA256; a key longer than 64 bytes is hashed first.
+    pub fn sha256(cs: &mut ConstraintSystem, key: &[Lc]) -> Self {
+        Self::new(cs, &SHA256, key)
+    }
+
+    /// Key for HMAC-SHA512; a key longer than 128 bytes is hashed first.
+    pub fn sha512(cs: &mut ConstraintSystem, key: &[Lc]) -> Self {
+        Self::new(cs, &SHA512, key)
+    }
+
+    /// Chaining value after `key ^ ipad`, for a caller that builds the inner message
+    /// block itself.
+    pub fn inner_state(&self) -> &[Word; 8] {
+        &self.inner
+    }
+
+    /// The inner digest `H((key ^ ipad) || message)`.
+    pub fn inner_digest(&self, cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
+        let block = 2 * self.variant.width;
+        self.variant
+            .hash_from(cs, self.inner.clone(), block, message)
+    }
+
+    /// The MAC from an inner digest: `H((key ^ opad) || inner_digest)`.
+    pub fn finish(&self, cs: &mut ConstraintSystem, inner_digest: &[Lc]) -> Vec<Lc> {
+        let block = 2 * self.variant.width;
+        self.variant
+            .hash_from(cs, self.outer.clone(), block, inner_digest)
+    }
+
+    /// RFC 2104 HMAC of a byte string.
+    pub fn mac(&self, cs: &mut ConstraintSystem, message: &[Lc]) -> Vec<Lc> {
+        let inner = self.inner_digest(cs, message);
+        self.finish(cs, &inner)
+    }
 }
 
 /// RFC 2104 HMAC-SHA256 of a byte string under a byte-string key of any length.
 pub fn hmac_sha256(cs: &mut ConstraintSystem, key: &[Lc], message: &[Lc]) -> Vec<Lc> {
-    hmac(cs, sha256, 64, key, message)
+    HmacKey::sha256(cs, key).mac(cs, message)
 }
 
 /// RFC 2104 HMAC-SHA512 of a byte string under a byte-string key of any length.
 pub fn hmac_sha512(cs: &mut ConstraintSystem, key: &[Lc], message: &[Lc]) -> Vec<Lc> {
-    hmac(cs, sha512, 128, key, message)
+    HmacKey::sha512(cs, key).mac(cs, message)
 }
 
 /// RFC 5869 HKDF-Extract with SHA-256: the 256-bit pseudorandom key.
@@ -1545,6 +1626,89 @@ mod tests {
         assert_eq!(
             sha256_midstate(&[]),
             sha256_iv().map(|w| w.const_value().unwrap() as u32)
+        );
+    }
+
+    #[test]
+    fn add_wide_and_select_match_integers() {
+        let mut seed = 5;
+        for (len, mode) in [(256usize, 0), (256, 1), (256, 2), (224, 2), (40, 2)] {
+            let draw = |seed: &mut u64| -> Vec<u8> {
+                (0..len / 8)
+                    .map(|_| match mode {
+                        0 => 0xff,
+                        1 => 0,
+                        _ => splitmix(seed) as u8,
+                    })
+                    .collect()
+            };
+            let (a, b) = (draw(&mut seed), draw(&mut seed));
+            let mut want = vec![0u8; len / 8];
+            let mut carry = 0u16;
+            for i in 0..len / 8 {
+                let v = u16::from(a[i]) + u16::from(b[i]) + carry;
+                want[i] = v as u8;
+                carry = v >> 8;
+            }
+            let (got, shape, z) = run(&[&a, &b], |cs, i| add_wide(cs, &i[0], &i[1]));
+            assert_eq!(got, want);
+            assert!(shape.is_satisfied(&z));
+            assert!(flips_are_rejected(&shape, &z, 64) >= 32);
+        }
+        for v in 0..8u64 {
+            let mut cs = ConstraintSystem::new();
+            let bits: Vec<Lc> = (0..3)
+                .map(|i| {
+                    let bit: Lc = cs.alloc(fu((v >> i) & 1)).into();
+                    cs.enforce_boolean(&bit);
+                    bit
+                })
+                .collect();
+            let out = select(&mut cs, &bits[0], &bits[1], &bits[2]);
+            assert_eq!(cs.num_rows(), 4);
+            let want = if v & 1 == 1 { (v >> 1) & 1 } else { (v >> 2) & 1 };
+            assert_eq!(cs.eval(&out), fu(want));
+            assert_eq!(select(&mut cs, &Lc::constant(F::ONE), &bits[1], &bits[2]), bits[1]);
+            assert_eq!(select(&mut cs, &Lc::zero(), &bits[1], &bits[2]), bits[2]);
+            assert_eq!(cs.num_rows(), 4);
+        }
+    }
+
+    #[test]
+    fn hmac_key_is_reusable_and_folds_for_constant_keys() {
+        let key = bytes(32, 71);
+        let (m1, m2) = (bytes(37, 72), bytes(69, 73));
+        let mut want = native::hmac_sha512(&key, &m1).to_vec();
+        want.extend(native::hmac_sha512(&key, &m2));
+        check(&[&key, &m1, &m2], &want, |cs, i| {
+            let hk = HmacKey::sha512(cs, &i[0]);
+            let mut out = hk.mac(cs, &i[1]);
+            out.extend(hk.mac(cs, &i[2]));
+            out
+        });
+        // Sharing the key saves its two pad compressions on the second MAC.
+        let rows = |shared: bool| {
+            let mut cs = ConstraintSystem::new();
+            let k = alloc_bits(&mut cs, &key);
+            let (a, b) = (alloc_bits(&mut cs, &m1), alloc_bits(&mut cs, &m1));
+            if shared {
+                let hk = HmacKey::sha512(&mut cs, &k);
+                let _ = (hk.mac(&mut cs, &a), hk.mac(&mut cs, &b));
+            } else {
+                let _ = (hmac_sha512(&mut cs, &k, &a), hmac_sha512(&mut cs, &k, &b));
+            }
+            cs.num_rows()
+        };
+        assert!(rows(false) - rows(true) > 80_000);
+        // A constant key costs nothing itself.
+        let mut cs = ConstraintSystem::new();
+        let hk = HmacKey::sha512(&mut cs, &const_bits(b"Bitcoin seed"));
+        assert_eq!(cs.num_rows(), 0);
+        let msg = alloc_bits(&mut cs, &m1);
+        let out = hk.mac(&mut cs, &msg);
+        assert_eq!(
+            bits_to_bytes(&cs, &out),
+            native::hmac_sha512(b"Bitcoin seed", &m1).to_vec()
         );
     }
 
