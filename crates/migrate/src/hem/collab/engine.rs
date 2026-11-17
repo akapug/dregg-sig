@@ -469,18 +469,32 @@ impl<T: Transport> Engine<T> {
 
     /// Products of base-field values: one triple and two masked openings each.
     pub fn mul(&mut self, xs: &[Sb], ys: &[Sb]) -> Result<Vec<Sb>, MpcError> {
+        Ok(self.mul_open(xs, ys, &[])?.0)
+    }
+
+    /// The products `xs[i] ys[i]` and the values of `opens`, in one round: the masked
+    /// openings of the products and the plain openings travel in the same exchange.
+    #[allow(clippy::type_complexity)]
+    pub fn mul_open(
+        &mut self,
+        xs: &[Sb],
+        ys: &[Sb],
+        opens: &[Sb],
+    ) -> Result<(Vec<Sb>, Vec<F>), MpcError> {
         assert_eq!(xs.len(), ys.len());
         let n = xs.len();
         if self.prep.triples.len() - self.t_used < n {
             return Err(MpcError::OutOfTriples);
         }
         let triples = &self.prep.triples[self.t_used..self.t_used + n];
-        let mut masked = Vec::with_capacity(2 * n);
+        let mut masked = Vec::with_capacity(2 * n + opens.len());
         for ((x, y), t) in xs.iter().zip(ys).zip(triples) {
             masked.push(*x - t[0]);
             masked.push(*y - t[1]);
         }
-        let opened = self.open(&masked)?;
+        masked.extend_from_slice(opens);
+        let mut opened = self.open(&masked)?;
+        let plain = opened.split_off(2 * n);
         let mut out = Vec::with_capacity(n);
         for (k, pair) in opened.chunks_exact(2).enumerate() {
             let (d, e) = (pair[0], pair[1]);
@@ -493,7 +507,7 @@ impl<T: Transport> Engine<T> {
         );
         self.t_used += n;
         self.stats.triples_used += n as u64;
-        Ok(out)
+        Ok((out, plain))
     }
 
     /// Products of extension-field values: sixteen base products of limbs each.
