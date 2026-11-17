@@ -4527,13 +4527,19 @@ fn compute_ot_ext_transcript_bind(
 /// `(P_x(s_0) + tail_0, P_x(s_1) + tail_1)` with `P_x(s) = sum_k block_k s^(k+1)` over
 /// `Tower128`; `block_k` is the `k`-th pair of payload words and `tail` the two pairs of
 /// sacrificial words. It is the `GF(2)`-linear map `[X | I_256]`.
-pub(crate) struct OtExtCheckKey {
+///
+/// Public so that an extension outside this module can run the same check: hash the choice
+/// bits and every column on the receiver's side, every column on the sender's side, and
+/// compare per column `H(q_c) = H(t_c) + delta_c H(x)` in constant time.
+pub struct OtExtCheckKey {
     payload_words: usize,
     powers: Vec<[u128; 2]>,
 }
 
 impl OtExtCheckKey {
-    pub(crate) fn new(chi_seed: &[u8; 32], payload_words: usize) -> Self {
+    /// `chi_seed` must be the checking party's fresh randomness, revealed to the other party
+    /// only after that party's correction columns are fixed.
+    pub fn new(chi_seed: &[u8; 32], payload_words: usize) -> Self {
         let point = |lane: usize| {
             Tower128(u128::from_le_bytes(core::array::from_fn(|i| {
                 chi_seed[16 * lane + i]
@@ -4552,8 +4558,11 @@ impl OtExtCheckKey {
         }
     }
 
-    /// Hash one column. Constant time in `col`.
-    pub(crate) fn hash(&self, col: &[u64]) -> [u128; 2] {
+    /// Hash one column of `payload_words + 4` words. Constant time in `col`.
+    ///
+    /// # Panics
+    /// If `col` has another length.
+    pub fn hash(&self, col: &[u64]) -> [u128; 2] {
         let payload = self.payload_words;
         assert_eq!(col.len(), payload + OT_EXT_SACRIFICIAL_WORDS);
         let join = |lo: u64, hi: u64| u128::from(lo) | (u128::from(hi) << 64);
