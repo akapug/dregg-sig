@@ -75,6 +75,8 @@
 //!
 //! The same check, with 256 columns, guards the per-pair pool extension of `Π_triple_f2`
 //! (`triple_f2.rs`, `extend_pair`), whose correlation is the holder's two-lane MAC key share.
+//! `dregg-sig-quorum`'s staging (`PairwiseSubfieldVole::extend_authenticated_bits`) runs it
+//! with 128 columns through [`OtExtCheckKey`], under the holder's 128-bit MAC key.
 //!
 //! ## What is proven, with this code's numbers
 //!

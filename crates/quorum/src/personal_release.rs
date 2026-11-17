@@ -64,9 +64,9 @@ pub const ROUND_PREL_OT_R1: u32 = 0x0501_0004;
 pub const ROUND_PREL_OT_R2: u32 = 0x0501_0005;
 pub const ROUND_PREL_OT_R3: u32 = 0x0501_0006;
 pub const ROUND_PREL_OT_R4: u32 = 0x0501_0007;
-pub const ROUND_PREL_KOS_U: u32 = 0x0502_0001;
-pub const ROUND_PREL_KOS_CHAL: u32 = 0x0502_0002;
-pub const ROUND_PREL_KOS_PROOF: u32 = 0x0502_0003;
+pub const ROUND_PREL_OT_EXT_U: u32 = 0x0502_0001;
+pub const ROUND_PREL_OT_EXT_CHAL: u32 = 0x0502_0002;
+pub const ROUND_PREL_OT_EXT_PROOF: u32 = 0x0502_0003;
 pub const ROUND_PREL_OLE_CT: u32 = 0x0503_0001;
 pub const ROUND_PREL_OLE_DIFF: u32 = 0x0503_0002;
 pub const ROUND_PREL_COIN_COM: u32 = 0x0504_0001;
@@ -476,17 +476,17 @@ impl PartyOtEndpoint {
             )?;
             let (pending, u_msg) = recv_ch.round1_send_u_cols(my_choices, rng);
             let u_bytes = u_msg.to_bytes();
-            wire.send_frame(sender, ROUND_PREL_KOS_U, &u_bytes)?;
-            let chal_raw = recv_wire(wire, &self.roster, sender, ROUND_PREL_KOS_CHAL)?;
+            wire.send_frame(sender, ROUND_PREL_OT_EXT_U, &u_bytes)?;
+            let chal_raw = recv_wire(wire, &self.roster, sender, ROUND_PREL_OT_EXT_CHAL)?;
             let chal = OtExtChallengeMsg::from_bytes(&chal_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[sender],
-                    round: ROUND_PREL_KOS_CHAL,
+                    round: ROUND_PREL_OT_EXT_CHAL,
                 },
             )?;
             let (proof, pads) = recv_ch.round3_prove_and_finish(pending, &chal);
             let proof_bytes = proof.to_bytes();
-            wire.send_frame(sender, ROUND_PREL_KOS_PROOF, &proof_bytes)?;
+            wire.send_frame(sender, ROUND_PREL_OT_EXT_PROOF, &proof_bytes)?;
             self.transcript = h32(
                 b"personal-release/kos-step",
                 &[
@@ -507,23 +507,23 @@ impl PartyOtEndpoint {
                     },
                 )),
             )?;
-            let u_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_KOS_U)?;
+            let u_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_OT_EXT_U)?;
             let u_msg = OtExtUColsMsg::from_bytes(&u_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[receiver],
-                    round: ROUND_PREL_KOS_U,
+                    round: ROUND_PREL_OT_EXT_U,
                 },
             )?;
             let (pending, chal) = send_ch.round2_sample_challenge(&u_msg, rng).map_err(|e| {
                 self.poisoned = true;
                 PersonalReleaseError::Mpc(Poseidon2MpcError::Preprocess(e))
             })?;
-            wire.send_frame(receiver, ROUND_PREL_KOS_CHAL, &chal.to_bytes())?;
-            let proof_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_KOS_PROOF)?;
+            wire.send_frame(receiver, ROUND_PREL_OT_EXT_CHAL, &chal.to_bytes())?;
+            let proof_raw = recv_wire(wire, &self.roster, receiver, ROUND_PREL_OT_EXT_PROOF)?;
             let proof = OtExtProofMsg::from_bytes(&proof_raw).ok_or(
                 PersonalReleaseError::MalformedWireMessage {
                     from: self.roster[receiver],
-                    round: ROUND_PREL_KOS_PROOF,
+                    round: ROUND_PREL_OT_EXT_PROOF,
                 },
             )?;
             let pad_pairs = send_ch
