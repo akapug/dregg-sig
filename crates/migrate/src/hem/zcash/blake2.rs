@@ -7,8 +7,9 @@
 //!
 //! # Gadget cost
 //!
-//! One `G` function is four modular additions and four 64-bit XORs: 524 rows. A
-//! compression is 96 `G` plus the feed-forward, about 51,000 rows.
+//! One BLAKE2b `G` function is four modular additions and four 64-bit XORs: 524 rows. A
+//! compression is 96 `G` plus the feed-forward, about 51,000 rows. A BLAKE2s compression
+//! is 80 `G` on 32-bit words, about 21,000 rows.
 
 use alloc::vec::Vec;
 
@@ -314,7 +315,7 @@ pub fn blake2s_256(personal: &[u8; 8], parts: &[&[u8]]) -> [u8; 32] {
 // BLAKE2b gadget
 // ============================================================================
 
-fn xor_words(cs: &mut ConstraintSystem, a: &Word, b: &Word) -> Word {
+pub(super) fn xor_words(cs: &mut ConstraintSystem, a: &Word, b: &Word) -> Word {
     Word::from_bits(
         a.bits()
             .iter()
@@ -397,6 +398,67 @@ pub fn blake2b_512_gadget(
     h.into_iter().flat_map(Word::into_bits).collect()
 }
 
+/// The quarter-round of BLAKE2s and BLAKE3 on 32-bit words (rotations 16, 12, 8, 7).
+pub(super) fn g32(cs: &mut ConstraintSystem, v: &mut [Word], q: &[usize; 4], x: &Word, y: &Word) {
+    let (a, b, c, d) = (q[0], q[1], q[2], q[3]);
+    v[a] = add_mod(cs, &[&v[a], &v[b], x], &[]);
+    v[d] = xor_words(cs, &v[d], &v[a]).rotr(16);
+    v[c] = add_mod(cs, &[&v[c], &v[d]], &[]);
+    v[b] = xor_words(cs, &v[b], &v[c]).rotr(12);
+    v[a] = add_mod(cs, &[&v[a], &v[b], y], &[]);
+    v[d] = xor_words(cs, &v[d], &v[a]).rotr(8);
+    v[c] = add_mod(cs, &[&v[c], &v[d]], &[]);
+    v[b] = xor_words(cs, &v[b], &v[c]).rotr(7);
+}
+
+/// Initial chaining value of unkeyed BLAKE2s-256 with a personalization.
+pub fn blake2s_256_iv(personal: &[u8; 8]) -> [u32; 8] {
+    let mut h = IV_S;
+    h[0] ^= 0x0101_0000 ^ 32;
+    h[6] ^= u32::from_le_bytes(personal[..4].try_into().unwrap());
+    h[7] ^= u32::from_le_bytes(personal[4..].try_into().unwrap());
+    h
+}
+
+/// BLAKE2s-256 of exactly one 64-byte block (512 bits, least significant bit first within
+/// each byte) under a personalization: one compression, about 21,000 rows.
+pub fn blake2s_256_block_gadget(
+    cs: &mut ConstraintSystem,
+    personal: &[u8; 8],
+    block: &[Lc],
+) -> Vec<Lc> {
+    assert_eq!(block.len(), 512, "one 64-byte block");
+    let h: Vec<Word> = blake2s_256_iv(personal)
+        .iter()
+        .map(|&w| Word::constant(w as u64, 32))
+        .collect();
+    let m: Vec<Word> = block
+        .chunks(32)
+        .map(|w| Word::from_bits(w.to_vec()))
+        .collect();
+    let mut v = h.clone();
+    for (i, iv) in IV_S.iter().enumerate() {
+        let k = match i {
+            4 => iv ^ 64,
+            6 => !iv,
+            _ => *iv,
+        };
+        v.push(Word::constant(k as u64, 32));
+    }
+    for s in &SIGMA {
+        for (i, q) in QUARTERS.iter().enumerate() {
+            g32(cs, &mut v, q, &m[s[2 * i]], &m[s[2 * i + 1]]);
+        }
+    }
+    (0..8)
+        .flat_map(|i| {
+            (0..32)
+                .map(|k| xor3(cs, &h[i].bits()[k], &v[i].bits()[k], &v[i + 8].bits()[k]))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +506,28 @@ mod tests {
             blake2b_512(b"Zcash_ExpandSeed", &[&data[..128]]),
             blake2b_512(b"Zcash_ExpandSeee", &[&data[..128]])
         );
+    }
+
+    #[test]
+    fn blake2s_block_gadget_matches_native() {
+        let data: Vec<u8> = (0..64u32).map(|i| (i * 11 + 9) as u8).collect();
+        for personal in [b"QsIwTre\x00", b"QsIwTre\xff"] {
+            let mut cs = ConstraintSystem::new();
+            let bits = alloc_bits(&mut cs, &data);
+            let rows0 = cs.num_rows();
+            let out = blake2s_256_block_gadget(&mut cs, personal, &bits);
+            std::println!("BLAKE2s block: {} rows", cs.num_rows() - rows0);
+            assert_eq!(
+                bits_to_bytes(&cs, &out),
+                blake2s_256(personal, &[&data]).to_vec()
+            );
+            let var = out[0].terms().last().expect("a variable").0 as usize;
+            let (shape, z) = cs.finish();
+            assert!(shape.is_satisfied(&z));
+            let mut bad = z.clone();
+            bad[var] += dregg_sig_agg::field::Goldilocks::ONE;
+            assert!(!shape.is_satisfied(&bad));
+        }
     }
 
     #[test]
